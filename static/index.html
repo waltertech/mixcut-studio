@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>混剪工坊 · 本地批量混剪</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <style>[hidden]{display:none!important}.top-actions{display:flex;align-items:center;gap:13px}.quiet-button{border:0;border-left:1px solid #e4e0d8;border-radius:0;padding:2px 0 2px 12px;background:transparent;color:#64717d;font-size:12px}.quiet-button:hover{color:#b64536}.path-control{display:flex;gap:7px;align-items:center}.path-control input{min-width:0;flex:1}.path-control .button{flex:0 0 auto;white-space:nowrap;padding:9px 11px}.keyframe-gallery{grid-column:2/-1;margin-top:8px;border-top:1px solid #eeeae3;padding-top:10px}.keyframe-gallery h5{font-size:12px;margin:0 0 8px;color:#394754}.keyframe-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(92px,1fr));gap:7px}.keyframe{border:0;padding:0;background:#e8e3da;border-radius:4px;overflow:hidden;position:relative;aspect-ratio:16/9}.keyframe img{width:100%;height:100%;object-fit:cover;display:block}.keyframe time{position:absolute;right:3px;bottom:3px;background:#152433d9;color:white;font-size:10px;padding:1px 3px;border-radius:2px}.keyframe:focus{outline:2px solid #e46732;outline-offset:2px}.keyframe-more{margin-top:9px;font-size:12px}.keyframe-overlay{position:fixed;z-index:20;pointer-events:none;width:min(460px,55vw);background:#152433;padding:5px;border-radius:5px;box-shadow:0 12px 30px #0004}.keyframe-overlay img{display:block;width:100%;max-height:58vh;object-fit:contain}.keyframe-overlay span{display:block;color:white;font-size:12px;padding:4px 2px 1px}@media(max-width:520px){.keyframe-grid{grid-template-columns:repeat(3,1fr)}.keyframe-overlay{width:80vw}}</style>
+  <style>.keyframe-overlay img{aspect-ratio:16/9}.task-review-setting{margin-bottom:18px}.review-action{grid-column:2/-1;margin-top:4px}.review-action .button{margin-top:6px}.review-action.review-approved{color:#347461;font-weight:650}.review-error{color:#b64536;margin-top:4px}.sticker-editor{display:grid;grid-template-columns:minmax(280px,1fr) minmax(250px,1fr);gap:20px}.sticker-stage{position:relative;aspect-ratio:16/9;background:repeating-conic-gradient(#eee 0 25%,#ddd 0 50%) 0/20px 20px;overflow:hidden}.sticker-stage img{position:absolute;cursor:move;max-width:100%}.layer-list{display:grid;gap:8px;margin:12px 0}.layer-row{display:grid;grid-template-columns:1fr 1fr 1fr 1fr auto;gap:6px;font-size:11px}.layer-row input,.layer-row select{font-size:12px;padding:5px}.sticker-thumb{width:70px;height:70px;object-fit:contain;background:#eee;margin-right:8px;vertical-align:middle}@media(max-width:700px){.sticker-editor{grid-template-columns:1fr}.layer-row{grid-template-columns:1fr 1fr}}</style>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="#assets" aria-label="混剪工坊首页"><span class="brand-mark">▰</span><span>混剪工坊</span><small>LOCAL</small></a>
+      <div class="top-actions"><div id="server-state" class="server-state" aria-live="polite"><i></i>正在连接本地服务</div><button id="shutdown-btn" class="quiet-button" title="停止本地后台服务">退出后台</button></div>
+    </header>
+    <div class="layout">
+      <nav class="nav" aria-label="主导航">
+        <a href="#assets" data-view="assets"><b>01</b> 素材</a>
+        <a href="#settings" data-view="settings"><b>02</b> 剪辑设置</a>
+        <a href="#plan" data-view="plan"><b>03</b> 方案预览</a>
+        <a href="#tasks" data-view="tasks"><b>04</b> 任务结果</a>
+        <a href="#stickers" data-view="stickers"><b>05</b> 贴图库</a>
+        <a href="#schedules" data-view="schedules"><b>06</b> 定时任务</a>
+      </nav>
+      <main>
+        <section id="assets" class="view">
+          <div class="page-heading"><div><p class="eyebrow">MATERIAL LIBRARY</p><h1>素材</h1><p>填入本机绝对路径，递归扫描可用的视频与音乐。原始素材不会被改动。</p></div><button id="scan-btn" class="button primary">扫描素材</button></div>
+          <div class="notice"><strong>音乐按完整歌曲规划</strong>：不会截取、变速、循环或重叠播放。成片时长等于所选歌曲的总时长。</div>
+          <form id="paths-form" class="panel paths-grid">
+            <label>视频文件夹<span class="path-control"><input id="video-dir" name="video_dir" required placeholder="/Users/…/视频素材"><button class="button folder-picker" data-kind="video" type="button">选择文件夹</button></span></label>
+            <label>音乐文件夹<span class="path-control"><input id="music-dir" name="music_dir" required placeholder="/Users/…/音乐素材"><button class="button folder-picker" data-kind="music" type="button">选择文件夹</button></span></label>
+            <label>导出文件夹<span class="path-control"><input id="output-dir" name="output_dir" required placeholder="/Users/…/导出"><button class="button folder-picker" data-kind="output" type="button">选择文件夹</button></span></label>
+            <label>审核通过文件夹<span class="path-control"><input id="review-dir" name="review_dir" placeholder="/Users/…/审核通过"><button class="button folder-picker" data-kind="review" type="button">选择文件夹</button></span></label>
+            <p class="field-help">路径由本机服务验证；视频或音乐目录变更后请重新扫描。导出会按 <strong>YYYY-MM-DD_001</strong> 建立当日递增子文件夹。</p>
+          </form>
+          <div id="scan-errors" class="error-list" hidden></div>
+          <div class="asset-summary" id="asset-summary"><span>尚未扫描</span></div>
+          <div class="library-grid">
+            <section class="library"><div class="section-title"><h2>视频素材</h2><span id="video-count">0 条</span></div><div id="video-assets" class="asset-list empty">扫描后在这里显示视频、缩略图和分组。</div></section>
+            <section class="library"><div class="section-title"><h2>音乐素材</h2><span id="music-count">0 首</span></div><div id="music-assets" class="asset-list empty">扫描后在这里试听和选择歌曲。</div></section>
+          </div>
+        </section>
+
+        <section id="settings" class="view" hidden>
+          <div class="page-heading"><div><p class="eyebrow">EDITING RULES</p><h1>剪辑设置</h1><p>先选择素材和规则，再生成一批可复现的方案。</p></div><button id="plan-btn" class="button primary">生成方案</button></div>
+          <form id="config-form" class="settings-grid" novalidate>
+            <section class="panel span-2"><div class="section-title"><h2>画面组织</h2></div>
+              <div class="choice-row"><label class="choice"><input type="radio" name="mode" value="single" checked><span><strong>单源连续截取</strong><small>每条只从一个视频中连续截取</small></span></label><label class="choice"><input type="radio" name="mode" value="multi"><span><strong>多源片段拼接</strong><small>至少两个来源，按原顺序拼接</small></span></label></div>
+              <div class="form-grid"><label>生成数量<input name="count" type="number" min="1" value="3"></label><label>期望最短时长（秒）<input name="min_duration" type="number" min="1" value="30"></label><label>期望最长时长（秒）<input name="max_duration" type="number" min="1" value="450"></label><label>随机种子（可复现）<input name="seed" type="number" value="20260921"></label></div>
+              <div class="form-grid"><label>源视频时长必须大于（分钟）<input name="min_source_duration_minutes" type="number" min="0" step="0.1" value="0" aria-describedby="source-duration-help"></label></div>
+              <p id="source-duration-help" class="field-help">0 表示不限制；例如填 5，只使用超过 5 分钟的原始视频，正好 5 分钟也会排除。此项筛选源文件，不是设置成片或截取片段的长度；手动生成和定时任务均生效。</p>
+              <div class="form-grid mode-multi" hidden><label>单段最短（秒）<input name="segment_min" type="number" min="1" value="30"></label><label>单段最长（秒）<input name="segment_max" type="number" min="1" value="120"></label><label>组内拼接<select name="within_group"><option value="false">允许跨组</option><option value="true">仅同组内</option></select></label></div>
+              <div class="form-grid mode-single"><label>起点最小间隔（秒）<input name="start_gap" type="number" min="0" value="30"></label><label class="switch-label"><input name="allow_overlap" type="checkbox" checked><span>允许跨成片重叠画面</span></label></div>
+            </section>
+            <section class="panel span-2"><div class="section-title"><h2>完整歌曲规则</h2></div>
+              <div class="choice-row"><label class="choice"><input type="radio" name="music_mode" value="fixed"><span><strong>固定歌曲集合</strong><small>每条都用所选歌曲，只改变顺序</small></span></label><label class="choice"><input type="radio" name="music_mode" value="pool" checked><span><strong>候选池组合</strong><small>每条选不同子集，再改变顺序</small></span></label></div>
+              <div class="form-grid pool-settings"><label>每条最少歌曲数<input name="min_songs" type="number" min="1" value="1"></label><label>每条最多歌曲数<input name="max_songs" type="number" min="1" value="3"></label></div>
+              <p class="field-help">单条内每首歌曲最多一次。固定歌曲与固定首曲会减少可用排列数；若时长没有可行组合，服务会返回最接近候选与原因。</p>
+              <div id="music-picker" class="picker empty">请先在“素材”页扫描音乐。</div>
+            </section>
+            <section class="panel"><div class="section-title"><h2>视频范围与分组</h2></div><div id="video-picker" class="picker empty">请先在“素材”页扫描视频。</div><label>贴图模板<select id="generation-sticker-template" name="sticker_template_id"><option value="">不添加贴图</option></select></label></section>
+            <section class="panel"><div class="section-title"><h2>导出规格</h2></div><div class="form-grid"><label>分辨率<select name="resolution"><option value="1280x720">1280 × 720（默认）</option><option value="1920x1080">1920 × 1080</option></select></label><label>帧率<select name="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label><label>原音音量<input name="original_volume" type="number" min="0" max="1" step=".05" value="0"></label><label>音乐音量<input name="music_volume" type="number" min="0" max="1" step=".05" value="1"></label></div><p class="field-help">仅提供后端支持的导出规格；放大不会增加源画面细节。原音默认静音。</p></section>
+          </form>
+        </section>
+
+        <section id="plan" class="view" hidden>
+          <div class="page-heading"><div><p class="eyebrow">BATCH BLUEPRINT</p><h1>方案预览</h1><p id="plan-subtitle">生成方案后，逐条核对歌曲顺序和视频区间。</p></div><div class="button-row"><button id="manifest-btn" class="button" disabled>下载清单</button><button id="start-btn" class="button primary" disabled>确认并开始渲染</button></div></div>
+          <div id="plan-message" class="notice">尚未生成方案。</div><div id="plan-stats" class="stats"></div><div id="plan-warnings" class="warning-list"></div><div id="plan-items" class="plan-list"></div>
+        </section>
+
+        <section id="tasks" class="view" hidden>
+          <div class="page-heading"><div><p class="eyebrow">RENDER QUEUE</p><h1>任务与结果</h1><p>关闭网页不会停止后台队列。暂停会在当前成片完成后生效。</p></div><button id="refresh-tasks" class="button">刷新状态</button></div>
+          <div class="panel task-review-setting"><label>审核通过文件夹<span class="path-control"><input id="task-review-dir" placeholder="选择审核文件夹"><button class="button folder-picker" data-kind="review" type="button">选择文件夹</button></span></label><p class="field-help">点击单条“通过审核”会复制文件到该目录的日期子文件夹，原成片保持不变。</p></div>
+          <div id="task-summary" class="stats"><div class="stat"><b>—</b><span>等待批次</span></div></div><div id="batches" class="batch-list empty">尚无任务。先生成方案并确认开始渲染。</div>
+        </section>
+        <section id="stickers" class="view" hidden>
+          <div class="page-heading"><div><p class="eyebrow">STICKER LIBRARY</p><h1>贴图库</h1><p>默认不添加贴图；保存模板后可在剪辑设置中明确选择。</p></div><label class="button">导入贴图<input id="sticker-upload" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden></label></div>
+          <div class="settings-grid"><section class="panel"><div class="section-title"><h2>贴图素材</h2></div><div id="sticker-assets" class="picker empty">正在读取贴图库…</div></section><section class="panel"><div class="section-title"><h2>模板</h2><button id="new-template" class="button">新建模板</button></div><div id="sticker-templates" class="picker empty">尚无模板</div></section><section class="panel span-2"><div class="section-title"><h2>模板编辑器</h2><button id="save-template" class="button primary">保存模板</button></div><div class="sticker-editor"><div><label>参考画面<select id="sticker-background"><option value="">空白画布（16:9）</option></select></label><p class="field-help">拖动贴图定位；位置按比例保存，超出边界会自动缩小。</p><div id="sticker-stage" class="sticker-stage" aria-label="16 比 9 贴图预览"></div></div><div><label>模板名称<input id="template-name" value="未命名模板"></label><div id="sticker-layers" class="layer-list"></div><button id="add-layer" class="button">添加贴图层</button></div></div></section></div>
+        </section>
+        <section id="schedules" class="view" hidden>
+          <div class="page-heading"><div><p class="eyebrow">SCHEDULED BATCHES</p><h1>定时任务</h1><p>后台必须保持运行且电脑处于唤醒状态；错过多次启动时仅执行最新一轮。</p></div><div class="button-row"><button id="new-schedule" class="button">新建任务</button><button id="refresh-schedules" class="button">刷新状态</button></div></div>
+          <div class="notice">新一轮定时任务只会替代上一轮未完成的<strong>定时任务</strong>，不会取消手动创建的批次，已生成文件会保留。审核不会自动进行。</div>
+          <form id="schedule-form" class="panel settings-grid"><label>任务名称<input name="name" value="素材持续监测"></label><label>开始时间<input name="start_at" type="datetime-local"></label><label>重复<select name="repeat"><option value="once">仅一次</option><option value="daily">每天</option><option value="weekly">每周</option></select></label><label>目标成片数<input name="target_count" type="number" min="1" max="500" value="50"></label><label>检查间隔（分钟）<input name="check_interval_minutes" type="number" min="1" max="1440" value="10"></label><label class="switch-label"><input name="enabled" type="checkbox"><span>启用任务</span></label><label>视频目录<span class="path-control"><input name="video_dir" id="schedule-video-dir"><button class="button schedule-folder-picker" data-kind="video" type="button">选择文件夹</button></span></label><label>音乐目录<span class="path-control"><input name="music_dir" id="schedule-music-dir"><button class="button schedule-folder-picker" data-kind="music" type="button">选择文件夹</button></span></label><label class="span-2">导出目录<span class="path-control"><input name="output_dir" id="schedule-output-dir"><button class="button schedule-folder-picker" data-kind="output" type="button">选择文件夹</button></span></label><label class="switch-label span-2"><input id="schedule-current" type="checkbox" checked><span>使用当前目录和剪辑设置（保存为快照，未来新增素材会被扫描）</span></label><div class="button-row span-2"><button class="button primary" type="submit">保存定时任务</button><button id="schedule-check" class="button" type="button">立即检查素材</button></div></form>
+          <div id="schedule-active" class="notice">暂无运行中的定时任务。</div><div id="schedules-list" class="batch-list empty">正在读取定时任务…</div>
+        </section>
+      </main>
+    </div>
+  </div>
+  <template id="video-card-template"><article class="asset-card video-card"><img loading="lazy" alt="视频缩略图"><div class="asset-info"><label class="select-line"><input type="checkbox" class="asset-select"><strong class="asset-name"></strong></label><p class="asset-meta"></p><label class="group-line">分组 <input class="group-input" maxlength="80" placeholder="例如：游戏 A"></label></div></article></template>
+  <template id="music-card-template"><article class="asset-card music-card"><div class="audio-icon">♫</div><div class="asset-info"><label class="select-line"><input type="checkbox" class="asset-select"><strong class="asset-name"></strong></label><p class="asset-meta"></p><audio controls preload="none"></audio><label class="first-line"><input type="checkbox" class="first-select"> 可作为第一首</label></div></article></template>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
