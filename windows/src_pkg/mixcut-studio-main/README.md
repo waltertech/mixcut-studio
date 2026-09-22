@@ -125,8 +125,3 @@ python3 -m mixcut.server
 详细需求见 `PROJECT_PLAN.md`，进度见 `TODO.md`，实际验收结果见 `VALIDATION.md`。第一版已通过33项自动测试、50条真实素材批量导出及后台重启续跑检查。
 
 已有720p样片位于 `exports/验收样片/`；50条360p批量测试文件位于 `exports/批量验收360p/`，共约2.08GB。360p是测试规格，网页默认仍为720p。
-# Windows 版本
-
-Windows 移植版源码与安装包构建脚本位于 [`windows/`](windows/)。它包含 Windows 原生文件夹选择器、用户数据目录、进程锁、内置 FFmpeg、PyInstaller 配置和 Inno Setup 安装脚本。
-
-在 Windows 10/11 x64 上可按 [`windows/源码包说明.md`](windows/源码包说明.md) 构建 `MixCutStudio-1.0.0-win64-Setup.exe`。当前仓库上传的是源码和构建工具，不包含 FFmpeg、构建缓存或最终安装包。
