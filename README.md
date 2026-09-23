@@ -130,3 +130,13 @@ python3 -m mixcut.server
 Windows 移植版源码与安装包构建脚本位于 [`windows/`](windows/)。它包含 Windows 原生文件夹选择器、用户数据目录、进程锁、内置 FFmpeg、PyInstaller 配置和 Inno Setup 安装脚本。
 
 在 Windows 10/11 x64 上可按 [`windows/源码包说明.md`](windows/源码包说明.md) 构建 `MixCutStudio-1.0.0-win64-Setup.exe`。当前仓库上传的是源码和构建工具，不包含 FFmpeg、构建缓存或最终安装包。
+
+# macOS 安装包
+
+项目使用根目录 [`VERSION`](VERSION) 作为唯一版本号来源。运行下面的命令可生成带内置 FFmpeg 的 Apple Silicon 应用和 DMG：
+
+```bash
+python3 macos/build_tools/build.py
+```
+
+构建结果保存在 `macos/output/`，完整的版本发布和签名说明见 [`macos/README.md`](macos/README.md)。

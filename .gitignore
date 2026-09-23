@@ -39,3 +39,9 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+
+# Reproducible macOS build output
+/macos/build/
+/macos/dist/
+/macos/output/
+/macos/staging/

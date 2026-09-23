@@ -10,6 +10,8 @@ import sys
 import time
 import uuid
 
+from .fsutil import publish
+
 from . import media, stickers
 
 
@@ -167,8 +169,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
         if progress_callback:
             progress_callback({'stage': 'validating', 'progress': 0.96})
         checked = validate(str(temporary), duration)
-        os.link(temporary, output)
-        temporary.unlink()
+        publish(temporary, output)
         checked.update(path=str(output), encoder=chosen, elapsed_seconds=round(time.monotonic() - started, 3))
         if progress_callback:
             progress_callback({'stage': 'complete', 'progress': 1})
@@ -229,7 +230,7 @@ def overlay_existing(source, layers, output_path, work_dir, progress_callback=No
         if progress_callback:
             progress_callback({'stage': 'validating', 'progress': .96})
         checked = validate(str(temporary), duration)
-        os.link(temporary, output); temporary.unlink()
+        publish(temporary, output)
         checked['path'] = str(output)
         if progress_callback:
             progress_callback({'stage': 'complete', 'progress': 1})

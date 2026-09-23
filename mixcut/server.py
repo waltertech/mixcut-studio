@@ -7,7 +7,6 @@ import binascii
 import copy
 from contextlib import contextmanager
 from datetime import datetime
-import fcntl
 import hashlib
 import json
 import mimetypes
@@ -22,11 +21,17 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 import uuid
-from .folders import batch_output_folder, choose_folder
+from .folders import batch_output_folder, choose_folder, reveal
+from .fsutil import flush_to_disk, publish
 from .keyframes import KeyframeCache
+from .lockfile import LockUnavailable, acquire as acquire_lock, release as release_lock
 from .naming import export_filename, music_styles, tag_music_style
+from .runtime import activate_bundled_tools, app_version, data_root, resource_root
 
-ROOT = Path(__file__).resolve().parent.parent
+# ROOT keeps holding read-only resources so existing callers stay valid; DATA is the
+# writable per-user directory used for state, cache and the default material folders.
+ROOT = resource_root()
+DATA = data_root()
 
 
 class Store:
@@ -98,13 +103,14 @@ class Application:
         preferences = self.store.get('preferences', {})
         scan = library.get('scan', {'videos': [], 'music': [], 'errors': []})
         scan['music'] = [tag_music_style(song, library.get('music_dir')) for song in scan.get('music', [])]
-        return {'video_dir': library.get('video_dir', str(ROOT / '哔哩哔哩')),
-                'music_dir': library.get('music_dir', str(ROOT / '去重歌曲03')),
-                'output_dir': preferences.get('output_dir', str(ROOT / 'exports')),
-                'review_dir': preferences.get('review_dir', str(ROOT / '审核通过')),
+        return {'video_dir': library.get('video_dir', str(DATA / '哔哩哔哩')),
+                'music_dir': library.get('music_dir', str(DATA / '去重歌曲03')),
+                'output_dir': preferences.get('output_dir', str(DATA / 'exports')),
+                'review_dir': preferences.get('review_dir', str(DATA / '审核通过')),
                 'scan': scan,
                 'batches': self.store.batches(),
                 'sticker_catalog': self.sticker_catalog(),
+                'version': app_version(),
                 'ffmpeg_available': bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))}
 
     def sticker_catalog(self):
@@ -670,15 +676,13 @@ class Application:
                     if shutil.disk_usage(folder).free < source_stat.st_size + 64 * 1024 * 1024:
                         raise OSError('审核目录可用空间不足，原成片保留，请更换目录后重试')
                     shutil.copyfile(source, temporary)
-                    with temporary.open('rb') as stream:
-                        os.fsync(stream.fileno())
+                    flush_to_disk(temporary)
                     after = source.stat()
                     if after.st_size != source_stat.st_size or after.st_mtime_ns != source_stat.st_mtime_ns:
                         raise ValueError('复制期间原成片发生变化，请检查文件后重试')
                     if self.file_digest(temporary) != digest:
                         raise ValueError('审核副本完整性校验失败，请重试')
-                    os.link(temporary, target)
-                    temporary.unlink()
+                    publish(temporary, target)
                 approved = {'status': 'approved', 'path': str(target), 'review_dir': str(root),
                             'approved_at': datetime.now().astimezone().isoformat(timespec='seconds'),
                             'sha256': digest, 'size': target.stat().st_size}
@@ -782,7 +786,7 @@ class Handler(BaseHTTPRequestHandler):
                             target = Path(item['output_path'])
                     if not target.exists():
                         raise ValueError('输出尚未生成')
-                    subprocess.Popen(['open', '-R', str(target)] if target.is_file() else ['open', str(target)])
+                    reveal(target)
                     return self.json_response({'ok': True})
                 if path == '/api/shutdown':
                     if any(b['status'] in ['running', 'pausing', 'stopping'] for b in self.app.store.batches()):
@@ -887,20 +891,25 @@ class Handler(BaseHTTPRequestHandler):
                 remaining -= len(data)
 
 
-def main():
+def main(argv=None):
+    activate_bundled_tools()
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=8877)
-    parser.add_argument('--state-dir', default=str(ROOT / '.mixcut'))
-    args = parser.parse_args()
+    parser.add_argument('--state-dir', default=str(DATA / '.mixcut'))
+    args = parser.parse_args(argv)
     state_dir = Path(args.state_dir).resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
     lock = (state_dir / 'server.lock').open('a+')
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
+        acquire_lock(lock)
+    except LockUnavailable:
         raise SystemExit('后台已运行，请打开 http://127.0.0.1:8877')
     app = Application(state_dir)
-    server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
+    try:
+        server = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
+    except OSError as exc:
+        release_lock(lock)
+        raise SystemExit(f'无法监听 127.0.0.1:{args.port}，端口可能已被其他程序占用（{exc}）')
     server.app = app
     app.start_worker()
     print(f'MixCut ready: http://127.0.0.1:{args.port}', flush=True)
@@ -911,6 +920,7 @@ def main():
     finally:
         app.closing.set()
         server.server_close()
+        release_lock(lock)
 
 
 if __name__ == '__main__':
