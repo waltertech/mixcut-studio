@@ -32,10 +32,20 @@ def _decoded_audio_duration(path: Path) -> float:
 
 def _run_probe(path: Path) -> dict[str, Any]:
     command = ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    # Keep the pipe in binary mode.  A frozen windowed Windows process has no
+    # console streams, and some hosts have returned ``None`` for text captures.
+    # Explicit decoding gives the scanner one stable path on every platform.
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    stdout = (result.stdout or b"").decode("utf-8-sig", errors="replace")
+    stderr = (result.stderr or b"").decode("utf-8", errors="replace")
     if result.returncode:
-        raise ValueError(result.stderr.strip() or "ffprobe 无法读取媒体")
-    return json.loads(result.stdout)
+        raise ValueError(stderr.strip() or "ffprobe 无法读取媒体")
+    if not stdout.strip():
+        raise ValueError("ffprobe 未返回媒体信息")
+    try:
+        return json.loads(stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("ffprobe 返回了无效的媒体信息") from exc
 
 
 def _fraction(value: str | None) -> float | None:
