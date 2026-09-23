@@ -19,8 +19,12 @@ class StickerRenderTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.png = self.root / 'red.png'
         self.jpg = self.root / 'blue.jpg'
+        self.gif = self.root / 'animated.gif'
         run(['ffmpeg', '-y', '-f', 'lavfi', '-i', 'color=red:s=20x10', '-frames:v', '1', str(self.png)])
         run(['ffmpeg', '-y', '-f', 'lavfi', '-i', 'color=blue:s=10x20', '-frames:v', '1', str(self.jpg)])
+        run(['ffmpeg', '-y', '-f', 'lavfi', '-i', 'color=red:s=20x20:r=2:d=0.5',
+             '-f', 'lavfi', '-i', 'color=blue:s=20x20:r=2:d=0.5',
+             '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0,format=rgb8', '-loop', '0', str(self.gif)])
         self.source = self.root / 'source.mp4'
         run(['ffmpeg', '-y', '-f', 'lavfi', '-i', 'color=black:s=100x100:r=30:d=2', '-f', 'lavfi', '-i', 'sine=frequency=400:d=2', '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', str(self.source)])
 
@@ -45,6 +49,22 @@ class StickerRenderTests(unittest.TestCase):
             stickers.import_image(b'not-an-image', 'bad', self.root / 'assets')
         with self.assertRaises(ValueError):
             stickers.resolve_layers([{'sticker_id': asset['id'], 'x': 1}], [asset])
+
+    def test_animated_gif_is_preserved_and_changes_frames_in_output(self):
+        asset = stickers.import_image(self.gif.read_bytes(), 'animated.gif', self.root / 'assets')
+        self.assertTrue(asset['animated'])
+        self.assertGreater(asset['frame_count'], 1)
+        self.assertTrue(asset['path'].endswith('.gif'))
+        layers = stickers.resolve_layers([{'sticker_id': asset['id'], 'x': 0, 'y': 0, 'width': .2}], [asset])
+        output = self.root / 'animated-variant.mp4'
+        renderer.overlay_existing(self.source, layers, output, self.root / 'animated-work')
+
+        def pixel(time):
+            return subprocess.run(['ffmpeg', '-v', 'error', '-ss', str(time), '-i', str(output),
+                                   '-frames:v', '1', '-vf', 'crop=2:2:0:0', '-f', 'rawvideo',
+                                   '-pix_fmt', 'rgb24', '-'], capture_output=True, check=True).stdout[:3]
+
+        self.assertNotEqual(pixel(.2), pixel(.7))
 
     def test_overlay_location_transparency_timing_and_audio(self):
         asset = stickers.import_image(self.png.read_bytes(), 'red', self.root / 'assets')

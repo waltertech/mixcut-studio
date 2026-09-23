@@ -163,7 +163,7 @@
       button.onclick=()=>{state.stickers.active=template;state.stickers.layers=structuredClone(template.layers);$('#template-name').value=template.name;renderStickerEditor();};
       templates.append(button);
     });
-    if (!state.stickers.assets.length) assets.textContent='尚未导入贴图（静态PNG、JPG、WEBP，单文件最大12MB）。';
+    if (!state.stickers.assets.length) assets.textContent='尚未导入贴图（PNG、JPG、WEBP、动态GIF，单文件最大12MB）。';
     if (!state.stickers.templates.length) templates.textContent='尚无模板；点击贴图可将它放入画布。';
     updateStickerSelectors();
   };
