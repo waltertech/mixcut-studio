@@ -480,6 +480,17 @@ class Application:
             changed = False
             review_changed = False
             for item in batch['items']:
+                if item.get('review', {}).get('status') == 'approved':
+                    archived = Path(item['review'].get('path', ''))
+                    sidecar = archived.with_suffix('.txt')
+                    if archived.is_file() and not sidecar.exists():
+                        try:
+                            created = self.write_music_sidecar(item, archived)
+                            if created:
+                                item['review']['music_paths'] = str(created)
+                                review_changed = True
+                        except (OSError, ValueError):
+                            pass
                 if item.get('review', {}).get('status') == 'copying':
                     item['review'].update(status='failed', error='上次归档中断，请再次点击通过审核以恢复')
                     review_changed = True
@@ -647,13 +658,30 @@ class Application:
         for item in batch.get('items', []):
             if item.get('status') != 'success':
                 continue
-            folders = item.get('music_source_folders') or music_folders(item.get('music', []))
-            if not folders:
-                continue
-            sidecar = Path(item['output_path']).with_suffix('.txt')
-            temporary_sidecar = sidecar.with_name('.' + sidecar.name + '.tmp')
-            temporary_sidecar.write_text('\n'.join(folders) + '\n', encoding='utf-8')
-            temporary_sidecar.replace(sidecar)
+            self.write_music_sidecar(item, item['output_path'], replace=True)
+
+    @staticmethod
+    def write_music_sidecar(item, video_path, *, replace=False):
+        folders = item.get('music_source_folders') or music_folders(item.get('music', []))
+        if not folders:
+            return None
+        sidecar = Path(video_path).with_suffix('.txt')
+        content = '\n'.join(folders) + '\n'
+        if sidecar.exists() and not replace:
+            if sidecar.is_file() and sidecar.read_text(encoding='utf-8') == content:
+                return sidecar
+            raise ValueError('审核文件夹中已有同名的不同 TXT，程序不会覆盖；请选择其他审核目录')
+        temporary = sidecar.with_name('.' + sidecar.name + '-' + uuid.uuid4().hex + '.tmp')
+        try:
+            temporary.write_text(content, encoding='utf-8')
+            flush_to_disk(temporary)
+            if replace:
+                os.replace(temporary, sidecar)
+            else:
+                publish(temporary, sidecar)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return sidecar
 
     def asset(self, asset_id):
         scan = self.store.get('library', {}).get('scan', {})
@@ -693,6 +721,7 @@ class Application:
             if previous.get('status') == 'approved':
                 archived = Path(previous['path'])
                 if archived.is_file() and self.file_digest(archived) == previous.get('sha256'):
+                    self.write_music_sidecar(item, archived)
                     return batch
                 raise ValueError('审核归档文件已被移动或修改，请检查原保存位置')
             source = self.completed_output(batch_id, item_id)
@@ -739,9 +768,11 @@ class Application:
                     if self.file_digest(temporary) != digest:
                         raise ValueError('审核副本完整性校验失败，请重试')
                     publish(temporary, target)
+                sidecar = self.write_music_sidecar(item, target)
                 approved = {'status': 'approved', 'path': str(target), 'review_dir': str(root),
                             'approved_at': datetime.now().astimezone().isoformat(timespec='seconds'),
-                            'sha256': digest, 'size': target.stat().st_size}
+                            'sha256': digest, 'size': target.stat().st_size,
+                            'music_paths': str(sidecar) if sidecar else None}
                 result = self.store.update(batch_id, lambda b: b['items'][index].update(review=approved))
                 self.preferences({'review_dir': str(root)})
                 return result

@@ -21,6 +21,7 @@ class ReviewTests(unittest.TestCase):
             file.write_bytes(f'original-video-{index}'.encode() * 1000)
             stat = file.stat()
             items.append({'id': str(index), 'index': index, 'status': 'success', 'output_path': str(file),
+                          'music': [{'path': str(self.root / 'music' / f'song-{index}' / 'track.mp3')}],
                           'result': {'output_size': stat.st_size, 'output_mtime_ns': stat.st_mtime_ns}})
         self.record = {'id': 'abc123', 'created_at': 1, 'updated_at': 1, 'status': 'completed',
                        'config': {'output_dir': str(self.root / 'exports')},
@@ -40,6 +41,9 @@ class ReviewTests(unittest.TestCase):
         self.assertRegex(Path(first['path']).parent.name, r'^\d{4}-\d{2}-\d{2}_\d{3}$')
         self.assertEqual(Path(first['path']).parent, Path(second['path']).parent)
         self.assertEqual((self.export / '001.mp4').read_bytes(), Path(first['path']).read_bytes())
+        sidecar = Path(first['path']).with_suffix('.txt')
+        self.assertEqual([str(self.root / 'music' / 'song-1')], sidecar.read_text().splitlines())
+        self.assertEqual(str(sidecar), first['music_paths'])
         self.assertTrue((self.export / '001.mp4').is_file())
         self.assertEqual(first, Application(self.root / 'state').batch('abc123')['items'][0]['review'])
 
@@ -48,6 +52,19 @@ class ReviewTests(unittest.TestCase):
             results = list(pool.map(lambda _: self.approve(), range(2)))
         self.assertEqual(results[0]['items'][0]['review'], results[1]['items'][0]['review'])
         self.assertEqual(1, len(list(self.target_root.rglob('*.mp4'))))
+        self.assertEqual(1, len(list(self.target_root.rglob('*.txt'))))
+
+    def test_already_approved_video_backfills_missing_music_txt(self):
+        approved = self.approve()['items'][0]['review']
+        sidecar = Path(approved['path']).with_suffix('.txt')
+        sidecar.unlink()
+
+        reopened = Application(self.root / 'state')
+        result = reopened.batch('abc123')['items'][0]['review']
+
+        self.assertTrue(sidecar.is_file())
+        self.assertEqual([str(self.root / 'music' / 'song-1')], sidecar.read_text().splitlines())
+        self.assertEqual('approved', result['status'])
 
     def test_preferences_partial_update_preserves_output_folder(self):
         self.app.preferences({'output_dir': str(self.export)})
