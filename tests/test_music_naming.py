@@ -65,8 +65,8 @@ class MusicNamingTests(unittest.TestCase):
         songs = [{'path': '/music/Old Hindi Songs/第一首/a.mp3'},
                  {'path': '/music/Hindi POP Songs/第二首/b.mp3'},
                  {'path': '/music/Old Hindi Songs/第一首/a-copy.mp3'}]
-        self.assertEqual(['/music/Old Hindi Songs/第一首', '/music/Hindi POP Songs/第二首'],
-                         music_folders(songs))
+        expected = [str(Path(song['path']).resolve().parent) for song in songs[:2]]
+        self.assertEqual(expected, music_folders(songs))
 
     def test_plan_names_new_files_and_review_preserves_basename(self):
         with tempfile.TemporaryDirectory() as temporary:
