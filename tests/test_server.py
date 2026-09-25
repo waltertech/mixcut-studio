@@ -92,6 +92,25 @@ class ApplicationTestCase(unittest.TestCase):
         reopened = server.Store(self.root / 'state')
         self.assertEqual({'scan': {'videos': ['v']}}, reopened.get('library'))
 
+    def test_draft_music_order_can_change_but_cannot_duplicate_another_item(self):
+        first = item(1)
+        first['music'] = [{'id': 'a', 'name': 'A'}, {'id': 'b', 'name': 'B'}, {'id': 'c', 'name': 'C'}]
+        second = item(2)
+        second['music'] = [{'id': 'b'}, {'id': 'a'}, {'id': 'c'}]
+        record = self.save(batch('musicorder1', 'draft', [first, second], self.root / 'exports'))
+
+        changed = self.app.reorder_music(record['id'], first['id'], ['c', 'a', 'b'])
+
+        self.assertEqual(['c', 'a', 'b'], [song['id'] for song in changed['items'][0]['music']])
+        self.assertTrue(changed['items'][0]['manual_music_order'])
+        self.assertEqual(2, changed['stats']['unique_music_orders'])
+        with self.assertRaisesRegex(ValueError, '重复'):
+            self.app.reorder_music(record['id'], first['id'], ['b', 'a', 'c'])
+        changed['status'] = 'queued'
+        self.app.store.put('batch:' + changed['id'], changed)
+        with self.assertRaisesRegex(ValueError, '草稿'):
+            self.app.reorder_music(record['id'], first['id'], ['a', 'b', 'c'])
+
     def test_recovery_pauses_interrupted_work_and_keeps_existing_success(self):
         existing = self.root / 'exports' / 'recover1' / '001.mp4'
         existing.parent.mkdir(parents=True)

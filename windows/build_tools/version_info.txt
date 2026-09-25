@@ -19,12 +19,12 @@ VSVersionInfo(
           '080404B0',
           [StringStruct('CompanyName', 'waltertech'),
            StringStruct('FileDescription', 'MixCut Studio 本地批量混剪工具'),
-           StringStruct('FileVersion', '1.0.0.0'),
+           StringStruct('FileVersion', '__VERSION_QUAD__'),
            StringStruct('InternalName', 'MixCutStudio'),
            StringStruct('LegalCopyright', 'Copyright (C) 2026 waltertech'),
            StringStruct('OriginalFilename', 'MixCutStudio.exe'),
            StringStruct('ProductName', 'MixCut Studio'),
-           StringStruct('ProductVersion', '1.0.0.0')])
+           StringStruct('ProductVersion', '__VERSION_QUAD__')])
       ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
   ]

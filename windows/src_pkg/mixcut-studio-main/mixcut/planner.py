@@ -256,9 +256,12 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
     if len(items) < count and not allow_partial:
         raise ValueError(f"只能生成 {len(items)} 条不同视频方案；请允许重叠、增加素材或缩短时长")
     usage = defaultdict(int)
+    music_usage = defaultdict(int)
     for item in items:
         for segment in item["segments"]:
             usage[segment["asset_id"]] += 1
+        for song in item["music"]:
+            music_usage[song["id"]] += 1
     overlaps = []
     for left, right in itertools.combinations(items, 2):
         shared = 0.0
@@ -273,5 +276,8 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
         warnings.append(f'源视频须大于 {source_minutes:g} 分钟，已排除 {filtered_video_count} 条不符合时长的视频')
     if allow_partial and len(items) < count:
         warnings.append(f"仅生成 {len(items)}/{count} 条；可用音乐顺序或视频方案不足")
-    return {"items": items, "stats": {"count": len(items), "requested_count": count, "remaining": count - len(items), "video_usage": dict(usage),
+    return {"items": items, "stats": {"count": len(items), "requested_count": count, "remaining": count - len(items),
+            "video_usage": dict(usage), "music_usage": dict(music_usage),
+            "unique_music_orders": len({item["music_fingerprint"] for item in items}),
+            "unique_video_plans": len({item["video_fingerprint"] for item in items}),
             "max_overlap_ratio": max(overlaps, default=0.0)}, "warnings": warnings}

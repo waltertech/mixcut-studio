@@ -16,13 +16,16 @@ SRC = PROJECT / 'src_pkg' / 'mixcut-studio-main'
 TOOLS = Path(os.environ.get('MIXCUT_TOOLS') or PROJECT / '_tools')
 FFMPEG_DIR = TOOLS / 'ffmpeg-bin'
 ICON = PROJECT / 'build_tools' / 'mixcut.ico'
+VERSION_FILE = PROJECT.parent / 'VERSION'
+VERSION_INFO = PROJECT / 'build_tools' / '_version_info.generated.txt'
 
 for required in [SRC / 'mixcut' / 'server.py', SRC / 'winlaunch.py', SRC / 'static' / 'app.js',
-                 FFMPEG_DIR / 'ffmpeg.exe', FFMPEG_DIR / 'ffprobe.exe', ICON]:
+                 FFMPEG_DIR / 'ffmpeg.exe', FFMPEG_DIR / 'ffprobe.exe', ICON,
+                 VERSION_FILE, VERSION_INFO]:
     if not required.exists():
         raise SystemExit(f'missing build input: {required}')
 
-datas = [(str(SRC / 'static'), 'static')]
+datas = [(str(SRC / 'static'), 'static'), (str(VERSION_FILE), '.')]
 binaries = [(str(FFMPEG_DIR / 'ffmpeg.exe'), 'bin'), (str(FFMPEG_DIR / 'ffprobe.exe'), 'bin')]
 
 hiddenimports = [
@@ -65,7 +68,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=str(ICON),
-    version=str(PROJECT / 'build_tools' / 'version_info.txt'),
+    version=str(VERSION_INFO),
 )
 
 coll = COLLECT(

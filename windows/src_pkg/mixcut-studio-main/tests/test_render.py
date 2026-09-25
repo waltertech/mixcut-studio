@@ -11,6 +11,18 @@ from unittest.mock import patch
 from mixcut import media, renderer
 
 
+class EncoderSelectionTest(unittest.TestCase):
+    def test_auto_uses_platform_hardware_then_software_fallback(self):
+        self.assertEqual(['h264_videotoolbox', 'libx264'],
+                         renderer._codec_candidates('auto', 'darwin', 'posix'))
+        self.assertEqual(['h264_nvenc', 'h264_qsv', 'h264_amf', 'libx264'],
+                         renderer._codec_candidates('auto', 'win32', 'nt'))
+
+    def test_software_fast_uses_ultrafast_x264(self):
+        self.assertEqual(['libx264'], renderer._codec_candidates('software_fast'))
+        self.assertIn('ultrafast', renderer._encoding('libx264', 1280, 720, 30, 'software_fast'))
+
+
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg and ffprobe are required')
 class RenderIntegrationTest(unittest.TestCase):
     def setUp(self):

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,11 @@ DIST = PROJECT / 'dist'
 FROZEN = DIST / 'MixCutStudio'
 EXE = FROZEN / 'MixCutStudio.exe'
 INSTALLER_DIR = PROJECT / 'output'
+VERSION_FILE = PROJECT.parent / 'VERSION'
+VERSION = VERSION_FILE.read_text(encoding='utf-8').strip()
+if not re.fullmatch(r'\d+\.\d+\.\d+', VERSION):
+    raise SystemExit('VERSION must use semantic form MAJOR.MINOR.PATCH')
+VERSION_INFO = BUILD_TOOLS / '_version_info.generated.txt'
 
 
 def log(message):
@@ -120,6 +126,12 @@ def make_icon():
     subprocess.run([sys.executable, str(BUILD_TOOLS / 'make_icon.py'), str(target)], check=True)
 
 
+def write_version_info():
+    """Generate the Windows executable resource from the shared root VERSION."""
+    template = (BUILD_TOOLS / 'version_info.txt').read_text(encoding='utf-8')
+    VERSION_INFO.write_text(template.replace('__VERSION_QUAD__', f'{VERSION}.0'), encoding='utf-8')
+
+
 def freeze():
     log('freezing with PyInstaller')
     subprocess.run([sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean',
@@ -172,7 +184,8 @@ def build_installer():
     ensure_inno_setup()
     log('compiling the installer')
     INSTALLER_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run([str(ISCC), str(ISS)], check=True, cwd=str(BUILD_TOOLS))
+    subprocess.run([str(ISCC), f'/DAppVersion={VERSION}', str(ISS)], check=True,
+                   cwd=str(BUILD_TOOLS))
     produced = sorted(INSTALLER_DIR.glob('MixCutStudio-*-Setup.exe'))
     if not produced:
         raise SystemExit('installer was not produced')
@@ -189,6 +202,7 @@ def main():
 
     if not SRC.is_dir():
         raise SystemExit(f'source tree missing: {SRC}')
+    write_version_info()
     make_icon()
     if not args.skip_freeze:
         download_ffmpeg()

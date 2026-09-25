@@ -15,6 +15,31 @@ from .fsutil import publish
 from . import media, stickers
 
 
+def _codec_candidates(requested, platform_name=sys.platform, os_name=os.name):
+    if requested in {'software', 'software_fast'}:
+        return ['libx264']
+    if requested == 'videotoolbox':
+        return ['h264_videotoolbox']
+    if requested != 'auto':
+        raise ValueError('编码方式无效')
+    if platform_name == 'darwin':
+        return ['h264_videotoolbox', 'libx264']
+    if os_name == 'nt':
+        return ['h264_nvenc', 'h264_qsv', 'h264_amf', 'libx264']
+    return ['libx264']
+
+
+def _encoding(codec, width, height, fps, requested='auto'):
+    if codec == 'libx264':
+        return ['-c:v', codec, '-preset', 'ultrafast' if requested == 'software_fast' else 'veryfast',
+                '-crf', '24' if requested == 'software_fast' else '22']
+    return ['-c:v', codec, '-b:v', str(max(800_000, int(width * height * fps * 0.12)))]
+
+
+def _filter_threads():
+    return str(max(2, min(8, os.cpu_count() or 2)))
+
+
 def _probe(path):
     result = subprocess.run(['ffprobe', '-v', 'error', '-show_format', '-show_streams',
                              '-of', 'json', str(path)], capture_output=True, text=True, timeout=30)
@@ -132,18 +157,14 @@ def render(item, config, output_path, work_dir, progress_callback=None):
     output_label = stickers.add_overlay_filters(inputs, filters, config.get('sticker_layers') or [],
                                                 count + len(item['music']), 'vout', width, height, fps, duration)
     requested = config.get('hardware', 'auto')
-    codecs = ['h264_videotoolbox', 'libx264'] if requested == 'auto' and sys.platform == 'darwin' else ['h264_videotoolbox'] if requested == 'videotoolbox' else ['libx264']
+    codecs = _codec_candidates(requested)
     started = time.monotonic()
     chosen = None
     try:
         for codec in codecs:
-            encoding = ['-c:v', codec]
-            if codec == 'libx264':
-                encoding += ['-preset', 'veryfast', '-crf', '22']
-            else:
-                encoding += ['-b:v', str(max(800_000, int(width * height * fps * 0.12)))]
+            encoding = _encoding(codec, width, height, fps, requested)
             command = ['ffmpeg', '-nostdin', '-y', '-hide_banner', '-loglevel', 'error',
-                       '-filter_complex_threads', '2', *inputs, '-filter_complex', ';'.join(filters),
+                       '-filter_complex_threads', _filter_threads(), *inputs, '-filter_complex', ';'.join(filters),
                        '-map', f'[{output_label}]', '-map', '[aout]', *encoding, '-pix_fmt', 'yuv420p',
                        '-r', str(fps), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
                        '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', str(temporary)]
@@ -201,12 +222,13 @@ def overlay_existing(source, layers, output_path, work_dir, progress_callback=No
     if not layers:
         # No work and no re-encode is the only way to preserve the original byte-for-byte.
         return validate(str(source), duration)
-    codecs = ['h264_videotoolbox', 'libx264'] if sys.platform == 'darwin' else ['libx264']
+    requested = 'auto'
+    codecs = _codec_candidates(requested)
     log_path = work / 'overlay-ffmpeg.log'
     try:
         for codec in codecs:
-            encoding = ['-c:v', codec, '-b:v', str(max(800_000, int(width * height * fps * .12)))] if codec != 'libx264' else ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22']
-            command = ['ffmpeg', '-nostdin', '-y', '-v', 'error', '-filter_complex_threads', '2', *inputs, '-filter_complex', ';'.join(filters),
+            encoding = _encoding(codec, width, height, fps, requested)
+            command = ['ffmpeg', '-nostdin', '-y', '-v', 'error', '-filter_complex_threads', _filter_threads(), *inputs, '-filter_complex', ';'.join(filters),
                        '-map', f'[{label}]', '-map', '0:a:0', *encoding, '-pix_fmt', 'yuv420p', '-c:a', 'copy',
                        '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', str(temporary)]
             with log_path.open('w', encoding='utf-8') as log:

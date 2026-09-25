@@ -8,7 +8,9 @@
 
 #define AppName "MixCut Studio"
 #define AppNameCn "MixCut Studio 本地批量混剪工具"
-#define AppVersion "1.0.0"
+#ifndef AppVersion
+#define AppVersion "0.0.0"
+#endif
 #define AppPublisher "waltertech"
 #define AppURL "https://github.com/waltertech/mixcut-studio"
 #define AppExe "MixCutStudio.exe"

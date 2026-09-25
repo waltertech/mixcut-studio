@@ -43,6 +43,9 @@ class PlannerBoundaries(unittest.TestCase):
              "segment_min": 5, "segment_max": 12, "seed": 3})
         self.assertEqual(3, len(result["items"]))
         self.assertEqual(3, len({item["music_fingerprint"] for item in result["items"]}))
+        self.assertEqual(3, result['stats']['unique_music_orders'])
+        self.assertEqual(3, result['stats']['unique_video_plans'])
+        self.assertEqual(6, sum(result['stats']['music_usage'].values()))
         for item in result["items"]:
             self.assertAlmostEqual(item["duration"], sum(song["duration"] for song in item["music"]))
             self.assertGreaterEqual(len({p["asset_id"] for p in item["segments"]}), 2)

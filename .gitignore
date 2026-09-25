@@ -44,4 +44,5 @@ venv/
 /macos/build/
 /macos/dist/
 /macos/output/
+/windows/build_tools/_version_info.generated.txt
 /macos/staging/

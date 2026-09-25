@@ -15,7 +15,7 @@ from pathlib import Path
 import zipfile
 
 PROJECT = Path(__file__).resolve().parent.parent
-VERSION = '1.0.0'
+VERSION = (PROJECT.parent / 'VERSION').read_text(encoding='utf-8').strip()
 ROOT_NAME = f'MixCutStudio-{VERSION}-src'
 
 SOURCES = [

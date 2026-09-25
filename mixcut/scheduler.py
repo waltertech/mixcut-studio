@@ -123,6 +123,8 @@ class Scheduler:
             config[field] = int(config.get(field, default))
         if (config['width'], config['height']) not in {(640, 360), (1280, 720), (1920, 1080)} or config['fps'] not in {24, 25, 30, 60}:
             raise ValueError('导出规格无效')
+        if config.get('hardware', 'auto') not in {'auto', 'software', 'software_fast', 'videotoolbox'}:
+            raise ValueError('编码方式无效')
         for field, default in [('music_volume', 1), ('original_volume', 0)]:
             config[field] = float(config.get(field, default))
             if not math.isfinite(config[field]) or not 0 <= config[field] <= 2:

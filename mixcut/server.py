@@ -317,6 +317,8 @@ class Application:
             raise ValueError('输出尺寸须为 720p、1080p 或 360p 验证规格')
         if config['fps'] not in [24, 25, 30, 60]:
             raise ValueError('不支持的帧率')
+        if config.get('hardware', 'auto') not in {'auto', 'software', 'software_fast', 'videotoolbox'}:
+            raise ValueError('编码方式无效')
         for field, default in [('original_volume', 0), ('music_volume', 1)]:
             config[field] = float(config.get(field, default))
             if not 0 <= config[field] <= 2:
@@ -382,6 +384,39 @@ class Application:
         if not batch:
             raise ValueError('批次不存在')
         return batch
+
+    def reorder_music(self, batch_id, item_id, music_ids):
+        if not isinstance(music_ids, list) or not all(isinstance(value, str) for value in music_ids):
+            raise ValueError('歌曲顺序格式无效')
+
+        def fingerprint(ids):
+            return hashlib.sha256(repr(tuple(ids)).encode('utf-8')).hexdigest()
+
+        def change(batch):
+            if batch['status'] != 'draft':
+                raise ValueError('只有尚未开始渲染的草稿方案可以调整歌曲顺序')
+            item = next((entry for entry in batch['items'] if str(entry['id']) == str(item_id)), None)
+            if item is None:
+                raise ValueError('方案条目不存在')
+            current_ids = [song['id'] for song in item.get('music', [])]
+            if len(music_ids) != len(current_ids) or sorted(music_ids) != sorted(current_ids):
+                raise ValueError('只能调整当前方案已有歌曲的顺序')
+            candidate = fingerprint(music_ids)
+            for other in batch['items']:
+                if other is item:
+                    continue
+                other_ids = [song['id'] for song in other.get('music', [])]
+                if fingerprint(other_ids) == candidate:
+                    raise ValueError('该歌曲顺序与本批另一条方案重复，请换一个顺序')
+            by_id = {song['id']: song for song in item['music']}
+            item['music'] = [by_id[value] for value in music_ids]
+            item['music_fingerprint'] = candidate
+            item['manual_music_order'] = True
+            batch.setdefault('stats', {})['unique_music_orders'] = len({
+                fingerprint([song['id'] for song in entry.get('music', [])]) for entry in batch['items']
+            })
+
+        return self.store.update(batch_id, change)
 
     def action(self, batch_id, action):
         def change(batch):
@@ -770,6 +805,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response(self.app.approve(body))
                 if path == '/api/plan':
                     return self.json_response(self.app.create_plan(body))
+                music_order_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/music-order', path)
+                if music_order_match:
+                    return self.json_response(self.app.reorder_music(
+                        music_order_match[1], music_order_match[2], body.get('music_ids')))
                 match = re.fullmatch(r'/api/batches/([a-f0-9]+)/([a-z]+)', path)
                 if match:
                     return self.json_response(self.app.action(*match.groups()))
