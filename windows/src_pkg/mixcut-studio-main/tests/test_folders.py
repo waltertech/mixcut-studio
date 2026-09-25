@@ -73,6 +73,23 @@ class FolderTests(unittest.TestCase):
         legacy = {'id': 'oldbatch', 'config': {'output_dir': str(self.root)}}
         self.assertEqual(self.root / 'oldbatch', batch_output_folder(legacy))
 
+    def test_successful_output_gets_ordered_music_folder_sidecar(self):
+        output = self.root / 'output'; output.mkdir()
+        video = output / 'Old Hindi Songs_001.mp4'; video.write_bytes(b'video')
+        folders = [self.root / 'music' / 'Old Hindi Songs' / '第一首',
+                   self.root / 'music' / 'Hindi POP Songs' / '第二首']
+        batch = {'id': 'sidecar01', 'status': 'completed', 'output_folder': str(output),
+                 'config': {'output_dir': str(self.root)}, 'items': [{
+                     'id': 'one', 'status': 'success', 'output_path': str(video),
+                     'music': [{'path': str(folder / 'song.mp3')} for folder in folders],
+                 }]}
+        self.app.store.put('batch:' + batch['id'], batch)
+
+        self.app.write_manifest(batch['id'])
+
+        sidecar = video.with_suffix('.txt')
+        self.assertEqual([str(folder) for folder in folders], sidecar.read_text(encoding='utf-8').splitlines())
+
 
 if __name__ == '__main__':
     unittest.main()

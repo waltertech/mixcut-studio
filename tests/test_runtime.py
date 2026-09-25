@@ -21,7 +21,7 @@ class RuntimeLocations(unittest.TestCase):
             self.assertEqual(Path('/tmp/custom-mixcut'), runtime.data_root())
 
     def test_version_comes_from_single_version_file(self):
-        self.assertEqual('1.2.1', runtime.app_version())
+        self.assertEqual('1.2.2', runtime.app_version())
 
 
 if __name__ == '__main__':

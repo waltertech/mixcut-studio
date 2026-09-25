@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from mixcut.naming import export_filename, infer_music_style, music_styles
+from mixcut.naming import export_filename, infer_music_style, music_folders, music_styles
 from mixcut.server import Application
 from mixcut import media
 
@@ -44,6 +44,29 @@ class MusicNamingTests(unittest.TestCase):
                 result = media.scan(str(root / 'no-videos'), str(root), str(root / 'cache'))
             self.assertEqual('Hindi DJ Remix', result['music'][0]['music_style'])
             self.assertNotIn('music_style', old)
+
+    def test_music_scan_recurses_song_folders_and_ignores_companion_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            song_dir = root / 'Old Hindi Songs' / '第一首'
+            song_dir.mkdir(parents=True)
+            song = song_dir / 'song.mp3'; song.touch()
+            (song_dir / 'song.mp4').touch()
+            (song_dir / '封面.webp').touch()
+            (song_dir / '文案.txt').touch()
+            asset = {'id': 'song', 'path': str(song), 'name': song.name, 'duration': 3}
+            with patch('mixcut.media._cached_asset', return_value=asset) as cached:
+                result = media.scan(str(root / 'videos'), str(root), str(root / 'cache'))
+            self.assertEqual([song.name], [entry['name'] for entry in result['music']])
+            self.assertEqual('Old Hindi Songs', result['music'][0]['music_style'])
+            cached.assert_called_once()
+
+    def test_music_folders_preserve_song_order_and_remove_duplicates(self):
+        songs = [{'path': '/music/Old Hindi Songs/第一首/a.mp3'},
+                 {'path': '/music/Hindi POP Songs/第二首/b.mp3'},
+                 {'path': '/music/Old Hindi Songs/第一首/a-copy.mp3'}]
+        self.assertEqual(['/music/Old Hindi Songs/第一首', '/music/Hindi POP Songs/第二首'],
+                         music_folders(songs))
 
     def test_plan_names_new_files_and_review_preserves_basename(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -25,7 +25,7 @@ from .folders import batch_output_folder, choose_folder, reveal
 from .fsutil import flush_to_disk, publish
 from .keyframes import KeyframeCache
 from .lockfile import LockUnavailable, acquire as acquire_lock, release as release_lock
-from .naming import export_filename, music_styles, tag_music_style
+from .naming import export_filename, music_folders, music_styles, tag_music_style
 from .runtime import activate_bundled_tools, app_version, data_root, resource_root
 
 # ROOT keeps holding read-only resources so existing callers stay valid; DATA is the
@@ -215,6 +215,8 @@ class Application:
             filename = export_filename(styles, 1) if styles else source.name
             item = {'id': uuid.uuid4().hex, 'index': 1, 'kind': 'sticker_variant',
                     'duration': source_item['duration'], 'segments': [], 'music': [],
+                    'music_source_folders': source_item.get('music_source_folders') or
+                                            music_folders(source_item.get('music', [])),
                     'source_asset': source_asset, 'status': 'pending', 'progress': 0, 'error': None, 'attempts': 0,
                     'music_styles': styles, 'output_name': filename,
                     'output_path': str(folder / filename)}
@@ -374,6 +376,7 @@ class Application:
             item['index'] = index + index_offset
             item.update(status='pending', progress=0, error=None, attempts=0)
             item['music'] = [tag_music_style(song, music_root) for song in item.get('music', [])]
+            item['music_source_folders'] = music_folders(item['music'])
             item['music_styles'] = music_styles(item['music'], music_root)
             item['output_name'] = export_filename(item['music_styles'], item['index'])
             item['output_path'] = str(output_folder / item['output_name'])
@@ -641,6 +644,16 @@ class Application:
         temporary = directory / '.manifest.json.tmp'
         temporary.write_text(json.dumps(batch, ensure_ascii=False, indent=2), encoding='utf-8')
         temporary.replace(directory / 'manifest.json')
+        for item in batch.get('items', []):
+            if item.get('status') != 'success':
+                continue
+            folders = item.get('music_source_folders') or music_folders(item.get('music', []))
+            if not folders:
+                continue
+            sidecar = Path(item['output_path']).with_suffix('.txt')
+            temporary_sidecar = sidecar.with_name('.' + sidecar.name + '.tmp')
+            temporary_sidecar.write_text('\n'.join(folders) + '\n', encoding='utf-8')
+            temporary_sidecar.replace(sidecar)
 
     def asset(self, asset_id):
         scan = self.store.get('library', {}).get('scan', {})

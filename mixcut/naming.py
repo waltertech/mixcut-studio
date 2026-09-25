@@ -43,6 +43,18 @@ def music_styles(songs, root=None):
     return labels
 
 
+def music_folders(songs):
+    """Return each used song's containing folder, preserving playback order."""
+    folders = []
+    for song in songs:
+        if not song.get('path'):
+            continue
+        path = str(Path(song['path']).expanduser().resolve().parent)
+        if path not in folders:
+            folders.append(path)
+    return folders
+
+
 def export_filename(styles, index):
     prefix = ' + '.join(styles)
     prefix = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', '_', prefix).strip(' .')
