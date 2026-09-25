@@ -474,6 +474,22 @@ class Application:
         if shutil.disk_usage(directory).free < 512 * 1024 * 1024:
             raise OSError('可用磁盘空间少于 512 MB，请清理空间后继续')
 
+    @staticmethod
+    def reserve_review_bundle(root, item):
+        day = datetime.now().astimezone().strftime('%Y-%m-%d')
+        parent = Path(root) / day
+        parent.mkdir(parents=True, exist_ok=True)
+        styles = item.get('music_styles') or music_styles(item.get('music', []))
+        for number in range(1, 10000):
+            name = Path(export_filename(styles, number)).stem
+            folder = parent / name
+            try:
+                folder.mkdir()
+                return folder, name
+            except FileExistsError:
+                continue
+        raise OSError('当天审核文件夹编号已用尽')
+
     def recover(self):
         for batch in self.store.batches():
             changed = False
@@ -740,14 +756,9 @@ class Application:
             root.mkdir(parents=True, exist_ok=True)
             if root == batch_output_folder(batch).resolve():
                 raise ValueError('审核通过文件夹不能与当前批次的原导出子文件夹相同')
-            folders = batch.get('review_folders', {})
-            if str(root) in folders:
-                folder = Path(folders[str(root)])
-                folder.mkdir(parents=True, exist_ok=True)
-            else:
-                folder = self.reserve_output_folder(root)
-                self.store.update(batch_id, lambda b: b.setdefault('review_folders', {}).update({str(root): str(folder)}))
-            target = folder / source.name
+            folder, bundle_name = self.reserve_review_bundle(root, item)
+            self.store.update(batch_id, lambda b: b.setdefault('review_folders', {}).update({str(root): str(folder.parent)}))
+            target = folder / f'{bundle_name}.mp4'
             pending = {'status': 'copying', 'path': str(target), 'review_dir': str(root)}
             self.store.update(batch_id, lambda b: b['items'][index].update(review=pending))
             temporary = folder / ('.' + source.stem + '-' + uuid.uuid4().hex + '.review.tmp')
@@ -781,6 +792,10 @@ class Application:
                 raise
             finally:
                 temporary.unlink(missing_ok=True)
+                try:
+                    folder.rmdir()
+                except OSError:
+                    pass
 
 
 class Handler(BaseHTTPRequestHandler):

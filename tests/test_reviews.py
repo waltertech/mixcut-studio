@@ -1,4 +1,5 @@
 import concurrent.futures
+from datetime import datetime
 from pathlib import Path
 import tempfile
 import unittest
@@ -21,7 +22,7 @@ class ReviewTests(unittest.TestCase):
             file.write_bytes(f'original-video-{index}'.encode() * 1000)
             stat = file.stat()
             items.append({'id': str(index), 'index': index, 'status': 'success', 'output_path': str(file),
-                          'music': [{'path': str(self.root / 'music' / f'song-{index}' / 'track.mp3')}],
+                          'music': [{'path': str(self.root / 'music' / '去重歌曲03' / f'track-{index}.mp3')}],
                           'result': {'output_size': stat.st_size, 'output_mtime_ns': stat.st_mtime_ns}})
         self.record = {'id': 'abc123', 'created_at': 1, 'updated_at': 1, 'status': 'completed',
                        'config': {'output_dir': str(self.root / 'exports')},
@@ -38,11 +39,15 @@ class ReviewTests(unittest.TestCase):
         first = self.approve()['items'][0]['review']
         second = self.approve('2')['items'][1]['review']
         self.assertEqual('approved', first['status'])
-        self.assertRegex(Path(first['path']).parent.name, r'^\d{4}-\d{2}-\d{2}_\d{3}$')
-        self.assertEqual(Path(first['path']).parent, Path(second['path']).parent)
+        self.assertRegex(Path(first['path']).parent.parent.name, r'^\d{4}-\d{2}-\d{2}$')
+        self.assertEqual(Path(first['path']).parent.parent, Path(second['path']).parent.parent)
+        self.assertNotEqual(Path(first['path']).parent, Path(second['path']).parent)
+        self.assertEqual('去重歌曲03_001', Path(first['path']).stem)
+        self.assertEqual('去重歌曲03_002', Path(second['path']).stem)
+        self.assertEqual(Path(first['path']).stem, Path(first['path']).parent.name)
         self.assertEqual((self.export / '001.mp4').read_bytes(), Path(first['path']).read_bytes())
         sidecar = Path(first['path']).with_suffix('.txt')
-        self.assertEqual([str(self.root / 'music' / 'song-1')], sidecar.read_text().splitlines())
+        self.assertEqual([str(self.root / 'music' / '去重歌曲03')], sidecar.read_text().splitlines())
         self.assertEqual(str(sidecar), first['music_paths'])
         self.assertTrue((self.export / '001.mp4').is_file())
         self.assertEqual(first, Application(self.root / 'state').batch('abc123')['items'][0]['review'])
@@ -63,7 +68,7 @@ class ReviewTests(unittest.TestCase):
         result = reopened.batch('abc123')['items'][0]['review']
 
         self.assertTrue(sidecar.is_file())
-        self.assertEqual([str(self.root / 'music' / 'song-1')], sidecar.read_text().splitlines())
+        self.assertEqual([str(self.root / 'music' / '去重歌曲03')], sidecar.read_text().splitlines())
         self.assertEqual('approved', result['status'])
 
     def test_preferences_partial_update_preserves_output_folder(self):
@@ -89,13 +94,13 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual('approved', self.approve()['items'][0]['review']['status'])
 
     def test_different_existing_file_is_not_overwritten(self):
-        self.approve('2')
-        folder = Path(self.app.batch('abc123')['items'][1]['review']['path']).parent
-        target = folder / '001.mp4'
+        day = datetime.now().astimezone().strftime('%Y-%m-%d')
+        folder = self.target_root / day / '去重歌曲03_001'; folder.mkdir(parents=True)
+        target = folder / '去重歌曲03_001.mp4'
         target.write_bytes(b'keep-existing')
-        with self.assertRaisesRegex(ValueError, '不会覆盖'):
-            self.approve()
+        approved = self.approve()['items'][0]['review']
         self.assertEqual(b'keep-existing', target.read_bytes())
+        self.assertEqual('去重歌曲03_002.mp4', Path(approved['path']).name)
 
     def test_restart_recovers_copy_finished_before_state_commit(self):
         approved = self.approve()['items'][0]['review']
