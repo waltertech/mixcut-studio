@@ -173,11 +173,18 @@ class Application:
         return copy.deepcopy(template), stickers.resolve_layers(template['layers'], self.store.get('sticker-assets', []))
 
     def create_sticker_variant(self, body):
-        from . import media
+        from . import media, stickers
         with self.sticker_lock:
-            template, layers = self.resolve_sticker_template(body.get('template_id'))
+            if body.get('layers') is not None:
+                layers = stickers.resolve_layers(body.get('layers'), self.store.get('sticker-assets', []))
+                template = {'id': None, 'name': str(body.get('name') or '视频内手动贴图').strip(),
+                            'layers': [{key: layer[key] for key in
+                                        ('sticker_id', 'x', 'y', 'width', 'opacity', 'start', 'end')}
+                                       for layer in layers]}
+            else:
+                template, layers = self.resolve_sticker_template(body.get('template_id'))
             if not layers:
-                raise ValueError('请先选择贴图模板；不添加贴图可直接审核原成片')
+                raise ValueError('请至少添加一张贴图')
             source_batch_id, source_item_id = str(body['batch_id']), str(body['item_id'])
             source_batch = self.batch(source_batch_id)
             source_item = next((i for i in source_batch['items'] if i['id'] == source_item_id), None)
@@ -201,7 +208,8 @@ class Application:
             folder = self.reserve_output_folder(output_root)
             batch_id = uuid.uuid4().hex[:12]
             config = copy.deepcopy(source_batch['config'])
-            config.update(count=1, sticker_template_id=template['id'], sticker_template=template, sticker_layers=layers)
+            config.update(count=1, sticker_template_id=template.get('id'),
+                          sticker_template=template, sticker_layers=layers)
             styles = source_item.get('music_styles') or music_styles(source_item.get('music', []))
             filename = export_filename(styles, 1) if styles else source.name
             item = {'id': uuid.uuid4().hex, 'index': 1, 'kind': 'sticker_variant',

@@ -134,6 +134,24 @@ class StickerApplicationTest(unittest.TestCase):
         self.assertEqual(Path(job['output_folder']) / '001.mp4', Path(job_item['output_path']))
         self.assertEqual(job['id'], reply['output_batch_id'])
 
+    def test_variant_accepts_layers_positioned_directly_on_completed_video(self):
+        asset = self.imported_asset()
+        source = self.output_root / 'original' / '001.mp4'
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b'original-output-not-to-be-modified')
+        original = self.source_batch(source)
+
+        reply = self.app.create_sticker_variant({
+            'batch_id': original['id'], 'item_id': 'item01',
+            'name': '视频内手动贴图', 'layers': [self.layer(asset, x=.42)],
+        })
+        job = self.app.batch(reply['job_id'])
+
+        self.assertIsNone(job['config']['sticker_template_id'])
+        self.assertEqual(.42, job['config']['sticker_layers'][0]['x'])
+        self.assertEqual('视频内手动贴图', job['config']['sticker_template']['name'])
+        self.assertEqual('视频内手动贴图', job['sticker_origin']['template_name'])
+
     def test_invalid_template_or_source_and_tampered_completed_file_are_rejected(self):
         asset = self.imported_asset()
         with self.assertRaisesRegex(ValueError, '贴纸不存在'):

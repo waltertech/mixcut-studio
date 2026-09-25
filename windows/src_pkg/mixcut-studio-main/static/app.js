@@ -121,12 +121,75 @@
           error.textContent = `归档失败：${item.review.error}`; action.append(error);
         }
       }
+      const directSticker = document.createElement('button'); directSticker.className = 'button direct-sticker'; directSticker.type = 'button'; directSticker.textContent = '在视频上添加贴图';
+      directSticker.addEventListener('click', () => openVideoStickerEditor(batch, item, video));
+      action.append(document.createElement('br'), directSticker);
       video.before(action);
     });
   });
   new MutationObserver(polishReviewActions).observe($('#batches'), { childList: true, subtree: true });
   state.stickers = { assets: [], templates: [], active: null, layers: [] };
   const stickerImage = id => `/api/sticker?id=${encodeURIComponent(id)}`;
+  const waitForStickerVariant = (job, button, dialog) => {
+    button.textContent = '贴图版本排队中';
+    const timer = setInterval(async () => {
+      try {
+        const status = await api(`/api/sticker-variants/${encodeURIComponent(job.job_id)}`);
+        button.textContent = status.status === 'completed' ? '贴图版本已生成' : `生成中 ${Math.round((status.progress || 0) * 100)}%`;
+        if (['completed', 'failed'].includes(status.status)) {
+          clearInterval(timer); button.disabled = false;
+          if (status.status === 'failed') toast(status.error || '贴图版本生成失败', true);
+          else { dialog?.close(); toast('贴图版本已生成，原视频保持不变。'); }
+          await refreshBatches();
+        }
+      } catch (_) { clearInterval(timer); button.disabled = false; }
+    }, 3000);
+  };
+  const openVideoStickerEditor = (batch, item, sourceVideo) => {
+    if (!state.stickers.assets.length) return toast('贴图库为空，请先到“贴图库”导入图片或 GIF。', true);
+    const layers = [];
+    const dialog = document.createElement('dialog'); dialog.className = 'video-sticker-dialog';
+    const heading = document.createElement('div'); heading.className = 'video-sticker-heading';
+    const title = document.createElement('h2'); title.textContent = '在当前视频上添加贴图';
+    const close = document.createElement('button'); close.className = 'button'; close.textContent = '关闭'; close.onclick = () => dialog.close();
+    heading.append(title, close);
+    const stage = document.createElement('div'); stage.className = 'video-sticker-stage';
+    const video = document.createElement('video'); video.src = sourceVideo.src; video.controls = true; video.preload = 'metadata';
+    if (Number.isFinite(sourceVideo.currentTime)) video.addEventListener('loadedmetadata', () => { video.currentTime = sourceVideo.currentTime; }, {once:true});
+    stage.append(video);
+    const controls = document.createElement('div'); controls.className = 'video-sticker-controls';
+    const picker = document.createElement('select'); state.stickers.assets.forEach(asset => picker.append(new Option(asset.name, asset.id)));
+    const add = document.createElement('button'); add.className = 'button'; add.textContent = '添加贴图';
+    const layerList = document.createElement('div'); layerList.className = 'video-sticker-layers';
+    const render = () => {
+      $$('.placed-sticker', stage).forEach(image => image.remove()); layerList.replaceChildren();
+      layers.forEach((layer, index) => {
+        const asset = state.stickers.assets.find(entry => entry.id === layer.sticker_id); if (!asset) return;
+        const image = document.createElement('img'); image.className = 'placed-sticker'; image.src = stickerImage(asset.id); image.draggable = false;
+        const paint = () => { image.style.left = `${layer.x * 100}%`; image.style.top = `${layer.y * 100}%`; image.style.width = `${layer.width * 100}%`; image.style.opacity = layer.opacity; };
+        paint(); stage.append(image);
+        image.addEventListener('pointerdown', event => {
+          event.preventDefault(); image.setPointerCapture(event.pointerId);
+          const box = stage.getBoundingClientRect(), startX = event.clientX, startY = event.clientY, x = layer.x, y = layer.y;
+          const move = next => { layer.x = Math.max(0, Math.min(1 - layer.width, x + (next.clientX - startX) / box.width)); layer.y = Math.max(0, Math.min(.99, y + (next.clientY - startY) / box.height)); paint(); };
+          const done = () => { image.removeEventListener('pointermove', move); image.removeEventListener('pointerup', done); image.removeEventListener('pointercancel', done); };
+          image.addEventListener('pointermove', move); image.addEventListener('pointerup', done); image.addEventListener('pointercancel', done);
+        });
+        const row = document.createElement('div'); row.className = 'video-sticker-layer';
+        const name = document.createElement('span'); name.textContent = `${index + 1}. ${asset.name}`;
+        const width = document.createElement('input'); width.type = 'range'; width.min = '5'; width.max = '80'; width.value = String(layer.width * 100); width.title = '贴图大小'; width.oninput = () => { layer.width = Number(width.value) / 100; layer.x = Math.min(layer.x, 1 - layer.width); paint(); };
+        const opacity = document.createElement('input'); opacity.type = 'range'; opacity.min = '10'; opacity.max = '100'; opacity.value = String(layer.opacity * 100); opacity.title = '透明度'; opacity.oninput = () => { layer.opacity = Number(opacity.value) / 100; paint(); };
+        const remove = document.createElement('button'); remove.className = 'button'; remove.textContent = '移除'; remove.onclick = () => { layers.splice(index, 1); render(); };
+        row.append(name, document.createTextNode('大小'), width, document.createTextNode('透明度'), opacity, remove); layerList.append(row);
+      });
+    };
+    add.onclick = () => { if (layers.length >= 8) return toast('每条视频最多添加 8 张贴图。', true); layers.push({sticker_id:picker.value,x:.05,y:.05,width:.2,opacity:1,start:0,end:null}); render(); };
+    const save = document.createElement('button'); save.className = 'button primary'; save.textContent = '生成贴图版本';
+    save.onclick = async () => { if (!layers.length) return toast('请先添加贴图。', true); save.disabled = true; try { const job = await api('/api/sticker-variants', {method:'POST',body:JSON.stringify({batch_id:batch.id,item_id:item.id,name:'视频内手动贴图',layers})}); waitForStickerVariant(job, save, dialog); } catch (error) { save.disabled = false; toast(error.message, true); } };
+    const help = document.createElement('p'); help.className = 'field-help'; help.textContent = '直接拖动贴图改变位置；滑块调整大小和透明度。播放或拖动视频可检查不同画面。';
+    controls.append(picker, add, layerList, save, help); dialog.append(heading, stage, controls); document.body.append(dialog);
+    dialog.addEventListener('close', () => dialog.remove()); dialog.showModal();
+  };
   const updateStickerSelectors = () => {
     [$('#generation-sticker-template'), ...$$('.sticker-variant')].forEach(select => {
       const previous = select.value;
