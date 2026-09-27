@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from pathlib import Path
 import subprocess
 import threading
@@ -21,7 +20,7 @@ class KeyframeCache:
     def _version(self, path):
         path = Path(path).resolve(strict=True)
         stat = path.stat()
-        identity = f'{path}:{stat.st_size}:{stat.st_mtime_ns}:keyframes-v1'
+        identity = f'{path}:{stat.st_size}:{stat.st_mtime_ns}:keyframes-v2-30s'
         return hashlib.sha256(identity.encode()).hexdigest()[:24]
 
     def _lock(self, key):
@@ -37,27 +36,19 @@ class KeyframeCache:
                 return json.loads(metadata.read_text(encoding='utf-8'))
             with self.slots:
                 result = subprocess.run(
-                    ['ffprobe', '-v', 'error', '-threads', '1', '-skip_frame', 'nokey',
-                     '-select_streams', 'v:0', '-show_frames', '-show_format',
-                     '-show_entries', 'frame=best_effort_timestamp_time:format=duration',
-                     '-of', 'json', str(path)], capture_output=True, text=True, timeout=180)
+                    ['ffprobe', '-v', 'error', '-threads', '1', '-show_entries',
+                     'format=duration', '-of', 'json', str(path)],
+                    capture_output=True, text=True, timeout=60)
             if result.returncode:
                 raise ValueError('关键帧读取失败：' + result.stderr[-500:])
             data = json.loads(result.stdout)
             duration = float(data.get('format', {}).get('duration', 0))
-            timestamps = set()
-            for frame in data.get('frames', []):
-                try:
-                    timestamp = float(frame['best_effort_timestamp_time'])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if math.isfinite(timestamp) and 0 <= timestamp < duration:
-                    timestamps.add(timestamp)
-            if not timestamps:
-                raise ValueError('该视频未读取到关键帧，请检查文件是否可正常播放')
+            if duration <= 0:
+                raise ValueError('视频时长无效，请检查文件是否可正常播放')
             if self._version(path) != version:
                 raise ValueError('视频已变化，请刷新后重新加载关键帧')
-            frames = [{'index': index, 'time': value} for index, value in enumerate(sorted(timestamps))]
+            timestamps = [float(value) for value in range(0, max(1, int(duration)), 30)]
+            frames = [{'index': index, 'time': value} for index, value in enumerate(timestamps)]
             response = {'version': version, 'duration': duration, 'total': len(frames), 'frames': frames}
             directory.mkdir(parents=True, exist_ok=True)
             temporary = directory / ('index-' + uuid.uuid4().hex + '.tmp')
