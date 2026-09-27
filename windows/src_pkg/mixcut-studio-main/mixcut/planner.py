@@ -75,6 +75,35 @@ def _allocate(total: float, count: int, lo: float, hi: float, rng: random.Random
     return result
 
 
+def allocate_music(music, target, config, rng, usage=None):
+    """Choose one batch-aware song set; least-used songs win before reuse."""
+    usage = usage or defaultdict(int)
+    minimum = max(1, int(config.get('min_songs', 1)))
+    maximum = min(len(music), max(minimum, int(config.get('max_songs', len(music)))))
+    desired = rng.randint(minimum, maximum)
+    first_ids = set(config.get('first_song_ids', []))
+    pool = list(music)
+    rng.shuffle(pool)
+    pool.sort(key=lambda song: usage[song['id']])
+    if first_ids:
+        starters = [song for song in pool if song['id'] in first_ids]
+        if not starters:
+            raise ValueError('没有可用的开头候选歌曲')
+        first = starters[0]
+        pool.remove(first)
+        chosen = [first]
+    else:
+        chosen = [pool.pop(0)]
+    total = float(chosen[0]['duration'])
+    while pool and (len(chosen) < desired or total + 1e-7 < target):
+        song = pool.pop(0)
+        chosen.append(song)
+        total += float(song['duration'])
+    if total + 1e-7 < target:
+        raise ValueError(f'全部所选音乐总时长 {total:.1f} 秒，无法覆盖目标视频 {target:.1f} 秒')
+    return tuple(chosen), total
+
+
 def _single_segments(videos, duration, state, config, rng):
     candidates = [video for video in videos if float(video["duration"]) + 1e-6 >= duration]
     if not candidates:
@@ -106,7 +135,9 @@ def _single_segments(videos, duration, state, config, rng):
     return None
 
 
-def _multi_segments(videos: list[dict[str, Any]], total: float, config: dict[str, Any], rng: random.Random) -> list[dict[str, Any]] | None:
+def _multi_segments(videos: list[dict[str, Any]], total: float, config: dict[str, Any], rng: random.Random,
+                    usage: dict[str, int] | None = None) -> list[dict[str, Any]] | None:
+    usage = usage or defaultdict(int)
     lo, hi = float(config.get("segment_min", 30)), float(config.get("segment_max", 120))
     if lo <= 0 or hi < lo:
         raise ValueError("片段最短/最长时长设置无效")
@@ -149,7 +180,9 @@ def _multi_segments(videos: list[dict[str, Any]], total: float, config: dict[str
                             cursor = max(cursor, right)
                     if not choices:
                         break
-                    video, lower, upper = rng.choice(choices)
+                    least_used = min(usage[choice[0]['id']] for choice in choices)
+                    balanced = [choice for choice in choices if usage[choice[0]['id']] == least_used]
+                    video, lower, upper = rng.choice(balanced)
                     # Keep allocations packed on retries so random gaps cannot block a feasible fit.
                     start = rng.uniform(lower, upper) if attempt == 0 else (lower if attempt == 1 else upper)
                     used[video['id']].append((start, start + length))
@@ -214,7 +247,7 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
     # Avoid materializing factorially many permutations.  The limit is deliberately
     # visible to callers: this is a bounded search, not a false impossibility proof.
     search_limit = max(count, min(50000, int(config.get("search_limit", 50000))))
-    orders, bound_reached, nearest = _collect_music_orders(music, config, search_limit)
+    orders, bound_reached, nearest = _collect_music_orders(music, config, search_limit) if config.get('music_mode', 'pool') == 'fixed' else ([], False, None)
     previous_items = previous_items or []
     def music_key(item):
         return item.get('music_fingerprint') or _fingerprint(tuple(song['id'] for song in item.get('music', [])))
@@ -223,7 +256,7 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
     prior_music = {music_key(item) for item in previous_items}
     prior_video = {video_key(item) for item in previous_items}
     orders = [order for order in orders if _fingerprint(tuple(song['id'] for song in order)) not in prior_music]
-    if len(orders) < count and not allow_partial:
+    if config.get('music_mode', 'pool') == 'fixed' and len(orders) < count and not allow_partial:
         suffix = "（搜索达到上限，可能仍有更多方案）" if bound_reached else ""
         hint = f"；最接近目标时长相差约 {nearest:.2f} 秒" if nearest is not None else ""
         raise ValueError(f"符合完整歌曲与时长条件的不同音乐顺序只有 {len(orders)} 个，少于所需 {count} 个{hint}{suffix}")
@@ -234,10 +267,26 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
             for segment in old.get('segments', []):
                 state[segment['asset_id']].append((float(segment['start']), float(segment['start']) + float(segment['duration'])))
     items, used_video = [], set(prior_video)
+    batch_video_usage = defaultdict(int)
+    for old in previous_items:
+        for segment in old.get('segments', []):
+            batch_video_usage[segment['asset_id']] += 1
+    batch_music_usage = defaultdict(int)
+    for old in previous_items:
+        for song in old.get('music', []):
+            batch_music_usage[song['id']] += 1
+    if config.get('music_mode', 'pool') == 'pool':
+        orders = [None] * count
     for order in orders:
-        total = sum(float(song["duration"]) for song in order)
-        segments = (_single_segments(videos, total, state, config, rng) if mode == "single"
-                    else _multi_segments(videos, total, config, rng))
+        if order is None:
+            lower = float(config.get('min_duration', min(float(song['duration']) for song in music)))
+            upper = float(config.get('max_duration', lower))
+            target = rng.uniform(lower, upper) if math.isfinite(upper) else max(lower, min(float(song['duration']) for song in music))
+            order, music_total = allocate_music(music, target, config, rng, batch_music_usage)
+        else:
+            target = music_total = sum(float(song["duration"]) for song in order)
+        segments = (_single_segments(videos, target, state, config, rng) if mode == "single"
+                    else _multi_segments(videos, target, config, rng, batch_video_usage))
         if not segments:
             continue
         video_key = tuple((part["asset_id"], part["start"], round(part["duration"], 6)) for part in segments)
@@ -247,10 +296,15 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
             continue
         used_video.add(video_fingerprint)
         segment_assets = {video["id"]: video for video in videos}
-        items.append({"id": _fingerprint((video_key, music_key)), "index": len(items), "duration": total,
+        items.append({"id": _fingerprint((video_key, music_key)), "index": len(items), "duration": target,
                       "segments": segments, "music": list(order),
+                      "music_total_duration": music_total,
                       "video_assets": [segment_assets[p["asset_id"]] for p in segments],
                       "video_fingerprint": video_fingerprint, "music_fingerprint": _fingerprint(music_key)})
+        for song in order:
+            batch_music_usage[song['id']] += 1
+        for segment in segments:
+            batch_video_usage[segment['asset_id']] += 1
         if len(items) == count:
             break
     if len(items) < count and not allow_partial:

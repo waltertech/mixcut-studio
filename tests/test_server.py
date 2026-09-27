@@ -163,6 +163,20 @@ class ApplicationTestCase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '仅执行中或排队中'):
             self.app.action(record['id'], 'pause')
 
+    def test_single_item_stop_restart_delete_and_clear(self):
+        record = self.save(batch('items1', 'paused', [item(1), item(2, 'failed')], self.root / 'exports'))
+        stopped = self.app.item_action(record['id'], '1', 'stop')
+        self.assertEqual('cancelled', stopped['items'][0]['status'])
+        restarted = self.app.item_action(record['id'], '1', 'start')
+        self.assertEqual('queued', restarted['status'])
+        self.assertEqual('pending', restarted['items'][0]['status'])
+        self.app.store.update(record['id'], lambda value: value.update(status='stopped'))
+        deleted = self.app.item_action(record['id'], '2', 'delete')
+        self.assertEqual(['1'], [entry['id'] for entry in deleted['items']])
+        self.assertEqual(1, deleted['items'][0]['index'])
+        self.assertEqual(1, self.app.clear_batches()['deleted'])
+        self.assertEqual([], self.app.store.batches())
+
     def test_existing_valid_output_is_committed_without_rendering_again(self):
         record = batch('rename1', output_dir=self.root / 'exports')
         output = Path(record['items'][0]['output_path'])

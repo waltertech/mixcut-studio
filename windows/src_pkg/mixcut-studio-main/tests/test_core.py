@@ -35,7 +35,7 @@ class PlannerBoundaries(unittest.TestCase):
                          "music_mode": "fixed", "min_duration": 20, "max_duration": 20,
                          "segment_min": 10, "segment_max": 10})
 
-    def test_pool_generates_unique_orders_and_exact_song_duration(self):
+    def test_pool_balances_song_usage_and_covers_video_duration(self):
         videos = [asset("v1", 100), asset("v2", 100)]
         songs = [asset("a", 10), asset("b", 11), asset("c", 12)]
         result = planner.plan(videos, songs, {"mode": "multi", "count": 3, "music_mode": "pool",
@@ -45,24 +45,25 @@ class PlannerBoundaries(unittest.TestCase):
         self.assertEqual(3, len({item["music_fingerprint"] for item in result["items"]}))
         self.assertEqual(3, result['stats']['unique_music_orders'])
         self.assertEqual(3, result['stats']['unique_video_plans'])
-        self.assertEqual(6, sum(result['stats']['music_usage'].values()))
+        counts = list(result['stats']['music_usage'].values())
+        self.assertLessEqual(max(counts) - min(counts), 1)
         for item in result["items"]:
-            self.assertAlmostEqual(item["duration"], sum(song["duration"] for song in item["music"]))
+            self.assertGreaterEqual(sum(song["duration"] for song in item["music"]), item["duration"])
             self.assertGreaterEqual(len({p["asset_id"] for p in item["segments"]}), 2)
 
     def test_empty_explicit_selection_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "至少选择"):
             planner.plan([asset("v", 20)], [asset("m", 10)], {"video_ids": [], "count": 1})
 
-    def test_bounded_search_marks_uncertainty(self):
+    def test_pool_sampling_is_not_limited_to_early_folder_order(self):
         songs = [asset(str(i), 10) for i in range(5)]
-        with self.assertRaisesRegex(ValueError, "搜索达到上限"):
-            planner.plan([asset("v", 100)], songs, {"mode": "single", "count": 1, "music_mode": "pool",
-                         "first_song_ids": ['4'], "min_songs": 1, "max_songs": 1,
-                         "min_duration": 10, "max_duration": 10, "search_limit": 1})
+        result = planner.plan([asset("v", 100)], songs, {"mode": "single", "count": 5, "music_mode": "pool",
+                              "min_songs": 1, "max_songs": 1, "min_duration": 10,
+                              "max_duration": 10, "seed": 9})
+        self.assertEqual(set(str(i) for i in range(5)), {item['music'][0]['id'] for item in result['items']})
 
     def test_no_duration_match_reports_nearest(self):
-        with self.assertRaisesRegex(ValueError, "最接近"):
+        with self.assertRaisesRegex(ValueError, "无法覆盖"):
             planner.plan([asset("v", 100)], [asset("a", 10), asset("b", 10)], {"mode": "single", "music_mode": "pool", "count": 1,
                          "min_songs": 2, "max_songs": 2, "min_duration": 25, "max_duration": 26})
 

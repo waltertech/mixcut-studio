@@ -147,7 +147,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
                        f'aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]')
     music_labels = ''.join(f'[a{i}]' for i in range(len(item['music'])))
     filters.append(f'{music_labels}concat=n={len(item["music"])}:v=0:a=1,'
-                   f'volume={float(config.get("music_volume", 1))}[music]')
+                   f'atrim=duration={duration:.8f},volume={float(config.get("music_volume", 1))}[music]')
     if original_volume:
         original_labels = ''.join(f'[o{i}]' for i in range(count))
         filters.append(f'{original_labels}concat=n={count}:v=0:a=1[original]')

@@ -35,7 +35,8 @@ class ReviewTests(unittest.TestCase):
     def approve(self, item='1'):
         return self.app.approve({'batch_id': 'abc123', 'item_id': item, 'review_dir': str(self.target_root)})
 
-    def test_copy_preserves_original_and_groups_approved_items(self):
+    def test_copy_cleans_working_output_and_groups_approved_items(self):
+        original = (self.export / '001.mp4').read_bytes()
         first = self.approve()['items'][0]['review']
         second = self.approve('2')['items'][1]['review']
         self.assertEqual('approved', first['status'])
@@ -45,12 +46,15 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual('去重歌曲03_001', Path(first['path']).stem)
         self.assertEqual('去重歌曲03_002', Path(second['path']).stem)
         self.assertEqual(Path(first['path']).stem, Path(first['path']).parent.name)
-        self.assertEqual((self.export / '001.mp4').read_bytes(), Path(first['path']).read_bytes())
+        self.assertEqual(original, Path(first['path']).read_bytes())
         sidecar = Path(first['path']).with_suffix('.txt')
         self.assertEqual([str(self.root / 'music' / '去重歌曲03')], sidecar.read_text().splitlines())
         self.assertEqual(str(sidecar), first['music_paths'])
-        self.assertTrue((self.export / '001.mp4').is_file())
-        self.assertEqual(first, Application(self.root / 'state').batch('abc123')['items'][0]['review'])
+        self.assertFalse((self.export / '001.mp4').exists())
+        reopened_item = Application(self.root / 'state').batch('abc123')['items'][0]
+        self.assertEqual(first, reopened_item['review'])
+        self.assertEqual({'output_deleted': True, 'temporary_segments_deleted': True,
+                          'original_recordings_deleted': False}, reopened_item['cleanup'])
 
     def test_double_click_is_idempotent_even_concurrently(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -108,8 +112,7 @@ class ReviewTests(unittest.TestCase):
         self.app.store.update('abc123', lambda b: b['items'][0]['review'].update(status='copying'))
         self.app = Application(self.root / 'state')
         self.assertEqual('completed', self.app.batch('abc123')['status'])
-        self.assertEqual('failed', self.app.batch('abc123')['items'][0]['review']['status'])
-        self.assertEqual('approved', self.approve()['items'][0]['review']['status'])
+        self.assertEqual('approved', self.app.batch('abc123')['items'][0]['review']['status'])
         self.assertEqual(before, Path(approved['path']).stat().st_mtime_ns)
 
     def test_modified_original_is_rejected(self):

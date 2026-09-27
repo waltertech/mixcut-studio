@@ -12,6 +12,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+import random
 import re
 import shutil
 import sqlite3
@@ -81,6 +82,10 @@ class Store:
             batch['updated_at'] = time.time()
             self.put('batch:' + batch_id, batch)
             return batch
+
+    def delete(self, key):
+        with self.lock, self.connection() as conn:
+            conn.execute('DELETE FROM records WHERE id=?', (key,))
 
 
 class Application:
@@ -428,6 +433,79 @@ class Application:
 
         return self.store.update(batch_id, change)
 
+    def refresh_music(self, batch_id, item_id):
+        from . import planner
+        def change(batch):
+            if batch['status'] != 'draft':
+                raise ValueError('只有草稿方案可以刷新音乐')
+            item = next((entry for entry in batch['items'] if str(entry['id']) == str(item_id)), None)
+            if item is None:
+                raise ValueError('方案条目不存在')
+            selected = set(batch.get('config', {}).get('music_ids') or [])
+            music = [asset for asset in batch.get('assets', []) if asset.get('id') in selected]
+            usage = defaultdict(int)
+            for other in batch['items']:
+                if other is not item:
+                    for song in other.get('music', []):
+                        usage[song['id']] += 1
+            order, total = planner.allocate_music(music, float(item['duration']), batch['config'],
+                                                  random.Random(time.time_ns()), usage)
+            old_ids = [song['id'] for song in item.get('music', [])]
+            if len(music) > 1 and [song['id'] for song in order] == old_ids:
+                order, total = planner.allocate_music(list(reversed(music)), float(item['duration']),
+                                                      batch['config'], random.Random(time.time_ns() + 1), usage)
+            item['music'] = list(order)
+            item['music_total_duration'] = total
+            item['music_fingerprint'] = hashlib.sha256(repr(tuple(song['id'] for song in order)).encode()).hexdigest()
+            root = self.store.get('library', {}).get('music_dir')
+            item['music_source_folders'] = music_folders(item['music'])
+            item['music_styles'] = music_styles(item['music'], root)
+            item['output_name'] = export_filename(item['music_styles'], item['index'])
+            item['output_path'] = str(Path(batch['output_folder']) / item['output_name'])
+            batch.setdefault('stats', {})['music_usage'] = dict(usage)
+            for song in item['music']:
+                batch['stats']['music_usage'][song['id']] = batch['stats']['music_usage'].get(song['id'], 0) + 1
+        return self.store.update(batch_id, change)
+
+    def item_action(self, batch_id, item_id, action):
+        def change(batch):
+            item = next((entry for entry in batch['items'] if str(entry['id']) == str(item_id)), None)
+            if not item:
+                raise ValueError('任务不存在')
+            if action == 'stop':
+                if item['status'] in {'running', 'validating'}:
+                    item['cancel_requested'] = True
+                elif item['status'] == 'pending':
+                    item.update(status='cancelled', error='已手动终止')
+            elif action == 'start':
+                if item['status'] not in {'cancelled', 'failed'}:
+                    raise ValueError('只有已终止或失败的单条任务可以重新开始')
+                item.update(status='pending', error=None, attempts=0, progress=0)
+                batch['status'] = 'queued'
+            elif action == 'delete':
+                if batch['status'] in {'queued', 'running', 'pausing', 'stopping'}:
+                    raise ValueError('请先停止所属批次再删除单条任务')
+                if item['status'] in {'running', 'validating'}:
+                    raise ValueError('请先终止当前任务再删除')
+                batch['items'].remove(item)
+                for index, remaining in enumerate(batch['items'], 1):
+                    remaining['index'] = index
+            else:
+                raise ValueError('未知单条任务操作')
+        result = self.store.update(batch_id, change)
+        self.wake.set()
+        return result
+
+    def clear_batches(self, delete_outputs=False):
+        batches = self.store.batches()
+        if any(batch['status'] in {'running', 'queued', 'pausing', 'stopping'} for batch in batches):
+            raise ValueError('请先停止所有执行中的批次')
+        for batch in batches:
+            if delete_outputs:
+                shutil.rmtree(batch_output_folder(batch), ignore_errors=True)
+            self.store.delete('batch:' + batch['id'])
+        return {'ok': True, 'deleted': len(batches)}
+
     def action(self, batch_id, action):
         def change(batch):
             status = batch['status']
@@ -507,12 +585,19 @@ class Application:
                         except (OSError, ValueError):
                             pass
                 if item.get('review', {}).get('status') == 'copying':
-                    item['review'].update(status='failed', error='上次归档中断，请再次点击通过审核以恢复')
+                    archived = Path(item['review'].get('path', ''))
+                    if item.get('cleanup', {}).get('output_deleted') and archived.is_file():
+                        item['review'].update(status='approved')
+                        item['review'].pop('error', None)
+                    else:
+                        item['review'].update(status='failed', error='上次归档中断，请再次点击通过审核以恢复')
                     review_changed = True
-                if item['status'] == 'success' and not Path(item['output_path']).is_file():
+                if (item['status'] == 'success' and not item.get('cleanup', {}).get('output_deleted')
+                        and not Path(item['output_path']).is_file()):
                     item.update(status='failed', error='已完成的输出文件已被移动或删除')
                     changed = True
-                elif item['status'] == 'success' and item.get('result', {}).get('output_mtime_ns'):
+                elif (item['status'] == 'success' and not item.get('cleanup', {}).get('output_deleted')
+                      and item.get('result', {}).get('output_mtime_ns')):
                     stat = Path(item['output_path']).stat()
                     saved = item['result']
                     if stat.st_size != saved.get('output_size') or stat.st_mtime_ns != saved['output_mtime_ns']:
@@ -617,6 +702,9 @@ class Application:
                 def progress(value, *args, **kwargs):
                     now = time.monotonic()
                     stage = value.get('stage') if isinstance(value, dict) else None
+                    current_item = next(entry for entry in self.batch(batch_id)['items'] if entry['id'] == item['id'])
+                    if stage != 'complete' and current_item.get('cancel_requested'):
+                        raise InterruptedError('单条任务已手动终止')
                     if stage != 'complete' and self.batch(batch_id).get('scheduled_cancelled'):
                         from .scheduler import ScheduledRunCancelled
                         raise ScheduledRunCancelled('新定时任务已启动，旧目标取消')
@@ -644,6 +732,10 @@ class Application:
                         status='success', progress=1, error=None, result=result))
                     break
                 except Exception as exc:
+                    if isinstance(exc, InterruptedError):
+                        self.store.update(batch_id, lambda b: b['items'][index].update(
+                            status='cancelled', error=str(exc), cancel_requested=False))
+                        break
                     if self.batch(batch_id).get('scheduled_cancelled'):
                         self.scheduler.finish_cancelled_batch(batch_id)
                         return
@@ -784,6 +876,12 @@ class Application:
                             'sha256': digest, 'size': target.stat().st_size,
                             'music_paths': str(sidecar) if sidecar else None}
                 result = self.store.update(batch_id, lambda b: b['items'][index].update(review=approved))
+                source.unlink(missing_ok=True)
+                source.with_suffix('.txt').unlink(missing_ok=True)
+                shutil.rmtree(self.store.directory / 'work' / batch_id / item_id, ignore_errors=True)
+                result = self.store.update(batch_id, lambda b: b['items'][index].update(
+                    cleanup={'output_deleted': True, 'temporary_segments_deleted': True,
+                             'original_recordings_deleted': False}))
                 self.preferences({'review_dir': str(root)})
                 return result
             except Exception as exc:
@@ -875,6 +973,14 @@ class Handler(BaseHTTPRequestHandler):
                 if music_order_match:
                     return self.json_response(self.app.reorder_music(
                         music_order_match[1], music_order_match[2], body.get('music_ids')))
+                music_refresh_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/refresh-music', path)
+                if music_refresh_match:
+                    return self.json_response(self.app.refresh_music(*music_refresh_match.groups()))
+                item_action_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/(start|stop|delete)', path)
+                if item_action_match:
+                    return self.json_response(self.app.item_action(*item_action_match.groups()))
+                if path == '/api/batches/clear':
+                    return self.json_response(self.app.clear_batches(bool(body.get('delete_outputs'))))
                 match = re.fullmatch(r'/api/batches/([a-f0-9]+)/([a-z]+)', path)
                 if match:
                     return self.json_response(self.app.action(*match.groups()))

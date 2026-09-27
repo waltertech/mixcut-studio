@@ -18,16 +18,19 @@ class PartialPlanningTests(unittest.TestCase):
         value.update(extra)
         return value
 
-    def test_partial_returns_all_available_music_orders(self):
+    def test_partial_uses_video_capacity_not_music_permutation_count(self):
         result = planner.plan([asset('v', 100)], [asset('a', 10), asset('b', 10)], self.config(), allow_partial=True)
-        self.assertEqual(2, len(result['items']))
+        self.assertEqual(50, len(result['items']))
         self.assertEqual(50, result['stats']['requested_count'])
-        self.assertEqual(48, result['stats']['remaining'])
+        self.assertEqual(0, result['stats']['remaining'])
+        self.assertLessEqual(max(result['stats']['music_usage'].values()) - min(result['stats']['music_usage'].values()), 1)
 
     def test_same_previous_items_produce_no_duplicates(self):
         first = planner.plan([asset('v', 100)], [asset('a', 10), asset('b', 10)], self.config(2), allow_partial=True)
         again = planner.plan([asset('v', 100)], [asset('a', 10), asset('b', 10)], self.config(2), allow_partial=True, previous_items=first['items'])
-        self.assertEqual([], again['items'])
+        self.assertEqual(2, len(again['items']))
+        old = {item['video_fingerprint'] for item in first['items']}
+        self.assertTrue(old.isdisjoint(item['video_fingerprint'] for item in again['items']))
 
     def test_new_video_can_use_orders_left_by_old_capacity(self):
         songs = [asset('a', 10), asset('b', 10), asset('c', 10)]
@@ -35,7 +38,7 @@ class PartialPlanningTests(unittest.TestCase):
         second = planner.plan([asset('old', 10), asset('new', 10)], songs, self.config(3, allow_overlap=False), allow_partial=True, previous_items=first['items'])
         self.assertEqual(1, len(first['items']))
         self.assertGreaterEqual(len(second['items']), 1)
-        self.assertTrue({i['music_fingerprint'] for i in first['items']}.isdisjoint(i['music_fingerprint'] for i in second['items']))
+        self.assertNotEqual(first['items'][0]['video_fingerprint'], second['items'][0]['video_fingerprint'])
 
     def test_previous_intervals_block_nonoverlap_across_calls(self):
         previous = [{'segments': [{'asset_id': 'v', 'start': 0, 'duration': 10}], 'music': []}]
@@ -52,7 +55,18 @@ class PartialPlanningTests(unittest.TestCase):
 
     def test_strict_mode_remains_strict(self):
         with self.assertRaises(ValueError):
-            planner.plan([asset('v', 100)], [asset('a', 10)], self.config(2))
+            planner.plan([asset('v', 10)], [asset('a', 10)], self.config(2, allow_overlap=False))
+
+    def test_fifteen_items_share_one_balanced_music_allocation(self):
+        songs = [asset(f'song-{index:02d}', 20) for index in range(30)]
+        result = planner.plan([asset('v', 1000)], songs,
+                              self.config(15, min_songs=2, max_songs=4,
+                                          min_duration=35, max_duration=55, seed=9))
+        uses = [song['id'] for item in result['items'] for song in item['music']]
+        first_repeat = next((index for index, song in enumerate(uses) if song in uses[:index]), len(uses))
+        self.assertGreaterEqual(first_repeat, 30)
+        self.assertTrue(all(item['music_total_duration'] >= item['duration'] for item in result['items']))
+        self.assertTrue(all(2 <= len(item['music']) <= 4 for item in result['items']))
 
 
 if __name__ == '__main__':
