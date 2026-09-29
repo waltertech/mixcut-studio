@@ -13,6 +13,13 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(repr(value).encode("utf-8")).hexdigest()
 
 
+def video_plan_key(segments, fps=30):
+    """Compare rendered timelines at output-frame precision."""
+    rate = max(1, int(fps))
+    return tuple((part['asset_id'], round(float(part.get('start', 0)) * rate),
+                  round(float(part.get('duration', 0)) * rate)) for part in segments)
+
+
 def _selected(items: list[dict[str, Any]], ids: list[str] | None, label: str) -> list[dict[str, Any]]:
     by_id = {item["id"]: item for item in items}
     wanted = list(by_id) if ids is None else list(dict.fromkeys(ids))
@@ -26,7 +33,6 @@ def _selected(items: list[dict[str, Any]], ids: list[str] | None, label: str) ->
 def _collect_music_orders(music: list[dict[str, Any]], config: dict[str, Any], limit: int) -> tuple[list[tuple[dict[str, Any], ...]], bool, float | None]:
     """Bound *examined* permutations; retain nearest duration for actionable errors."""
     mode = config.get("music_mode", "pool")
-    first = set(config.get("first_song_ids", []))
     lower, upper = float(config.get("min_duration", 0)), float(config.get("max_duration", math.inf))
     lengths = [len(music)] if mode == "fixed" else range(max(1, int(config.get("min_songs", 1))), min(len(music), int(config.get("max_songs", len(music)))) + 1)
     found, examined, nearest = [], 0, None
@@ -40,8 +46,6 @@ def _collect_music_orders(music: list[dict[str, Any]], config: dict[str, Any], l
             examined += 1
             if examined > limit:
                 return found, True, nearest
-            if first and order[0]["id"] not in first:
-                continue
             total = sum(float(song["duration"]) for song in order)
             distance = abs(total - target)
             nearest = distance if nearest is None else min(nearest, distance)
@@ -76,68 +80,135 @@ def _allocate(total: float, count: int, lo: float, hi: float, rng: random.Random
 
 
 def allocate_music(music, target, config, rng, usage=None):
-    """Choose one batch-aware song set; least-used songs win before reuse."""
-    usage = usage or defaultdict(int)
+    """Choose a feasible song set, exhausting each usage round before the next."""
+    usage = defaultdict(int, usage or {})
     minimum = max(1, int(config.get('min_songs', 1)))
-    maximum = min(len(music), max(minimum, int(config.get('max_songs', len(music)))))
-    desired = rng.randint(minimum, maximum)
-    first_ids = set(config.get('first_song_ids', []))
-    pool = list(music)
-    rng.shuffle(pool)
-    pool.sort(key=lambda song: usage[song['id']])
-    if first_ids:
-        starters = [song for song in pool if song['id'] in first_ids]
-        if not starters:
-            raise ValueError('没有可用的开头候选歌曲')
-        first = starters[0]
-        pool.remove(first)
-        chosen = [first]
-    else:
-        chosen = [pool.pop(0)]
-    total = float(chosen[0]['duration'])
-    while pool and (len(chosen) < desired or total + 1e-7 < target):
-        song = pool.pop(0)
-        chosen.append(song)
-        total += float(song['duration'])
-    if total + 1e-7 < target:
-        raise ValueError(f'全部所选音乐总时长 {total:.1f} 秒，无法覆盖目标视频 {target:.1f} 秒')
-    return tuple(chosen), total
+    maximum = min(len(music), int(config.get('max_songs', len(music))))
+    if maximum < minimum:
+        raise ValueError('所选歌曲数少于每条任务的最少首数')
+    levels = sorted({usage[song['id']] for song in music})
+    counts = list(range(minimum, maximum + 1))
+    rng.shuffle(counts)
 
+    def best_remaining(available, slots):
+        if len(available) < slots:
+            return -math.inf
+        return sum(sorted((float(song['duration']) for song in available), reverse=True)[:slots])
 
-def _single_segments(videos, duration, state, config, rng):
-    candidates = [video for video in videos if float(video["duration"]) + 1e-6 >= duration]
-    if not candidates:
-        return None
-    rng.shuffle(candidates)
-    candidates.sort(key=lambda video: len(state[video['id']]))
-    overlap = bool(config.get("allow_overlap", True))
-    gap = max(0.001, float(config.get("start_gap", 1)))
-    for video in candidates:
-        available = float(video["duration"]) - duration
-        previous = state[video['id']]
-        if overlap:
-            # Find starts in the remaining gaps, and prefer ones furthest from prior starts.
-            options = [0.0, available]
-            for old_start, _ in previous:
-                options.extend([old_start - gap, old_start + gap])
-            options = [x for x in options if 0 <= x <= available and
-                       all(abs(x - old) >= gap - 1e-6 for old, _ in previous)]
-            if not options:
+    for ceiling in levels:
+        for count in counts:
+            remaining = [song for song in music if usage[song['id']] <= ceiling]
+            if best_remaining(remaining, count) + 1e-7 < target:
                 continue
-            rng.shuffle(options)
-            start = max(options, key=lambda x: min((abs(x - old) for old, _ in previous), default=0))
+            chosen = []
+            total = 0.0
+            for position in range(count):
+                viable = []
+                slots = count - position - 1
+                by_duration = sorted(remaining, key=lambda entry: float(entry['duration']), reverse=True)
+                best = sum(float(entry['duration']) for entry in by_duration[:slots])
+                top_ids = {entry['id'] for entry in by_duration[:slots]}
+                next_duration = float(by_duration[slots]['duration']) if slots < len(by_duration) else 0.0
+                for song in remaining:
+                    if len(remaining) - 1 < slots:
+                        continue
+                    rest_best = best - float(song['duration']) + next_duration if song['id'] in top_ids else best
+                    if total + float(song['duration']) + rest_best + 1e-7 >= target:
+                        viable.append(song)
+                if not viable:
+                    break
+                min_level = min(usage[song['id']] for song in viable)
+                viable = [song for song in viable if usage[song['id']] == min_level]
+                song = rng.choice(viable)
+                chosen.append(song)
+                remaining.remove(song)
+                total += float(song['duration'])
+            if len(chosen) == count and total + 1e-7 >= target:
+                # Choose the set for feasibility and batch usage, then choose playback order.
+                rng.shuffle(chosen)
+                return tuple(chosen), total
+    raise ValueError(f'本轮未用歌曲在 {minimum}～{maximum} 首内无法覆盖目标视频 {target:.1f} 秒；请增加曲目或调整时长')
+
+
+def _free_starts(source_duration, length, occupied):
+    """Return start ranges whose whole segment is outside occupied intervals."""
+    ranges = []
+    cursor = 0.0
+    for left, right in sorted(occupied):
+        left, right = max(0.0, left), min(source_duration, right)
+        if left - cursor + 1e-7 >= length:
+            ranges.append((cursor, max(cursor, left - length)))
+        cursor = max(cursor, right)
+    if source_duration - cursor + 1e-7 >= length:
+        ranges.append((cursor, max(cursor, source_duration - length)))
+    return ranges
+
+
+def _respect_start_gap(ranges, old_starts, gap):
+    if gap <= 0:
+        return ranges
+    for old in old_starts:
+        kept = []
+        for lower, upper in ranges:
+            if lower <= old - gap:
+                kept.append((lower, min(upper, old - gap)))
+            if upper >= old + gap:
+                kept.append((max(lower, old + gap), upper))
+        ranges = [(lower, upper) for lower, upper in kept if lower <= upper + 1e-7]
+    return ranges
+
+
+def choose_video_segment(videos, length, occupied, usage, rng, *, allow_overlap=True,
+                         excluded_ids=(), protected=None, placement='random', min_start_gap=0):
+    """Use the least-used eligible source, and prefer unseen time ranges in every round."""
+    excluded_ids = set(excluded_ids)
+    for permit_reused_time in (False, True) if allow_overlap else (False,):
+        choices = []
+        for video in videos:
+            if video['id'] in excluded_ids or float(video['duration']) + 1e-7 < length:
+                continue
+            reservations = ((protected or {}).get(video['id'], []) if permit_reused_time
+                            else occupied.get(video['id'], []))
+            starts = _free_starts(float(video['duration']), length, reservations)
+            starts = _respect_start_gap(starts, (left for left, _ in occupied.get(video['id'], [])),
+                                        min_start_gap)
+            for lower, upper in starts:
+                if placement == 'grid' and min_start_gap > 0:
+                    first = math.ceil((lower - 1e-7) / min_start_gap)
+                    last = math.floor((upper + 1e-7) / min_start_gap)
+                    step = max(1, math.ceil(max(0, last - first + 1) / 2048))
+                    choices.extend((video, point * min_start_gap, point * min_start_gap)
+                                   for point in range(first, last + 1, step))
+                else:
+                    choices.append((video, lower, upper))
+        if not choices:
+            continue
+        level = min(usage[video['id']] for video, _, _ in choices)
+        video, lower, upper = rng.choice([choice for choice in choices if usage[choice[0]['id']] == level])
+        if placement == 'spread':
+            old = [left for left, _ in occupied.get(video['id'], [])]
+            endpoints = [lower, upper]
+            rng.shuffle(endpoints)
+            start = max(endpoints, key=lambda point: min((abs(point - value) for value in old),
+                                                         default=0.0))
         else:
-            start = max((end for _, end in previous), default=0)
-            if start + duration > float(video["duration"]) + 1e-6:
-                continue
-        previous.append((start, start + duration))
-        return [{"asset_id": video["id"], "path": video["path"], "start": round(start, 6), "duration": duration}]
+            start = lower if placement == 'start' else upper if placement == 'end' else rng.uniform(lower, upper)
+        start = round(start, 6)
+        return {'asset_id': video['id'], 'path': video['path'], 'start': start, 'duration': length}
     return None
 
 
+def _single_segments(videos, duration, state, config, rng, usage):
+    overlap = bool(config.get('allow_overlap', True))
+    segment = choose_video_segment(videos, duration, state, usage, rng,
+                                   allow_overlap=overlap,
+                                   min_start_gap=float(config.get('start_gap', 1)) if overlap else 0,
+                                   placement='grid' if overlap else 'start')
+    return [segment] if segment else None
+
+
 def _multi_segments(videos: list[dict[str, Any]], total: float, config: dict[str, Any], rng: random.Random,
-                    usage: dict[str, int] | None = None) -> list[dict[str, Any]] | None:
-    usage = usage or defaultdict(int)
+                    usage: dict[str, int], state: dict[str, list[tuple[float, float]]]) -> list[dict[str, Any]] | None:
     lo, hi = float(config.get("segment_min", 30)), float(config.get("segment_max", 120))
     if lo <= 0 or hi < lo:
         raise ValueError("片段最短/最长时长设置无效")
@@ -159,38 +230,71 @@ def _multi_segments(videos: list[dict[str, Any]], total: float, config: dict[str
         pools = [videos]
     pools = [pool for pool in pools if sum(float(v['duration']) for v in pool) + 1e-6 >= total]
     rng.shuffle(pools)
-    for count in counts:
-        for pool in pools:
-            for attempt in range(3):
-                lengths = _allocate(total, count, lo, hi, rng)
-                if not lengths:
-                    continue
-                used = defaultdict(list)
-                segments = []
-                for index, length in enumerate(lengths):
-                    choices = []
-                    for video in pool:
-                        if index == 1 and video['id'] == segments[0]['asset_id']:
-                            continue
-                        cursor = 0.0
-                        intervals = sorted(used[video['id']]) + [(float(video['duration']), float(video['duration']))]
-                        for left, right in intervals:
-                            if left - cursor + 1e-7 >= length:
-                                choices.append((video, cursor, max(cursor, left - length)))
-                            cursor = max(cursor, right)
-                    if not choices:
-                        break
-                    least_used = min(usage[choice[0]['id']] for choice in choices)
-                    balanced = [choice for choice in choices if usage[choice[0]['id']] == least_used]
-                    video, lower, upper = rng.choice(balanced)
-                    # Keep allocations packed on retries so random gaps cannot block a feasible fit.
-                    start = rng.uniform(lower, upper) if attempt == 0 else (lower if attempt == 1 else upper)
-                    used[video['id']].append((start, start + length))
-                    segments.append({'asset_id': video['id'], 'path': video['path'],
-                                     'start': start, 'duration': length})
-                if len(segments) == count:
-                    return segments
+    for permit_overlap in (False, True) if config.get('allow_overlap', True) else (False,):
+        for count in counts:
+            for pool in pools:
+                for attempt in range(6):
+                    lengths = _allocate(total, count, lo, hi, rng)
+                    if not lengths:
+                        continue
+                    used = defaultdict(list)
+                    local_usage = defaultdict(int)
+                    segments = []
+                    for index, length in enumerate(lengths):
+                        occupied = {video['id']: state[video['id']] + used[video['id']] for video in pool}
+                        source_usage = defaultdict(int, {video['id']: usage[video['id']] + local_usage[video['id']]
+                                                         for video in pool})
+                        excluded = {segments[0]['asset_id']} if index == 1 else set()
+                        segment = choose_video_segment(pool, length, occupied, source_usage, rng,
+                                                       allow_overlap=permit_overlap,
+                                                       excluded_ids=excluded, protected=used,
+                                                       placement='random' if attempt < 4 else 'start' if attempt == 4 else 'end')
+                        if segment is None:
+                            break
+                        used[segment['asset_id']].append((segment['start'], segment['start'] + length))
+                        local_usage[segment['asset_id']] += 1
+                        segments.append(segment)
+                    if len(segments) == count:
+                        return segments
     return None
+
+
+def annotate_batch(items):
+    """Derive display counts from the current plan after every edit or refresh."""
+    video_usage = defaultdict(int)
+    music_usage = defaultdict(int)
+    for item in items:
+        for segment in item.get('segments', []):
+            video_usage[segment['asset_id']] += 1
+        for song in item.get('music', []):
+            music_usage[song['id']] += 1
+    for item in items:
+        for song in item.get('music', []):
+            song['batch_use_count'] = music_usage[song['id']]
+        for segment in item.get('segments', []):
+            segment['source_use_count'] = video_usage[segment['asset_id']]
+            segment['batch_use_count'] = 1 + sum(
+                1 for other in items if other is not item and any(
+                    candidate['asset_id'] == segment['asset_id'] and
+                    min(float(candidate.get('start', 0)) + float(candidate.get('duration', 0)),
+                        float(segment.get('start', 0)) + float(segment.get('duration', 0))) -
+                    max(float(candidate.get('start', 0)), float(segment.get('start', 0))) > 1e-6
+                    for candidate in other.get('segments', [])))
+    overlaps = []
+    overlap_pairs = 0
+    for left, right in itertools.combinations(items, 2):
+        shared = 0.0
+        for a in left.get('segments', []):
+            for b in right.get('segments', []):
+                if a['asset_id'] == b['asset_id']:
+                    shared += max(0.0, min(a.get('start', 0) + a.get('duration', 0),
+                                           b.get('start', 0) + b.get('duration', 0))
+                                  - max(a.get('start', 0), b.get('start', 0)))
+        overlap_pairs += shared > 1e-6
+        overlaps.append(shared / min(left['duration'], right['duration']))
+    return {'video_usage': dict(video_usage), 'music_usage': dict(music_usage),
+            'segment_overlap_pairs': overlap_pairs,
+            'max_overlap_ratio': max(overlaps, default=0.0)}
 
 
 def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict[str, Any], *,
@@ -228,8 +332,6 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
         videos = [video for video in videos if float(video['duration']) > source_minutes * 60]
     filtered_video_count = selected_video_count - len(videos)
     music = _selected(music, config.get("music_ids"), "音乐")
-    if not set(config.get('first_song_ids', [])).issubset({song['id'] for song in music}):
-        raise ValueError('开头候选歌曲必须同时勾选为参与剪辑的歌曲')
     if not videos or not music:
         if not videos and source_minutes > 0:
             message = f'没有时长大于 {source_minutes:g} 分钟的可用源视频（已排除 {filtered_video_count} 条）；请降低门槛或添加更长的视频'
@@ -252,7 +354,7 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
     def music_key(item):
         return item.get('music_fingerprint') or _fingerprint(tuple(song['id'] for song in item.get('music', [])))
     def video_key(item):
-        return item.get('video_fingerprint') or _fingerprint(tuple((part['asset_id'], part['start'], round(part['duration'], 6)) for part in item.get('segments', [])))
+        return _fingerprint(video_plan_key(item.get('segments', []), config.get('fps', 30)))
     prior_music = {music_key(item) for item in previous_items}
     prior_video = {video_key(item) for item in previous_items}
     orders = [order for order in orders if _fingerprint(tuple(song['id'] for song in order)) not in prior_music]
@@ -262,10 +364,9 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
         raise ValueError(f"符合完整歌曲与时长条件的不同音乐顺序只有 {len(orders)} 个，少于所需 {count} 个{hint}{suffix}")
     rng.shuffle(orders)
     state = defaultdict(list)
-    if mode == 'single':
-        for old in previous_items:
-            for segment in old.get('segments', []):
-                state[segment['asset_id']].append((float(segment['start']), float(segment['start']) + float(segment['duration'])))
+    for old in previous_items:
+        for segment in old.get('segments', []):
+            state[segment['asset_id']].append((float(segment['start']), float(segment['start']) + float(segment['duration'])))
     items, used_video = [], set(prior_video)
     batch_video_usage = defaultdict(int)
     for old in previous_items:
@@ -281,15 +382,26 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
         if order is None:
             lower = float(config.get('min_duration', min(float(song['duration']) for song in music)))
             upper = float(config.get('max_duration', lower))
-            target = rng.uniform(lower, upper) if math.isfinite(upper) else max(lower, min(float(song['duration']) for song in music))
-            order, music_total = allocate_music(music, target, config, rng, batch_music_usage)
+            candidates = ([rng.uniform(lower, upper) for _ in range(6)] + [lower]
+                          if math.isfinite(upper) else [max(lower, min(float(song['duration']) for song in music))])
+            last_error = None
+            for target in candidates:
+                try:
+                    order, music_total = allocate_music(music, target, config, rng, batch_music_usage)
+                    break
+                except ValueError as exc:
+                    last_error = exc
+            else:
+                if allow_partial:
+                    break
+                raise last_error
         else:
             target = music_total = sum(float(song["duration"]) for song in order)
-        segments = (_single_segments(videos, target, state, config, rng) if mode == "single"
-                    else _multi_segments(videos, target, config, rng, batch_video_usage))
+        segments = (_single_segments(videos, target, state, config, rng, batch_video_usage) if mode == "single"
+                    else _multi_segments(videos, target, config, rng, batch_video_usage, state))
         if not segments:
             continue
-        video_key = tuple((part["asset_id"], part["start"], round(part["duration"], 6)) for part in segments)
+        video_key = video_plan_key(segments, config.get('fps', 30))
         music_key = tuple(song["id"] for song in order)
         video_fingerprint = _fingerprint(video_key)
         if video_fingerprint in used_video:
@@ -305,33 +417,25 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
             batch_music_usage[song['id']] += 1
         for segment in segments:
             batch_video_usage[segment['asset_id']] += 1
+            state[segment['asset_id']].append((float(segment['start']),
+                                               float(segment['start']) + float(segment['duration'])))
         if len(items) == count:
             break
     if len(items) < count and not allow_partial:
         raise ValueError(f"只能生成 {len(items)} 条不同视频方案；请允许重叠、增加素材或缩短时长")
-    usage = defaultdict(int)
-    music_usage = defaultdict(int)
-    for item in items:
-        for segment in item["segments"]:
-            usage[segment["asset_id"]] += 1
-        for song in item["music"]:
-            music_usage[song["id"]] += 1
-    overlaps = []
-    for left, right in itertools.combinations(items, 2):
-        shared = 0.0
-        for a in left["segments"]:
-            for b in right["segments"]:
-                if a["asset_id"] == b["asset_id"]:
-                    shared += max(0.0, min(a["start"] + a["duration"], b["start"] + b["duration"])
-                                  - max(a["start"], b["start"]))
-        overlaps.append(shared / min(left["duration"], right["duration"]))
+    statistics = annotate_batch(items)
     warnings = (["音乐组合搜索达到上限；更多可行方案可能存在"] if bound_reached else [])
+    if config.get('music_mode', 'pool') == 'fixed' and len(items) > 1:
+        warnings.append('固定歌曲集合模式会在多条任务中重复使用同一批歌曲；整批轮转仅适用于候选池组合')
+    if (config.get('music_mode', 'pool') == 'pool' and
+            any(value > 1 for value in statistics['music_usage'].values()) and
+            len(statistics['music_usage']) < len(music)):
+        warnings.append('本轮剩余未用歌曲无法在最多首数内覆盖目标时长，已使用下一轮歌曲；可增加最多首数或降低成片时长')
     if filtered_video_count:
         warnings.append(f'源视频须大于 {source_minutes:g} 分钟，已排除 {filtered_video_count} 条不符合时长的视频')
     if allow_partial and len(items) < count:
         warnings.append(f"仅生成 {len(items)}/{count} 条；可用音乐顺序或视频方案不足")
     return {"items": items, "stats": {"count": len(items), "requested_count": count, "remaining": count - len(items),
-            "video_usage": dict(usage), "music_usage": dict(music_usage),
+            **statistics,
             "unique_music_orders": len({item["music_fingerprint"] for item in items}),
-            "unique_video_plans": len({item["video_fingerprint"] for item in items}),
-            "max_overlap_ratio": max(overlaps, default=0.0)}, "warnings": warnings}
+            "unique_video_plans": len({item["video_fingerprint"] for item in items})}, "warnings": warnings}

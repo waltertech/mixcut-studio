@@ -123,6 +123,7 @@ class StickerApplicationTest(unittest.TestCase):
 
         self.assertEqual('queued', reply['status'])
         self.assertEqual('sticker_variant', job_item['kind'])
+        self.assertTrue(job['sticker_origin']['replace_origin_on_approval'])
         self.assertEqual([], job_item['segments'])
         self.assertEqual([], job_item['music'])
         self.assertEqual(source.read_bytes(), b'original-output-not-to-be-modified')
@@ -151,6 +152,21 @@ class StickerApplicationTest(unittest.TestCase):
         self.assertEqual(.42, job['config']['sticker_layers'][0]['x'])
         self.assertEqual('视频内手动贴图', job['config']['sticker_template']['name'])
         self.assertEqual('视频内手动贴图', job['sticker_origin']['template_name'])
+
+    def test_variant_can_use_verified_review_copy_after_working_output_is_deleted(self):
+        template = self.save_template(self.imported_asset())
+        source = self.output_root / 'original' / '001.mp4'
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b'original-output-not-to-be-modified')
+        original = self.source_batch(source)
+        self.app.store.update(original['id'], lambda batch: batch['items'][0].pop('review'))
+        approved = self.app.approve({'batch_id': original['id'], 'item_id': 'item01',
+                                     'review_dir': str(self.root / 'approved')})
+        archived = approved['items'][0]['review']['path']
+        self.assertFalse(source.exists())
+        reply = self.app.create_sticker_variant({'batch_id': original['id'], 'item_id': 'item01',
+                                                  'template_id': template['id']})
+        self.assertEqual(archived, self.app.batch(reply['job_id'])['items'][0]['source_asset']['path'])
 
     def test_invalid_template_or_source_and_tampered_completed_file_are_rejected(self):
         asset = self.imported_asset()

@@ -11,18 +11,18 @@ def asset(identity: str, duration: float) -> dict:
 
 
 class PlannerBoundaries(unittest.TestCase):
-    def test_fixed_first_song_has_only_two_orders_for_three_songs(self):
+    def test_legacy_first_song_choice_does_not_limit_fixed_orders(self):
         songs = [asset("a", 10), asset("b", 10), asset("c", 10)]
         videos = [asset("v", 100)]
-        with self.assertRaisesRegex(ValueError, "只有 2 个"):
-            planner.plan(videos, songs, {"mode": "single", "count": 3, "music_mode": "fixed",
-                                         "first_song_ids": ["a"], "min_duration": 30, "max_duration": 30})
+        result = planner.plan(videos, songs, {"mode": "single", "count": 3, "music_mode": "fixed",
+                              "first_song_ids": ["a"], "min_duration": 30, "max_duration": 30})
+        self.assertEqual(3, len(result['items']))
 
-    def test_fixed_five_songs_with_first_has_24_orders(self):
+    def test_legacy_first_song_choice_does_not_cap_fixed_orders(self):
         songs = [asset(str(i), 10) for i in range(5)]
-        with self.assertRaisesRegex(ValueError, "只有 24 个"):
-            planner.plan([asset("v", 100)], songs, {"mode": "single", "count": 25, "music_mode": "fixed",
-                         "first_song_ids": ["0"], "min_duration": 50, "max_duration": 50})
+        result = planner.plan([asset("v", 100)], songs, {"mode": "single", "count": 25,
+            "music_mode": "fixed", "first_song_ids": ["0"], "min_duration": 50, "max_duration": 50})
+        self.assertEqual(25, result['stats']['unique_music_orders'])
 
     def test_single_rejects_source_shorter_than_complete_music(self):
         with self.assertRaisesRegex(ValueError, "只能生成 0"):
@@ -39,7 +39,7 @@ class PlannerBoundaries(unittest.TestCase):
         videos = [asset("v1", 100), asset("v2", 100)]
         songs = [asset("a", 10), asset("b", 11), asset("c", 12)]
         result = planner.plan(videos, songs, {"mode": "multi", "count": 3, "music_mode": "pool",
-             "min_songs": 2, "max_songs": 2, "min_duration": 21, "max_duration": 23,
+             "min_songs": 2, "max_songs": 2, "min_duration": 21, "max_duration": 21,
              "segment_min": 5, "segment_max": 12, "seed": 3})
         self.assertEqual(3, len(result["items"]))
         self.assertEqual(3, len({item["music_fingerprint"] for item in result["items"]}))
@@ -97,10 +97,11 @@ class PlannerBoundaries(unittest.TestCase):
                                'within_group': True, 'groups': groups})
         self.assertEqual(1, len({groups[p['asset_id']] for p in result['items'][0]['segments']}))
 
-    def test_unselected_first_song_is_explained(self):
-        with self.assertRaisesRegex(ValueError, '开头候选'):
-            planner.plan([asset('v', 100)], [asset('a', 10), asset('b', 10)],
-                         {'music_ids': ['a'], 'first_song_ids': ['b']})
+    def test_unselected_legacy_first_song_is_ignored(self):
+        result = planner.plan([asset('v', 100)], [asset('a', 10), asset('b', 10)],
+            {'music_ids': ['a'], 'first_song_ids': ['b'], 'count': 1, 'music_mode': 'pool',
+             'min_songs': 1, 'max_songs': 1, 'min_duration': 10, 'max_duration': 10})
+        self.assertEqual('a', result['items'][0]['music'][0]['id'])
 
     def test_within_group_requires_explicit_group(self):
         with self.assertRaisesRegex(ValueError, '分组名称'):

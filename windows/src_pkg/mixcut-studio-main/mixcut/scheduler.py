@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import random
 import threading
 import time
 import uuid
@@ -379,6 +380,8 @@ class Scheduler:
                     previous = [i for batch in self._run_batches(run) for i in batch['items'] if i['status'] == 'success']
                     config = copy.deepcopy(schedule['config'])
                     config['count'] = run['target_count'] - run['completed_count']
+                    config.setdefault('seed', random.SystemRandom().randrange(2**63))
+                    config['source_video_dir'] = schedule['video_dir']
                 result = planner.plan(scan['videos'], scan['music'], config, allow_partial=True, previous_items=previous)
                 with self.lock:
                     run = self.active()

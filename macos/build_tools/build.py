@@ -18,11 +18,13 @@ PROJECT = Path(__file__).resolve().parent.parent.parent
 MACOS = PROJECT / 'macos'
 SPEC = MACOS / 'build_tools' / 'mixcut-macos.spec'
 ICON = MACOS / 'build_tools' / 'MixCutStudio.icns'
+WINDOW_SOURCE = MACOS / 'build_tools' / 'window.swift'
 DIST = MACOS / 'dist'
 BUILD = MACOS / 'build'
 OUTPUT = MACOS / 'output'
 APP = DIST / 'MixCut Studio.app'
 EXECUTABLE = APP / 'Contents' / 'MacOS' / 'MixCutStudio'
+WINDOW_EXECUTABLE = APP / 'Contents' / 'MacOS' / 'MixCutStudioWindow'
 VERIFY_PORT = 8893
 
 
@@ -53,6 +55,35 @@ def freeze(release_version):
          '--distpath', DIST, '--workpath', BUILD, SPEC], cwd=PROJECT, env=env)
     if not EXECUTABLE.is_file():
         raise SystemExit(f'PyInstaller did not produce {EXECUTABLE}')
+
+
+def build_window():
+    """Compile the bundled native WebKit window for the frozen launcher."""
+    BUILD.mkdir(parents=True, exist_ok=True)
+    candidate = BUILD / 'MixCutStudioWindow'
+    sdk_root = Path('/Library/Developer/CommandLineTools/SDKs')
+    override = os.environ.get('MIXCUT_MACOS_SDK')
+    sdks = ([Path(override)] if override else
+            sorted(sdk_root.glob('MacOSX[0-9]*.sdk'), reverse=True))
+    if not sdks:
+        sdks = [None]
+    errors = []
+    for sdk in sdks:
+        command = ['swiftc', '-O', '-target', 'arm64-apple-macos12.0']
+        if sdk is not None:
+            command += ['-sdk', str(sdk)]
+        command += ['-framework', 'AppKit', '-framework', 'WebKit', str(WINDOW_SOURCE), '-o', str(candidate)]
+        print('==>', ' '.join(command), flush=True)
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode == 0:
+            shutil.copy2(candidate, WINDOW_EXECUTABLE)
+            WINDOW_EXECUTABLE.chmod(0o755)
+            return
+        errors.append(f'{sdk or "default SDK"}: {result.stderr[-800:]}')
+    raise SystemExit('native WebKit window could not be compiled:\n' + '\n'.join(errors))
+
+
+def sign_app():
     run(['codesign', '--force', '--deep', '--sign', '-', APP])
     run(['codesign', '--verify', '--deep', '--strict', APP])
 
@@ -66,6 +97,8 @@ def bootstrap(port, timeout=1):
 
 
 def verify(release_version):
+    if not WINDOW_EXECUTABLE.is_file():
+        raise SystemExit('native WebKit window is missing from the app')
     if bootstrap(VERIFY_PORT) is not None:
         raise SystemExit(f'port {VERIFY_PORT} is already in use')
     with tempfile.TemporaryDirectory(prefix='mixcut-macos-verify-') as state:
@@ -86,6 +119,8 @@ def verify(release_version):
                 raise SystemExit('bundled FFmpeg was not detected')
             if data.get('version') != release_version:
                 raise SystemExit(f'embedded version mismatch: {data.get("version")}')
+            if data.get('api_protocol') != 3:
+                raise SystemExit('embedded API protocol mismatch')
             print(f'==> verified version={data["version"]} ffmpeg_available=True')
             request = Request(f'http://127.0.0.1:{VERIFY_PORT}/api/shutdown', data=b'{}', method='POST',
                               headers={'Content-Type': 'application/json'})
@@ -126,6 +161,8 @@ def main():
     make_icon()
     if not args.skip_freeze:
         freeze(release_version)
+    build_window()
+    sign_app()
     verify(release_version)
     package(release_version)
 

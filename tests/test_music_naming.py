@@ -55,11 +55,11 @@ class MusicNamingTests(unittest.TestCase):
             (song_dir / '封面.webp').touch()
             (song_dir / '文案.txt').touch()
             asset = {'id': 'song', 'path': str(song), 'name': song.name, 'duration': 3}
-            with patch('mixcut.media._cached_asset', return_value=asset) as cached:
+            with patch('mixcut.media._cached_asset', side_effect=lambda path, *_, **__: asset if path.resolve() == song.resolve() else None) as cached:
                 result = media.scan(str(root / 'videos'), str(root), str(root / 'cache'))
             self.assertEqual([song.name], [entry['name'] for entry in result['music']])
             self.assertEqual('Old Hindi Songs', result['music'][0]['music_style'])
-            cached.assert_called_once()
+            self.assertEqual(2, cached.call_count)
 
     def test_music_folders_preserve_song_order_and_remove_duplicates(self):
         songs = [{'path': '/music/Old Hindi Songs/第一首/a.mp3'},

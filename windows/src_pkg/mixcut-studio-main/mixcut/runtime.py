@@ -12,6 +12,7 @@ from pathlib import Path
 
 APP_NAME = 'MixCutStudio'
 DATA_ENV_VAR = 'MIXCUT_DATA_DIR'
+API_PROTOCOL = 3
 
 
 def frozen() -> bool:
@@ -37,7 +38,17 @@ def data_root() -> Path:
         base = os.environ.get('LOCALAPPDATA') or os.environ.get('APPDATA')
         if base:
             return Path(base) / APP_NAME
+    if frozen() and sys.platform == 'darwin':
+        return Path.home() / 'Library' / 'Application Support' / APP_NAME
     return resource_root()
+
+
+def app_version() -> str:
+    """Read the single release version bundled with source and frozen apps."""
+    try:
+        return (resource_root() / 'VERSION').read_text(encoding='utf-8').strip()
+    except OSError:
+        return '0.0.0'
 
 
 def bundled_bin() -> Path:
