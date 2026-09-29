@@ -174,7 +174,7 @@ class ApplicationTestCase(unittest.TestCase):
         deleted = self.app.item_action(record['id'], '2', 'delete')
         self.assertEqual(['1'], [entry['id'] for entry in deleted['items']])
         self.assertEqual(1, deleted['items'][0]['index'])
-        self.assertEqual(1, self.app.clear_batches()['deleted'])
+        self.assertEqual(1, self.app.clear_batches(confirmation='DELETE_TASK_RECORDS')['deleted'])
         self.assertEqual([], self.app.store.batches())
 
     def test_existing_valid_output_is_committed_without_rendering_again(self):
@@ -319,9 +319,10 @@ class HandlerTestCase(unittest.TestCase):
         self.assertEqual(403, status)
 
     def test_static_aliases_work_but_arbitrary_workspace_paths_do_not(self):
-        status, _, body = self.get('/static/app.js')
+        status, headers, body = self.get('/static/app.js')
         self.assertEqual(200, status)
         self.assertEqual((server.ROOT / 'static' / 'app.js').read_bytes(), body)
+        self.assertEqual('no-store', headers['Cache-Control'])
 
         status, _, _ = self.get('/PROJECT_PLAN.md')
         self.assertEqual(404, status)

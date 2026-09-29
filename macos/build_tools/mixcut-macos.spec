@@ -48,5 +48,6 @@ app = BUNDLE(
         'CFBundleVersion': VERSION,
         'NSHighResolutionCapable': True,
         'LSMinimumSystemVersion': '12.0',
+        'NSAppTransportSecurity': {'NSAllowsLocalNetworking': True},
     },
 )

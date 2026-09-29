@@ -1,5 +1,6 @@
 import concurrent.futures
 from datetime import datetime
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -53,8 +54,9 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse((self.export / '001.mp4').exists())
         reopened_item = Application(self.root / 'state').batch('abc123')['items'][0]
         self.assertEqual(first, reopened_item['review'])
-        self.assertEqual({'output_deleted': True, 'temporary_segments_deleted': True,
-                          'original_recordings_deleted': False}, reopened_item['cleanup'])
+        self.assertTrue(reopened_item['cleanup']['output_deleted'])
+        self.assertTrue(reopened_item['cleanup']['temporary_segments_deleted'])
+        self.assertFalse(reopened_item['cleanup']['original_recordings_deleted'])
 
     def test_double_click_is_idempotent_even_concurrently(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -126,6 +128,129 @@ class ReviewTests(unittest.TestCase):
         second = self.approve('2')['items'][1]['review']
         self.assertNotEqual(Path(first['path']).parent, Path(second['path']).parent)
         self.assertTrue(Path(first['path']).is_file())
+
+    def sticker_replacement(self, *, shared_source=False, another_variant=False):
+        original = self.export / '001.mp4'
+        stat = original.stat()
+        source_asset = {'id': hashlib.sha256(original.read_bytes()).hexdigest(),
+                        'path': str(original), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
+        recordings = self.root / 'recordings'
+        recordings.mkdir()
+        raw = recordings / 'capture.ts'
+        raw.write_bytes(b'original-recording')
+        raw_stat = raw.stat()
+        raw_asset = {'id': hashlib.sha256(raw.read_bytes()).hexdigest(), 'path': str(raw),
+                     'size': raw_stat.st_size, 'mtime_ns': raw_stat.st_mtime_ns}
+        self.record['config']['source_video_dir'] = str(recordings)
+        self.record['items'][0]['segments'] = [{'path': str(raw), 'asset_id': raw_asset['id']}]
+        self.record['items'][0]['video_assets'] = [raw_asset]
+        if shared_source:
+            self.record['items'][1]['segments'] = [{'path': str(raw), 'asset_id': raw_asset['id']}]
+            self.record['items'][1]['video_assets'] = [raw_asset]
+        self.app.store.put('batch:abc123', self.record)
+        replacement = self.root / 'exports' / 'sticker' / 'sticker.mp4'
+        replacement.parent.mkdir()
+        replacement.write_bytes(b'accepted-sticker-output')
+        replacement_stat = replacement.stat()
+        batch = {'id': 'sticker01', 'status': 'completed', 'created_at': 2, 'updated_at': 2,
+                 'config': {'output_dir': str(self.root / 'exports')},
+                 'output_folder': str(replacement.parent),
+                 'sticker_origin': {'batch_id': 'abc123', 'item_id': '1',
+                                    'replace_origin_on_approval': True},
+                 'items': [{'id': 'sticker-item', 'index': 1, 'kind': 'sticker_variant',
+                            'status': 'success', 'segments': [], 'music': [],
+                            'source_asset': source_asset, 'output_path': str(replacement),
+                            'result': {'output_size': replacement_stat.st_size,
+                                       'output_mtime_ns': replacement_stat.st_mtime_ns}}]}
+        self.app.store.put('batch:sticker01', batch)
+        if another_variant:
+            self.app.store.put('batch:sticker02', {
+                'id': 'sticker02', 'status': 'draft', 'created_at': 3, 'updated_at': 3,
+                'sticker_origin': {'batch_id': 'abc123', 'item_id': '1'},
+                'items': [{'id': 'other', 'status': 'pending', 'output_path': str(self.root / 'other.mp4')}]})
+        return original, raw, replacement
+
+    def test_approving_sticker_retires_original_and_deletes_unshared_recording(self):
+        original, raw, replacement = self.sticker_replacement()
+        approved = self.app.approve({'batch_id': 'sticker01', 'item_id': 'sticker-item',
+                                     'review_dir': str(self.target_root)})
+        self.assertTrue(Path(approved['items'][0]['review']['path']).is_file())
+        self.assertFalse(replacement.exists())
+        self.assertFalse(original.exists())
+        self.assertFalse(raw.exists())
+        parent = self.app.batch('abc123')['items'][0]
+        self.assertEqual('superseded', parent['review']['status'])
+        self.assertTrue(parent['cleanup']['output_deleted'])
+        self.assertTrue(parent['cleanup']['original_recordings_deleted'])
+
+    def test_shared_recording_waits_for_other_task_review(self):
+        original, raw, _ = self.sticker_replacement(shared_source=True)
+        self.app.approve({'batch_id': 'sticker01', 'item_id': 'sticker-item',
+                          'review_dir': str(self.target_root)})
+        self.assertFalse(original.exists())
+        self.assertTrue(raw.exists())
+        parent = self.app.batch('abc123')['items'][0]
+        self.assertIn('等待另外 1 条', next(iter(parent['cleanup']['source_files'].values())))
+
+    def test_other_unreviewed_sticker_keeps_original_until_retry(self):
+        original, raw, _ = self.sticker_replacement(another_variant=True)
+        approved = self.app.approve({'batch_id': 'sticker01', 'item_id': 'sticker-item',
+                                     'review_dir': str(self.target_root)})
+        self.assertTrue(original.exists())
+        self.assertTrue(raw.exists())
+        self.assertIn('其他未审核', approved['items'][0]['cleanup']['origin_error'])
+        self.app.store.delete('batch:sticker02')
+        retried = self.app.retry_approved_cleanup('sticker01', 'sticker-item')
+        self.assertTrue(retried['items'][0]['cleanup']['origin_output_deleted'])
+        self.assertFalse(original.exists())
+        self.assertFalse(raw.exists())
+
+    def test_changed_original_is_preserved_while_sticker_archive_remains_approved(self):
+        original, raw, _ = self.sticker_replacement()
+        original.write_bytes(b'changed-after-sticker-render')
+        approved = self.app.approve({'batch_id': 'sticker01', 'item_id': 'sticker-item',
+                                     'review_dir': str(self.target_root)})
+        self.assertEqual('approved', approved['items'][0]['review']['status'])
+        self.assertIn('素材已变化', approved['items'][0]['cleanup']['origin_error'])
+        self.assertTrue(original.exists())
+        self.assertTrue(raw.exists())
+        self.assertNotEqual('superseded', self.app.batch('abc123')['items'][0].get('review', {}).get('status'))
+
+    def test_independently_approved_original_keeps_its_review_archive(self):
+        original, _, _ = self.sticker_replacement()
+        parent = self.approve()['items'][0]
+        parent_archive = Path(parent['review']['path'])
+        self.assertFalse(original.exists())
+        approved = self.app.approve({'batch_id': 'sticker01', 'item_id': 'sticker-item',
+                                     'review_dir': str(self.target_root)})
+        self.assertEqual('approved', self.app.batch('abc123')['items'][0]['review']['status'])
+        self.assertTrue(parent_archive.is_file())
+        self.assertEqual('原视频已单独审核，保留其审核归档',
+                         approved['items'][0]['cleanup']['origin_status'])
+
+    def test_original_cannot_be_approved_while_sticker_render_needs_its_output(self):
+        original, _, _ = self.sticker_replacement()
+        self.app.store.update('sticker01', lambda batch: batch['items'][0].update(status='pending'))
+        with self.assertRaisesRegex(ValueError, '贴图版本仍需读取'):
+            self.approve()
+        self.assertTrue(original.exists())
+
+    def test_restart_does_not_retroactively_delete_legacy_sticker_original(self):
+        original, raw, replacement = self.sticker_replacement()
+        archive = self.target_root / 'old-sticker.mp4'
+        self.target_root.mkdir()
+        archive.write_bytes(replacement.read_bytes())
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        def legacy(batch):
+            batch['sticker_origin'].pop('replace_origin_on_approval')
+            batch['items'][0]['review'] = {'status': 'approved', 'path': str(archive),
+                                           'sha256': digest}
+            batch['items'][0]['cleanup'] = {'output_deleted': True}
+        self.app.store.update('sticker01', legacy)
+        replacement.unlink()
+        Application(self.root / 'state')
+        self.assertTrue(original.exists())
+        self.assertTrue(raw.exists())
 
 
 if __name__ == '__main__':

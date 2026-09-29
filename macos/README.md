@@ -6,7 +6,7 @@
 
 - macOS 12 或更高版本
 - Python 3.12 或更高版本
-- PyInstaller、Pillow
+- PyInstaller、Pillow、Swift 编译器与兼容的 macOS SDK
 - FFmpeg、ffprobe（构建时会连同动态库一起收进应用）
 
 ```bash
@@ -19,7 +19,7 @@ python3 macos/build_tools/build.py
 - `MixCutStudio-<版本>-macOS-<架构>.dmg`
 - 同名 `.sha256` 校验文件
 
-构建脚本会生成图标、冻结 `.app`、进行临时签名、启动成品验证版本号和内置 FFmpeg，最后生成并压缩 DMG。
+构建脚本会生成图标、冻结 `.app`、编译原生 WebKit 窗口、进行临时签名、启动成品验证版本号和内置 FFmpeg，最后生成并压缩 DMG。应用窗口关闭后后台仍可继续导出；再次打开应用会连接相同版本的后台。若 8877 端口仍由旧版后台占用，且没有正在执行的任务，启动器会先关闭旧版后台再启动当前版本。
 
 ## 发布新版本
 
