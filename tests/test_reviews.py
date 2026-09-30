@@ -47,6 +47,23 @@ class ReviewTests(unittest.TestCase):
             time.sleep(.01)
         self.fail('batch review did not finish')
 
+    def test_approved_task_vanishes_from_public_list_and_can_be_pruned(self):
+        self.approve()
+        self.assertEqual(['2'], [item['id'] for item in self.app.visible_batches()[0]['items']])
+        self.app.prune_forgotten_items()
+        self.assertEqual(['2'], [item['id'] for item in self.app.batch('abc123')['items']])
+
+    def test_global_review_finishes_without_a_visible_batch_group(self):
+        started = self.app.start_review_all({'review_dir': str(self.target_root)})
+        self.assertEqual(2, started['total'])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.app.review_all_status()['status'] == 'running':
+            time.sleep(.01)
+        job = self.app.review_all_status()
+        self.assertEqual('completed', job['status'])
+        self.assertEqual(2, job['completed'])
+        self.assertEqual([], self.app.visible_batches())
+
     def test_batch_review_uses_task_index_order_and_skips_approved(self):
         self.record['items'].reverse()
         self.app.store.put('batch:abc123', self.record)

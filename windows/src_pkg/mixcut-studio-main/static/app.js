@@ -3,7 +3,7 @@
   const state = { scan: { videos: [], music: [], errors: [] }, batch: null, batches: [], poller: null, scanPoller: null, scanSignature: '', scanRunning: false, libraryDirs: null, dirtyLibrary: new Set(), mediaCache: new Map(), keyframeObserver: null, batchSignature: '', batchLayoutSignature: '', serverVersion: '', reviewJobs: new Map() };
   const selectedTasks = new Set();
   const taskKey = (batchId, itemId) => `${batchId}:${itemId}`;
-  const taskSelection = (batch, item) => { const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = 'task-select'; checkbox.setAttribute('aria-label', `选择任务 ${item.index || item.id}`); const key = taskKey(batch.id,item.id); checkbox.checked = selectedTasks.has(key); checkbox.disabled = ['queued','running','pausing','stopping'].includes(batch.status) || ['running','validating'].includes(item.status); checkbox.addEventListener('change', () => { if (checkbox.checked) selectedTasks.add(key); else selectedTasks.delete(key); updateSelectionButtons(); }); return checkbox; };
+  const taskSelection = (batch, item) => { const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = 'task-select'; checkbox.setAttribute('aria-label', `选择任务 ${item.index || item.id}`); const key = taskKey(batch.id,item.id); checkbox.checked = selectedTasks.has(key); checkbox.addEventListener('change', () => { if (checkbox.checked) selectedTasks.add(key); else selectedTasks.delete(key); updateSelectionButtons(); }); return checkbox; };
   const $ = (s, root = document) => root.querySelector(s);
   const $$ = (s, root = document) => [...root.querySelectorAll(s)];
   const updateSelectionButtons = () => {
@@ -80,6 +80,37 @@
       watchBatchReview(batch.id);
     } catch (error) { toast(error.message, true); }
   };
+  let globalReviewPolling = false;
+  const watchAllReview = async () => {
+    if (globalReviewPolling) return;
+    globalReviewPolling = true;
+    const button = $('#approve-all-visible');
+    try {
+      while (true) {
+        const job = await api('/api/tasks/approve-all');
+        if (job.status === 'idle') break;
+        button.disabled = job.status === 'running';
+        button.textContent = job.status === 'running' ? `审核中 ${job.completed}/${job.total}` : '一键审核';
+        await refreshBatches();
+        if (job.status !== 'running') {
+          toast(job.status === 'completed' ? `已审核 ${job.completed} 条任务。` : `审核停在任务 ${job.failed_item || '未知'}：${job.error || '未知错误'}`, job.status !== 'completed');
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2500));
+      }
+    } catch (error) { toast(`无法获取审核状态：${error.message}`, true); }
+    finally { button.disabled = false; button.textContent = '一键审核'; globalReviewPolling = false; }
+  };
+  const approveAllVisible = async () => {
+    const review_dir = $('#task-review-dir').value.trim() || $('#review-dir').value.trim();
+    if (!review_dir) return toast('请先选择审核通过文件夹。', true);
+    if ($$('.sticker-variant').some(select => select.value)) return toast('有任务选了贴图模板，请先生成对应的贴图版本。', true);
+    const count = state.batches.reduce((total,batch) => total + reviewCandidates(batch).length, 0);
+    if (!count) return toast('没有待审核的已完成任务。');
+    if (!confirm(`将依次审核 ${count} 条已完成任务；审核成功的任务会从列表移除。确定继续吗？`)) return;
+    try { await api('/api/tasks/approve-all', {method:'POST', body:JSON.stringify({review_dir})}); watchAllReview(); }
+    catch (error) { toast(error.message, true); }
+  };
   const pickFolder = async (kind) => { const input = kind === 'review' ? $('#review-dir') : $(`#${kind}-dir`); if (!input) return; const buttons = $$('.folder-picker'); buttons.forEach(button => button.disabled = true); try { const data = await api('/api/pick-folder', { method: 'POST', body: JSON.stringify({ kind, current_path: input.value.trim() }) }); if (data.cancelled || !data.path) return; const changed = input.value.trim() !== data.path; input.value = data.path; if (kind === 'review') syncReviewDir(data.path); if ((kind === 'video' || kind === 'music') && changed) clearScannedLibrary(kind); if (kind === 'output' || kind === 'review') toast('已保存目录。'); } catch (error) { toast(error.message, true); } finally { buttons.forEach(button => button.disabled = false); } };
   const frameTime = (value) => { const seconds = Math.max(0, Number(value) || 0), minutes = Math.floor(seconds / 60), remainder = seconds % 60; return `${String(minutes).padStart(2, '0')}:${remainder.toFixed(3).padStart(6, '0')}`; };
   const frameUrl = (batch, item, index, size, version) => `/api/keyframe?batch=${encodeURIComponent(batch)}&item=${encodeURIComponent(item)}&index=${encodeURIComponent(index)}&size=${size}&v=${encodeURIComponent(version || '')}`;
@@ -110,16 +141,13 @@
     renderPickers();
   }
   function renderPickers() {
-    const videoBox = $('#video-picker'), musicBox = $('#music-picker'); videoBox.replaceChildren(); musicBox.replaceChildren();
-    const selectedVideo = new Set($$('.video-card .asset-select:checked').map(el => el.dataset.id)); const selectedMusic = new Set($$('.music-card .asset-select:checked').map(el => el.dataset.id)); const groups = new Map($$('.group-input').map(el => [el.dataset.id, el.value]));
-    (state.scan.videos || []).forEach(asset => { const row = document.createElement('label'); row.className = 'pick-row'; const input = document.createElement('input'); input.type = 'checkbox'; input.checked = selectedVideo.has(asset.id); input.dataset.id = asset.id; input.addEventListener('change', syncAssetChoices); const name = document.createElement('span'); name.textContent = asset.name || asset.path; const group = document.createElement('span'); group.className = 'duration'; group.textContent = groups.get(asset.id) ? `组：${groups.get(asset.id)}` : fmt(asset.duration); row.append(input, name, group); videoBox.append(row); });
-    (state.scan.music || []).forEach(asset => { const row = document.createElement('label'); row.className = 'pick-row'; const input = document.createElement('input'); input.type = 'checkbox'; input.checked = selectedMusic.has(asset.id); input.dataset.id = asset.id; input.addEventListener('change', syncAssetChoices); const name = document.createElement('span'); name.textContent = asset.music_style ? `${asset.name || asset.path} · ${asset.music_style}` : (asset.name || asset.path); const duration = document.createElement('span'); duration.className = 'duration'; duration.textContent = fmt(asset.duration); row.append(input, name, duration); musicBox.append(row); });
-    videoBox.classList.toggle('empty', !state.scan.videos?.length); musicBox.classList.toggle('empty', !state.scan.music?.length); if (!state.scan.videos?.length) videoBox.textContent = '请先扫描视频。'; if (!state.scan.music?.length) musicBox.textContent = '请先扫描音乐。';
+    const selectedVideo = $$('.video-card .asset-select:checked').length;
+    const selectedMusic = $$('.music-card .asset-select:checked').length;
+    $('#selection-summary').textContent = `已选 ${selectedVideo}/${state.scan.videos?.length || 0} 条视频、${selectedMusic}/${state.scan.music?.length || 0} 首音乐。需要排除素材或调整视频分组时，到“素材”页展开列表。`;
   }
-  function syncAssetChoices() { const source = this; const selector = source.closest('#video-picker') ? '.video-card' : '.music-card'; const target = $(`${selector} .asset-select[data-id="${CSS.escape(source.dataset.id)}"]`); if (target) target.checked = source.checked; saveAssetPrefs(); renderPickers(); }
   function getConfig() {
     if (state.scanRunning || state.dirtyLibrary.size) throw new Error('请等待素材扫描完成，并刷新已更改路径的素材库。');
-    const form = $('#config-form'), values = Object.fromEntries(new FormData(form)); const num = ['count','min_source_duration_minutes','min_duration','max_duration','min_songs','max_songs','start_gap','segment_min','segment_max','fps','original_volume','music_volume']; num.forEach(key => values[key] = Number(values[key])); [values.width, values.height] = String(values.resolution || '1280x720').split('x').map(Number); delete values.resolution; if (String(values.seed || '').trim()) values.seed = Number(values.seed); else delete values.seed; values.allow_overlap = form.elements.allow_overlap.checked; values.within_group = values.within_group === 'true'; values.output_dir = $('#output-dir').value.trim(); values.video_ids = $$('.video-card .asset-select:checked').map(el => el.dataset.id); values.music_ids = $$('.music-card .asset-select:checked').map(el => el.dataset.id); values.first_song_ids = []; values.groups = Object.fromEntries($$('.group-input').map(el => [el.dataset.id, el.value.trim()]).filter(([, value]) => value));
+    const form = $('#config-form'), values = Object.fromEntries(new FormData(form)); const num = ['count','min_source_duration_minutes','min_duration','max_duration','min_songs','max_songs','start_gap','segment_min','segment_max','fps','video_bitrate_mbps','original_volume','music_volume']; num.forEach(key => values[key] = Number(values[key])); [values.width, values.height] = String(values.resolution || '1280x720').split('x').map(Number); delete values.resolution; if (String(values.seed || '').trim()) values.seed = Number(values.seed); else delete values.seed; values.allow_overlap = form.elements.allow_overlap.checked; values.within_group = values.within_group === 'true'; values.output_dir = $('#output-dir').value.trim(); values.video_ids = $$('.video-card .asset-select:checked').map(el => el.dataset.id); values.music_ids = $$('.music-card .asset-select:checked').map(el => el.dataset.id); values.first_song_ids = []; values.groups = Object.fromEntries($$('.group-input').map(el => [el.dataset.id, el.value.trim()]).filter(([, value]) => value));
     values.sticker_template_id = values.sticker_template_id || null; if (!values.video_ids.length) throw new Error('请至少选择一个视频素材。'); if (!values.music_ids.length) throw new Error('请至少选择一首音乐。'); if (!values.output_dir) throw new Error('请在素材页填写导出文件夹。'); if (values.min_duration > values.max_duration) throw new Error('最短时长不能大于最长时长。'); if (values.segment_min > values.segment_max) throw new Error('单段最短时长不能大于最长时长。'); return values;
   }
   function stat(label, value) { const box = document.createElement('div'); box.className = 'stat'; const strong = document.createElement('b'); strong.textContent = value; const span = document.createElement('span'); span.textContent = label; box.append(strong, span); return box; }
@@ -191,7 +219,7 @@
     root.append(track);
   }
   function renderPlan(batch) {
-    state.batch = batch; $('#plan-message').textContent = batch ? `批次 ${batch.folder_name || batch.id} 已生成。仅在核对后开始渲染。${batch.output_folder ? ` 输出目录：${batch.output_folder}` : ''}` : '尚未生成方案。'; $('#start-btn').disabled = !batch || !batch.items?.length || batch.status !== 'draft'; $('#manifest-btn').disabled = !batch; const stats = $('#plan-stats'), warnings = $('#plan-warnings'), list = $('#plan-items'); stats.replaceChildren(); warnings.replaceChildren(); list.replaceChildren(); if (!batch) { updateSelectionButtons(); return; }
+    state.batch = batch; $('#plan-message').textContent = batch ? `当前方案共 ${batch.items?.length || 0} 条任务。核对后开始渲染。${batch.output_folder ? ` 输出目录：${batch.output_folder}` : ''}` : '尚未生成方案。'; $('#start-btn').disabled = !batch || !batch.items?.length || batch.status !== 'draft'; $('#manifest-btn').disabled = !batch; const stats = $('#plan-stats'), warnings = $('#plan-warnings'), list = $('#plan-items'); stats.replaceChildren(); warnings.replaceChildren(); list.replaceChildren(); if (!batch) { updateSelectionButtons(); return; }
     if(batch.config?.sticker_layers?.length){const note=document.createElement('div');note.textContent=`贴图模板：${batch.config.sticker_template?.name || '已保存模板'} · ${batch.config.sticker_layers.length}层（位置、大小和出现时间已固定到本批次）`;warnings.append(note);}
     const s = batch.stats || {};
     const numberOrDash = value => Number.isFinite(Number(value)) ? Number(value) : '—';
@@ -258,14 +286,9 @@
     } catch (error) { $('#scan-btn').disabled = false; toast(error.message === '接口不存在' ? '旧版后台仍在运行，请停止后台并重新打开 MixCut Studio。' : error.message, true); }
   }
   async function createPlan() { let config; try { config = getConfig(); } catch (error) { toast(error.message, true); return; } const btn = $('#plan-btn'); btn.disabled = true; btn.textContent = '正在规划…'; try { const data = await api('/api/plan', { method: 'POST', body: JSON.stringify({ config }) }); const planned = data.batch || data; state.batches = [planned, ...state.batches.filter(batch => batch.id !== planned.id)]; renderPlan(planned); location.hash = 'plan'; toast('方案生成完成，请核对每条歌曲与视频区间。'); } catch (error) { renderPlan(null); $('#plan-message').textContent = `无法生成方案：${error.message}`; location.hash = 'plan'; toast(error.message, true); } finally { btn.disabled = false; btn.textContent = '生成方案'; } }
-  async function batchAction(id, action) { try { const data = await api(`/api/batches/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: '{}' }); if (data.batch && state.batch?.id === id) renderPlan(data.batch); toast({start:'已加入渲染队列',pause:'将在当前成片完成后暂停',resume:'已继续队列',stop:'已停止队列',retry:'已安排重试'}[action] || '操作成功'); if (action === 'start') location.hash = 'tasks'; refreshBatches(); } catch (error) { toast(error.message, true); } }
-  async function itemAction(batchId, itemId, action) { try { await api(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}/${action}`, { method:'POST', body:'{}' }); toast({start:'已重新开始该条任务',stop:'已终止该条任务',delete:'已删除该条任务'}[action]); state.batchSignature=''; await refreshBatches(); } catch (error) { toast(error.message,true); } }
+  async function batchAction(id, action) { try { const data = await api(`/api/batches/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: '{}' }); if (action === 'start') renderPlan(null); else if (data.batch && state.batch?.id === id) renderPlan(data.batch); toast({start:'已加入渲染队列',pause:'将在当前成片完成后暂停',resume:'已继续队列',stop:'已停止队列',retry:'已安排重试'}[action] || '操作成功'); if (action === 'start') location.hash = 'tasks'; refreshBatches(); } catch (error) { toast(error.message, true); } }
+  async function itemAction(batchId, itemId, action) { try { const result = await api(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}/${action}`, { method:'POST', body:'{}' }); if (action === 'delete' && result.updated_batches) applyDeletedBatches(result.updated_batches); else { state.batchSignature=''; await refreshBatches(); } toast({start:'已重新开始该条任务',stop:'已终止该条任务',delete:'已删除该条任务记录；文件未删除'}[action]); } catch (error) { toast(error.message,true); } }
   async function allBatches(action) { const candidates=state.batches.filter(batch=>action==='pause'?['queued','running'].includes(batch.status):(action==='stop'?['queued','running','pausing','paused'].includes(batch.status):['paused','stopped','draft'].includes(batch.status))); for(const batch of candidates){const next=action==='pause'?'pause':(action==='stop'?'stop':(batch.status==='paused'?'resume':'start'));try{await api(`/api/batches/${encodeURIComponent(batch.id)}/${next}`,{method:'POST',body:'{}'});}catch(error){toast(`批次 ${batch.id}：${error.message}`,true);}} state.batchSignature='';await refreshBatches(); }
-  function confirmRecordDeletion(items) {
-    const pending = items.filter(item => item.review?.status === 'approved' && item.cleanup?.source_cleanup_requested && !item.cleanup?.original_recordings_deleted).length;
-    if (!confirm(`将删除 ${items.length} 条任务记录，其中 ${pending} 条仍有原片清理待处理。导出视频和审核成片会保留，清理状态会写入删除记录。确定继续吗？`)) return false;
-    return prompt(`请再次确认：输入“删除记录”以清除这 ${items.length} 条任务。`) === '删除记录';
-  }
   function applyDeletedBatches(updatedBatches) {
     const byId = new Map(state.batches.map(batch => [batch.id, batch]));
     Object.entries(updatedBatches).forEach(([id, batch]) => { if (batch) byId.set(id, batch); else byId.delete(id); });
@@ -286,33 +309,29 @@
     const selections = batches.map(batch => ({batch_id:batch.id,item_ids:(batch.items || []).filter(item => selectedTasks.has(taskKey(batch.id,item.id))).map(item => item.id)})).filter(entry => entry.item_ids.length);
     const items = batches.flatMap(batch => (batch.items || []).filter(item => selectedTasks.has(taskKey(batch.id,item.id))));
     if (!items.length) return toast('请先勾选任务。',true);
-    if (!confirmRecordDeletion(items)) return;
     const button = $(scope === 'plan' ? '#delete-selected-plan' : '#delete-selected-tasks');
     button.disabled = true; button.textContent = '删除中…';
     try {
-      const result = await api('/api/batches/delete-items',{method:'POST',body:JSON.stringify({selections,expected_count:items.length,confirmation:'DELETE_TASK_RECORDS'})});
+      const result = await api('/api/tasks/forget',{method:'POST',body:JSON.stringify({selections})});
       selections.forEach(entry => entry.item_ids.forEach(id => selectedTasks.delete(taskKey(entry.batch_id,id))));
       if (result.updated_batches) applyDeletedBatches(result.updated_batches);
       else { state.batchSignature=''; await refreshBatches(); if (state.batch) renderPlan(state.batches.find(batch => batch.id === state.batch.id) || null); }
-      if (scope === 'plan') $('#plan-message').textContent = `已删除 ${result.deleted_items} 条任务记录，当前方案剩余 ${state.batch?.items?.length || 0} 条。导出和审核文件未删除。${result.cleanup_warning || ''}`;
-      toast(result.cleanup_warning || `已删除 ${result.deleted_items} 条任务记录；文件已保留。`, !!result.cleanup_warning);
+      if (scope === 'plan') $('#plan-message').textContent = `已删除 ${result.deleted_items} 条任务记录，当前方案剩余 ${state.batch?.items?.length || 0} 条。文件未删除。`;
+      toast(`已删除 ${result.deleted_items} 条任务记录；文件未删除。`);
     } catch(error) { toast(error.message,true); }
     finally { button.disabled = false; updateSelectionButtons(); }
   }
   function selectAllTasks(scope) {
     const batches = scope === 'plan' ? (state.batch ? [state.batch] : []) : state.batches;
-    batches.forEach(batch => { if (['queued','running','pausing','stopping'].includes(batch.status)) return; (batch.items || []).forEach(item => { if (!['running','validating'].includes(item.status)) selectedTasks.add(taskKey(batch.id,item.id)); }); });
+    batches.forEach(batch => (batch.items || []).forEach(item => selectedTasks.add(taskKey(batch.id,item.id))));
     if (scope === 'plan') renderPlan(state.batch); else renderBatches(state.batches);
     updateSelectionButtons();
   }
   async function clearAllBatches() {
-    const items=state.batches.flatMap(batch => batch.items || []);
-    if (!state.batches.length) return toast('当前没有任务记录。');
-    if (!confirmRecordDeletion(items)) return;
     try {
-      const result=await api('/api/batches/clear',{method:'POST',body:JSON.stringify({expected_count:items.length,confirmation:'DELETE_TASK_RECORDS'})});
-      selectedTasks.clear();state.batchSignature='';await refreshBatches();renderPlan(null);
-      toast(`已清除 ${result.deleted_items} 条任务记录；导出与审核文件已保留。`);
+      const result=await api('/api/tasks/clear',{method:'POST',body:'{}'});
+      selectedTasks.clear();applyDeletedBatches(result.updated_batches);renderPlan(null);
+      toast(`已清除 ${result.deleted_items} 条任务记录；文件未删除。`);
     } catch(error){toast(error.message,true);}
   }
   async function downloadDeletionRecords() {
@@ -349,17 +368,16 @@
     else { renderBatches(batches); hydrateGalleries(); restoreTaskScroll(anchor); requestAnimationFrame(() => restoreTaskScroll(anchor)); }
     if (!state.poller) setupPolling();
   }
-  async function bootstrap() { try { const data = await api('/api/bootstrap'); if (data.api_protocol !== 3) throw new Error(`本地后台接口版本不兼容（当前 ${data.api_protocol ?? '未知'}，需要 3）。请先停止旧版后台再重新打开 MixCut Studio。`); state.serverVersion = data.version || ''; $('#video-dir').value = data.video_dir || ''; $('#music-dir').value = data.music_dir || ''; state.libraryDirs = {video: data.video_dir || '', music: data.music_dir || ''}; $('#output-dir').value = data.output_dir || ''; syncReviewDir(data.review_dir || ''); state.scan = data.scan || state.scan; state.batches = data.batches || []; state.reviewJobs = new Map(Object.entries(data.review_jobs || {})); state.batchSignature = batchesSignature(state.batches); state.batchLayoutSignature = batchesLayoutSignature(state.batches); renderAssets(); updateStickerSelectors(); renderErrors(state.scan.errors || []); renderBatches(state.batches); hydrateGalleries(); const draft = state.batches.find(batch => batch.status === 'draft'); if (draft) renderPlan(draft); if (data.scan_job && ['discovering','analyzing'].includes(data.scan_job.status)) applyScanJob(data.scan_job); setServer(true, data.ffmpeg_available === false ? `${connectedLabel()} · 未找到 FFmpeg` : connectedLabel()); Object.entries(data.review_jobs || {}).filter(([, job]) => job.status === 'running').forEach(([id]) => watchBatchReview(id)); document.dispatchEvent(new Event('mixcut-bootstrap')); } catch (error) { setServer(false, error.message); renderErrors([error.message]); } }
-  document.addEventListener('DOMContentLoaded', () => { window.addEventListener('hashchange', showView); $('#scan-btn').addEventListener('click', scan); $('#plan-btn').addEventListener('click', createPlan); $('#start-btn').addEventListener('click', () => state.batch && batchAction(state.batch.id, 'start')); $('#manifest-btn').addEventListener('click', () => { if (state.batch) window.open(`/api/manifest?batch=${encodeURIComponent(state.batch.id)}`, '_blank', 'noopener'); }); $('#refresh-tasks').addEventListener('click', () => refreshBatches()); $('#pause-all').addEventListener('click',()=>allBatches('pause')); $('#start-all').addEventListener('click',()=>allBatches('start')); $('#clear-all').addEventListener('click',clearAllBatches); $('#download-deletion-records').addEventListener('click',downloadDeletionRecords); $('#select-all-plan').addEventListener('click',()=>selectAllTasks('plan')); $('#delete-selected-plan').addEventListener('click',()=>deleteSelectedTasks('plan')); $('#select-all-tasks').addEventListener('click',()=>selectAllTasks('tasks')); $('#delete-selected-tasks').addEventListener('click',()=>deleteSelectedTasks('tasks')); $('#shutdown-btn').addEventListener('click', async () => { if (!confirm('确定停止本地后台服务吗？正在处理的任务会停止。')) return; try { await api('/api/shutdown', { method:'POST', body:'{}' }); } catch (error) { toast(error.message, true); return; } stopPolling(); setServer(false, '本地服务已停止'); toast('已请求停止后台服务。'); }); $('#config-form').addEventListener('change', event => { if (event.target.name === 'mode') { $$('.mode-multi').forEach(el => el.hidden = event.target.value !== 'multi'); $$('.mode-single').forEach(el => el.hidden = event.target.value !== 'single'); } if (event.target.name === 'music_mode') $$('.pool-settings').forEach(el => el.hidden = event.target.value !== 'pool'); }); $('#video-assets').addEventListener('change', event => { if (event.target.matches('.asset-select,.group-input')) { saveAssetPrefs(); renderPickers(); } }); $('#music-assets').addEventListener('change', event => { if (event.target.matches('.asset-select')) { saveAssetPrefs(); renderPickers(); } }); bootstrap().then(showView); });
+  async function bootstrap() { try { const data = await api('/api/bootstrap'); if (data.api_protocol !== 3) throw new Error(`本地后台接口版本不兼容（当前 ${data.api_protocol ?? '未知'}，需要 3）。请先停止旧版后台再重新打开 MixCut Studio。`); state.serverVersion = data.version || ''; $('#video-dir').value = data.video_dir || ''; $('#music-dir').value = data.music_dir || ''; state.libraryDirs = {video: data.video_dir || '', music: data.music_dir || ''}; $('#output-dir').value = data.output_dir || ''; syncReviewDir(data.review_dir || ''); state.scan = data.scan || state.scan; state.batches = data.batches || []; state.reviewJobs = new Map(Object.entries(data.review_jobs || {})); state.batchSignature = batchesSignature(state.batches); state.batchLayoutSignature = batchesLayoutSignature(state.batches); renderAssets(); updateStickerSelectors(); renderErrors(state.scan.errors || []); renderBatches(state.batches); hydrateGalleries(); const draft = state.batches.find(batch => batch.status === 'draft'); if (draft) renderPlan(draft); if (data.scan_job && ['discovering','analyzing'].includes(data.scan_job.status)) applyScanJob(data.scan_job); setServer(true, data.ffmpeg_available === false ? `${connectedLabel()} · 未找到 FFmpeg` : connectedLabel()); Object.entries(data.review_jobs || {}).filter(([, job]) => job.status === 'running').forEach(([id]) => watchBatchReview(id)); if (data.global_review_job?.status === 'running') watchAllReview(); document.dispatchEvent(new Event('mixcut-bootstrap')); } catch (error) { setServer(false, error.message); renderErrors([error.message]); } }
+  document.addEventListener('DOMContentLoaded', () => { window.addEventListener('hashchange', showView); $('#scan-btn').addEventListener('click', scan); $('#plan-btn').addEventListener('click', createPlan); $('#start-btn').addEventListener('click', () => state.batch && batchAction(state.batch.id, 'start')); $('#manifest-btn').addEventListener('click', () => { if (state.batch) window.open(`/api/manifest?batch=${encodeURIComponent(state.batch.id)}`, '_blank', 'noopener'); }); $('#refresh-tasks').addEventListener('click', () => refreshBatches()); $('#pause-all').addEventListener('click',()=>allBatches('pause')); $('#start-all').addEventListener('click',()=>allBatches('start')); $('#stop-all').addEventListener('click',()=>allBatches('stop')); $('#approve-all-visible').addEventListener('click',approveAllVisible); $('#clear-all').addEventListener('click',clearAllBatches); $('#select-all-plan').addEventListener('click',()=>selectAllTasks('plan')); $('#delete-selected-plan').addEventListener('click',()=>deleteSelectedTasks('plan')); $('#select-all-tasks').addEventListener('click',()=>selectAllTasks('tasks')); $('#delete-selected-tasks').addEventListener('click',()=>deleteSelectedTasks('tasks')); $('#shutdown-btn').addEventListener('click', async () => { if (!confirm('确定停止本地后台服务吗？正在处理的任务会停止。')) return; try { await api('/api/shutdown', { method:'POST', body:'{}' }); } catch (error) { toast(error.message, true); return; } stopPolling(); setServer(false, '本地服务已停止'); toast('已请求停止后台服务。'); }); $('#config-form').addEventListener('change', event => { if (event.target.name === 'mode') { $$('.mode-multi').forEach(el => el.hidden = event.target.value !== 'multi'); $$('.mode-single').forEach(el => el.hidden = event.target.value !== 'single'); } if (event.target.name === 'music_mode') $$('.pool-settings').forEach(el => el.hidden = event.target.value !== 'pool'); }); $('#video-assets').addEventListener('change', event => { if (event.target.matches('.asset-select,.group-input')) { saveAssetPrefs(); renderPickers(); } }); $('#music-assets').addEventListener('change', event => { if (event.target.matches('.asset-select')) { saveAssetPrefs(); renderPickers(); } }); bootstrap().then(showView); });
   document.addEventListener('DOMContentLoaded', () => { $$('.folder-picker').forEach(button => button.addEventListener('click', () => pickFolder(button.dataset.kind))); $('#output-dir').addEventListener('change', () => persistPreference('output_dir', $('#output-dir').value.trim())); ['review-dir', 'task-review-dir'].forEach(id => $(`#${id}`).addEventListener('change', () => { const value = $(`#${id}`).value.trim(); syncReviewDir(value); persistPreference('review_dir', value); })); [['video-dir','video'],['music-dir','music']].forEach(([id,kind]) => $(`#${id}`).addEventListener('change', () => { if ($(`#${id}`).value.trim() !== state.libraryDirs?.[kind]) clearScannedLibrary(kind); })); });
-  document.addEventListener('DOMContentLoaded', () => $('#stop-all').addEventListener('click',()=>allBatches('stop')));
   const polishTaskControls = () => $$('.batch').forEach(card => {
     const badge = $('.batch-head .status', card); if (badge?.textContent === 'validating') badge.textContent = '校验中';
     const batchId = $('.batch-head h3', card)?.textContent.replace('批次 ', ''); const batch = state.batches.find(item => String(item.id) === batchId);
     if (batch?.output_folder && !$('.output-location', card)) { const output = document.createElement('p'); output.className = 'output-location field-help'; output.textContent = `输出目录：${batch.output_folder}`; $('.batch-head', card).after(output); }
     const hasFailed = $$('.task-item .status', card).some(el => ['failed', 'error', '失败'].includes(safeClass(el.textContent)) || el.textContent === '失败'); const hasPending = $$('.task-item .status', card).some(el => el.textContent === '待处理'); const stateText = badge?.textContent;
     $$('.batch-controls .button', card).forEach(button => { if (button.textContent === '重试失败项' && hasFailed && stateText === '已暂停') button.disabled = false; if (button.textContent === '继续' && hasPending && stateText === '已停止') button.disabled = false; });
-    $$('.task-item', card).forEach((row,index) => { if ($('.item-controls',row)) return; const item=batch?.items?.[index]; if(!item)return; const controls=document.createElement('div');controls.className='item-controls'; if(['pending','running','validating'].includes(item.status)){const stop=document.createElement('button');stop.className='button';stop.textContent='终止该条';stop.onclick=()=>itemAction(batch.id,item.id,'stop');controls.append(stop);} if(['cancelled','failed'].includes(item.status)){const start=document.createElement('button');start.className='button';start.textContent='开始该条';start.onclick=()=>itemAction(batch.id,item.id,'start');controls.append(start);} if(!['running','validating'].includes(item.status)){const remove=document.createElement('button');remove.className='button';remove.textContent='删除该条';remove.onclick=()=>{if(confirm('只删除这条任务记录？'))itemAction(batch.id,item.id,'delete');};controls.append(remove);} row.append(controls); });
+    $$('.task-item', card).forEach((row,index) => { if ($('.item-controls',row)) return; const item=batch?.items?.[index]; if(!item)return; const controls=document.createElement('div');controls.className='item-controls'; if(['pending','running','validating'].includes(item.status)){const stop=document.createElement('button');stop.className='button';stop.textContent='终止该条';stop.onclick=()=>itemAction(batch.id,item.id,'stop');controls.append(stop);} if(['cancelled','failed'].includes(item.status)){const start=document.createElement('button');start.className='button';start.textContent='开始该条';start.onclick=()=>itemAction(batch.id,item.id,'start');controls.append(start);} if(item.status==='success'){const details=document.createElement('button');details.className='button';details.textContent='查看与审核';details.onclick=()=>{row.classList.toggle('expanded');details.textContent=row.classList.contains('expanded')?'收起详情':'查看与审核';};controls.append(details);} const remove=document.createElement('button');remove.className='button';remove.textContent='删除任务';remove.onclick=()=>itemAction(batch.id,item.id,'delete');controls.append(remove);row.append(controls); });
   });
   new MutationObserver(polishTaskControls).observe($('#batches'), { childList: true, subtree: true });
   const polishOutputFolders = () => $$('.batch').forEach(card => { const batchId = $('.batch-head h3', card)?.textContent.replace('批次 ', ''); const batch = state.batches.find(item => String(item.id) === batchId); const output = $('.output-location', card); const text = batch && `批次 ${batch.folder_name || batch.id} · 输出目录：${batch.output_folder}`; if (output && text && output.textContent !== text) output.textContent = text; });
@@ -373,6 +391,7 @@
       const video = $('video', row);
       const item = (batch.items || [])[index];
       if (!item) return;
+      if (item.status !== 'success') return;
       const action = document.createElement('div');
       action.className = 'review-action field-help';
       if (item.review?.status === 'approved') {

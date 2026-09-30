@@ -22,6 +22,12 @@ class EncoderSelectionTest(unittest.TestCase):
         self.assertEqual(['libx264'], renderer._codec_candidates('software_fast'))
         self.assertIn('ultrafast', renderer._encoding('libx264', 1280, 720, 30, 'software_fast'))
 
+    def test_explicit_video_bitrate_applies_to_software_and_hardware(self):
+        for codec in ('libx264', 'h264_videotoolbox'):
+            options = renderer._encoding(codec, 1280, 720, 30, 'auto', 4.5)
+            self.assertEqual('4500000', options[options.index('-b:v') + 1])
+            self.assertNotIn('-crf', options)
+
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'ffmpeg and ffprobe are required')
 class RenderIntegrationTest(unittest.TestCase):

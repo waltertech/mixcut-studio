@@ -29,7 +29,12 @@ def _codec_candidates(requested, platform_name=sys.platform, os_name=os.name):
     return ['libx264']
 
 
-def _encoding(codec, width, height, fps, requested='auto'):
+def _encoding(codec, width, height, fps, requested='auto', bitrate_mbps=0):
+    if bitrate_mbps:
+        result = ['-c:v', codec]
+        if codec == 'libx264':
+            result += ['-preset', 'ultrafast' if requested == 'software_fast' else 'veryfast']
+        return result + ['-b:v', str(round(float(bitrate_mbps) * 1_000_000))]
     if codec == 'libx264':
         return ['-c:v', codec, '-preset', 'ultrafast' if requested == 'software_fast' else 'veryfast',
                 '-crf', '24' if requested == 'software_fast' else '22']
@@ -162,7 +167,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
     chosen = None
     try:
         for codec in codecs:
-            encoding = _encoding(codec, width, height, fps, requested)
+            encoding = _encoding(codec, width, height, fps, requested, config.get('video_bitrate_mbps', 0))
             command = ['ffmpeg', '-nostdin', '-y', '-hide_banner', '-loglevel', 'error',
                        '-filter_complex_threads', _filter_threads(), *inputs, '-filter_complex', ';'.join(filters),
                        '-map', f'[{output_label}]', '-map', '[aout]', *encoding, '-pix_fmt', 'yuv420p',
@@ -199,7 +204,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
         temporary.unlink(missing_ok=True)
 
 
-def overlay_existing(source, layers, output_path, work_dir, progress_callback=None):
+def overlay_existing(source, layers, output_path, work_dir, progress_callback=None, video_bitrate_mbps=0):
     """Render a review variant while stream-copying the already validated music track."""
     source = Path(source).resolve()
     info = _probe(source)
@@ -227,7 +232,7 @@ def overlay_existing(source, layers, output_path, work_dir, progress_callback=No
     log_path = work / 'overlay-ffmpeg.log'
     try:
         for codec in codecs:
-            encoding = _encoding(codec, width, height, fps, requested)
+            encoding = _encoding(codec, width, height, fps, requested, video_bitrate_mbps)
             command = ['ffmpeg', '-nostdin', '-y', '-v', 'error', '-filter_complex_threads', _filter_threads(), *inputs, '-filter_complex', ';'.join(filters),
                        '-map', f'[{label}]', '-map', '0:a:0', *encoding, '-pix_fmt', 'yuv420p', '-c:a', 'copy',
                        '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', str(temporary)]

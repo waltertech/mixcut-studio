@@ -119,6 +119,40 @@ class EditingAndDeletionTests(unittest.TestCase):
         self.assertIn('cleanup unavailable', result['cleanup_warning'])
         self.assertEqual(['two'], [item['id'] for item in result['updated_batches'][self.batch['id']]['items']])
 
+    def test_fast_forget_does_not_touch_media_or_copy_deleted_tasks(self):
+        source = self.root / 'original.ts'
+        source.write_bytes(b'source')
+        output = Path(self.batch['items'][0]['output_path'])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(b'output')
+        result = self.app.forget_items([{'batch_id': self.batch['id'], 'item_ids': ['one']}])
+        self.assertEqual(1, result['deleted_items'])
+        self.assertIsNone(result['updated_batches'][self.batch['id']])
+        self.assertEqual([], self.app.store.batches())
+        self.assertEqual([], self.app.store.records('deletion:'))
+        self.assertTrue(source.exists())
+        self.assertTrue(output.exists())
+
+    def test_active_task_disappears_immediately_and_cancels_without_shifting_worker_indexes(self):
+        second = copy.deepcopy(self.batch['items'][0])
+        second.update(id='two', index=2)
+        self.app.store.update(self.batch['id'], lambda batch: batch.update(
+            status='running', items=[batch['items'][0], second]))
+        result = self.app.forget_items([{'batch_id': self.batch['id'], 'item_ids': ['one']}])
+        self.assertEqual(['two'], [item['id'] for item in result['updated_batches'][self.batch['id']]['items']])
+        self.assertEqual(['two'], [item['id'] for item in self.app.visible_batches()[0]['items']])
+        self.assertTrue(self.app.batch(self.batch['id'])['items'][0]['cancel_requested'])
+        self.app.store.update(self.batch['id'], lambda batch: batch.update(status='stopped'))
+        self.app.prune_forgotten_items()
+        self.assertEqual(['two'], [item['id'] for item in self.app.batch(self.batch['id'])['items']])
+
+    def test_clear_all_also_discards_legacy_deletion_history(self):
+        self.app.store.put('deletion:old', {'items': ['old']})
+        result = self.app.forget_all_items()
+        self.assertEqual(1, result['deleted_items'])
+        self.assertEqual([], self.app.store.batches())
+        self.assertEqual([], self.app.store.records('deletion:'))
+
     def test_bulk_delete_rejects_active_batch_before_writing_snapshot(self):
         self.app.store.update(self.batch['id'], lambda batch: batch.update(status='running'))
         with self.assertRaisesRegex(ValueError, '请先停止'):

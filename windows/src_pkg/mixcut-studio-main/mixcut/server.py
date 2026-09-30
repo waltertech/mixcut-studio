@@ -11,6 +11,7 @@ from datetime import datetime
 import hashlib
 import json
 import logging
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -103,6 +104,7 @@ class Application:
         self.review_lock = threading.RLock()
         self.review_job_lock = threading.Lock()
         self.review_jobs = {}
+        self.global_review_job = {'status': 'idle', 'total': 0, 'completed': 0}
         self.archive_verifications = set()
         self.sticker_lock = threading.RLock()
         self.keyframes = KeyframeCache(self.store.directory / 'keyframes')
@@ -118,14 +120,16 @@ class Application:
         scan['music'] = [tag_music_style(song, library.get('music_dir')) for song in scan.get('music', [])]
         with self.review_job_lock:
             review_jobs = {batch_id: dict(job) for batch_id, job in self.review_jobs.items()}
+            global_review_job = dict(self.global_review_job)
         return {'video_dir': library.get('video_dir', str(DATA / '哔哩哔哩')),
                 'music_dir': library.get('music_dir', str(DATA / '去重歌曲03')),
                 'output_dir': preferences.get('output_dir', str(DATA / 'exports')),
                 'review_dir': preferences.get('review_dir', str(DATA / '审核通过')),
                 'scan': scan,
                 'scan_job': self.scan_status() if self.scan_job else None,
-                'batches': self.store.batches(),
+                'batches': self.visible_batches(),
                 'review_jobs': review_jobs,
+                'global_review_job': global_review_job,
                 'sticker_catalog': self.sticker_catalog(),
                 'version': app_version(),
                 'api_protocol': API_PROTOCOL,
@@ -426,6 +430,12 @@ class Application:
             raise ValueError('不支持的帧率')
         if config.get('hardware', 'auto') not in {'auto', 'software', 'software_fast', 'videotoolbox'}:
             raise ValueError('编码方式无效')
+        try:
+            config['video_bitrate_mbps'] = float(config.get('video_bitrate_mbps') or 0)
+        except (TypeError, ValueError):
+            raise ValueError('视频码率须为 0～50 Mbps')
+        if not math.isfinite(config['video_bitrate_mbps']) or not 0 <= config['video_bitrate_mbps'] <= 50:
+            raise ValueError('视频码率须为 0～50 Mbps')
         for field, default in [('original_volume', 0), ('music_volume', 1)]:
             config[field] = float(config.get(field, default))
             if not 0 <= config[field] <= 2:
@@ -462,7 +472,8 @@ class Application:
         output = Path(config['output_dir']).expanduser().resolve()
         batch_id = uuid.uuid4().hex[:12]
         total_duration = sum(item['duration'] for item in result['items'])
-        bitrate_estimate = max(800_000, config['width'] * config['height'] * config['fps'] * 0.12) + 192_000
+        bitrate_estimate = (config['video_bitrate_mbps'] * 1_000_000 if config.get('video_bitrate_mbps')
+                            else max(800_000, config['width'] * config['height'] * config['fps'] * 0.12)) + 192_000
         estimated_bytes = int(total_duration * bitrate_estimate / 8)
         ancestor = output
         while not ancestor.exists():
@@ -514,8 +525,9 @@ class Application:
         stats['count'] = len(items)
         stats['total_duration'] = sum(float(item.get('duration', 0)) for item in items)
         config = batch.get('config', {})
-        bitrate = max(800_000, config.get('width', 1280) * config.get('height', 720) *
-                      config.get('fps', 30) * 0.12) + 192_000
+        bitrate = (config.get('video_bitrate_mbps', 0) * 1_000_000 if config.get('video_bitrate_mbps')
+                   else max(800_000, config.get('width', 1280) * config.get('height', 720) *
+                            config.get('fps', 30) * 0.12)) + 192_000
         stats['estimated_output_bytes'] = int(stats['total_duration'] * bitrate / 8)
         stats['unique_music_orders'] = len({self._fingerprint(tuple(song['id'] for song in item['music']))
                                              for item in items})
@@ -741,9 +753,7 @@ class Application:
 
     def item_action(self, batch_id, item_id, action):
         if action == 'delete':
-            self.delete_items([{'batch_id': batch_id, 'item_ids': [item_id]}],
-                              'DELETE_TASK_RECORDS', 1)
-            return self.store.get('batch:' + batch_id, {'items': []})
+            return self.forget_items([{'batch_id': batch_id, 'item_ids': [item_id]}])
         def change(batch):
             item = next((entry for entry in batch['items'] if str(entry['id']) == str(item_id)), None)
             if not item:
@@ -763,6 +773,116 @@ class Application:
         result = self.store.update(batch_id, change)
         self.wake.set()
         return result
+
+    @staticmethod
+    def _visible_batch(batch):
+        if batch is None:
+            return None
+        items = [item for item in batch.get('items', []) if not item.get('dismissed')
+                 and item.get('review', {}).get('status') not in {'approved', 'superseded'}]
+        return {**batch, 'items': items} if items else None
+
+    def visible_batches(self):
+        return [visible for batch in self.store.batches()
+                if (visible := self._visible_batch(batch)) is not None]
+
+    def forget_items(self, selections, *, clear_history=False):
+        """Forget task rows promptly; ongoing work is cancelled without touching media files."""
+        if not isinstance(selections, list):
+            raise ValueError('请选择要删除的任务')
+        review_available = self.review_lock.acquire(blocking=False)
+        try:
+            with self.review_job_lock:
+                reviewing = {key for key, job in self.review_jobs.items() if job['status'] == 'running'}
+            changed = {}
+            removed = 0
+            with self.store.lock, self.store.connection() as conn:
+                for entry in selections:
+                    if not isinstance(entry, dict) or not isinstance(entry.get('item_ids'), list):
+                        raise ValueError('任务选择格式无效')
+                    batch_id = str(entry.get('batch_id', ''))
+                    if batch_id in changed:
+                        raise ValueError('请勿重复选择同一组任务')
+                    row = conn.execute('SELECT body FROM records WHERE id=?', ('batch:' + batch_id,)).fetchone()
+                    if row is None:
+                        changed[batch_id] = None
+                        continue
+                    batch = json.loads(row[0])
+                    wanted = {str(item_id) for item_id in entry['item_ids']}
+                    active = (batch['status'] in {'running', 'queued', 'pausing', 'stopping'}
+                              or batch_id in reviewing or not review_available)
+                    retained = []
+                    for item in batch['items']:
+                        if str(item['id']) not in wanted:
+                            retained.append(item)
+                            continue
+                        if not item.get('dismissed'):
+                            removed += 1
+                        if active:
+                            item['dismissed'] = True
+                            item['cancel_requested'] = True
+                            if item['status'] == 'pending':
+                                item['status'] = 'cancelled'
+                            retained.append(item)
+                    batch['items'] = retained
+                    if retained:
+                        if batch['status'] == 'draft':
+                            self._update_plan_counts(batch)
+                        batch['updated_at'] = time.time()
+                        conn.execute('UPDATE records SET body=? WHERE id=?',
+                                     (json.dumps(batch, ensure_ascii=False), 'batch:' + batch_id))
+                        changed[batch_id] = self._visible_batch(batch)
+                    else:
+                        conn.execute('DELETE FROM records WHERE id=?', ('batch:' + batch_id,))
+                        changed[batch_id] = None
+                if clear_history:
+                    conn.execute("DELETE FROM records WHERE id LIKE 'deletion:%'")
+        finally:
+            if review_available:
+                self.review_lock.release()
+        self.wake.set()
+        return {'ok': True, 'deleted_items': removed, 'updated_batches': changed}
+
+    def forget_all_items(self):
+        selections = [{'batch_id': batch['id'], 'item_ids': [item['id'] for item in batch['items']]}
+                      for batch in self.store.batches()]
+        return self.forget_items(selections, clear_history=True)
+
+    def prune_forgotten_items(self):
+        """Drop hidden rows after their worker/reviewer has stopped using their indexes."""
+        if not self.review_lock.acquire(blocking=False):
+            return
+        try:
+            with self.review_job_lock:
+                reviewing = {key for key, job in self.review_jobs.items() if job['status'] == 'running'}
+            with self.store.lock, self.store.connection() as conn:
+                batches = self.store.batches()
+                dependents = {(origin.get('batch_id'), origin.get('item_id')) for batch in batches
+                              if (origin := batch.get('sticker_origin')) and batch.get('items')}
+                for batch in batches:
+                    if batch['status'] in {'running', 'queued', 'pausing', 'stopping'} or batch['id'] in reviewing:
+                        continue
+                    retained = []
+                    for item in batch['items']:
+                        cleanup = item.get('cleanup', {})
+                        archived = item.get('review', {}).get('status') in {'approved', 'superseded'}
+                        settled = (archived and cleanup.get('output_deleted')
+                                   and (not item.get('segments') or cleanup.get('original_recordings_deleted'))
+                                   and (not batch.get('sticker_origin') or cleanup.get('origin_output_deleted'))
+                                   and (batch['id'], item['id']) not in dependents)
+                        if not item.get('dismissed') and not settled:
+                            retained.append(item)
+                    if len(retained) == len(batch['items']):
+                        continue
+                    if retained:
+                        batch['items'] = retained
+                        batch['updated_at'] = time.time()
+                        conn.execute('UPDATE records SET body=? WHERE id=?',
+                                     (json.dumps(batch, ensure_ascii=False), 'batch:' + batch['id']))
+                    else:
+                        conn.execute('DELETE FROM records WHERE id=?', ('batch:' + batch['id'],))
+        finally:
+            self.review_lock.release()
 
     def delete_items(self, selections, confirmation, expected_count=None):
         """Remove selected task records, retaining a durable snapshot of cleanup state."""
@@ -1013,9 +1133,29 @@ class Application:
         self.worker = threading.Thread(target=self.run_queue, daemon=True, name='render-queue')
         self.worker.start()
         self.scheduler.start()
+        threading.Thread(target=self.run_housekeeping, daemon=True, name='task-housekeeping').start()
+
+    def run_housekeeping(self):
+        while not self.closing.wait(60):
+            if not self.review_lock.acquire(blocking=False):
+                continue
+            try:
+                self._cleanup_approved_sources()
+                self.prune_forgotten_items()
+            except Exception:
+                logging.exception('background source cleanup failed')
+            finally:
+                self.review_lock.release()
 
     def run_queue(self):
+        last_prune = 0.0
         while not self.closing.is_set():
+            if time.monotonic() - last_prune >= 10:
+                try:
+                    self.prune_forgotten_items()
+                except Exception:
+                    logging.exception('task record pruning failed')
+                last_prune = time.monotonic()
             candidates = [b for b in self.store.batches() if b['status'] == 'queued']
             if not candidates:
                 self.wake.wait(1)
@@ -1113,7 +1253,8 @@ class Application:
                     work_dir = str(self.store.directory / 'work' / batch_id / item['id'])
                     if item.get('kind') == 'sticker_variant':
                         result = renderer.overlay_existing(item['source_asset']['path'], render_config['sticker_layers'],
-                                                           str(output), work_dir, progress)
+                                                           str(output), work_dir, progress,
+                                                           video_bitrate_mbps=render_config.get('video_bitrate_mbps', 0))
                     else:
                         result = renderer.render(item, render_config, str(output), work_dir, progress)
                     result.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns)
@@ -1577,6 +1718,56 @@ class Application:
         with self.review_job_lock:
             return dict(self.review_jobs.get(batch_id, {'batch_id': batch_id, 'status': 'idle'}))
 
+    def start_review_all(self, body):
+        review_dir = str(body.get('review_dir', '')).strip()
+        if not review_dir:
+            raise ValueError('请先设置审核通过文件夹')
+        with self.review_job_lock:
+            if self.global_review_job['status'] == 'running':
+                return dict(self.global_review_job)
+            if any(job['status'] == 'running' for job in self.review_jobs.values()):
+                raise ValueError('另一项审核正在进行，请稍后重试')
+            candidates = [(batch['id'], str(item['id'])) for batch in
+                          sorted(self.visible_batches(), key=lambda entry: entry.get('created_at', 0))
+                          for item in sorted(batch['items'], key=lambda entry: (int(entry.get('index') or 0),
+                                                                               str(entry['id'])))
+                          if item['status'] == 'success' and
+                          item.get('review', {}).get('status') not in {'approved', 'superseded', 'copying'}]
+            if not candidates:
+                raise ValueError('没有待审核的已完成任务')
+            job = {'status': 'running', 'total': len(candidates), 'completed': 0,
+                   'skipped': 0, 'current_item': None, 'error': None}
+            self.global_review_job = job
+
+        def work():
+            for batch_id, item_id in candidates:
+                with self.review_job_lock:
+                    job['current_item'] = item_id
+                batch = self.store.get('batch:' + batch_id)
+                item = next((entry for entry in batch.get('items', []) if entry['id'] == item_id), None) if batch else None
+                if item is None or item.get('dismissed'):
+                    with self.review_job_lock:
+                        job['skipped'] += 1
+                    continue
+                try:
+                    self.approve({'batch_id': batch_id, 'item_id': item_id, 'review_dir': review_dir})
+                except Exception as exc:
+                    with self.review_job_lock:
+                        job.update(status='failed', error=str(exc), failed_item=item_id,
+                                   current_item=None)
+                    return
+                with self.review_job_lock:
+                    job['completed'] += 1
+            with self.review_job_lock:
+                job.update(status='completed', current_item=None)
+
+        threading.Thread(target=work, name='mixcut-review-all', daemon=True).start()
+        return dict(job)
+
+    def review_all_status(self):
+        with self.review_job_lock:
+            return dict(self.global_review_job)
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = 'MixCut/1.0'
@@ -1675,6 +1866,12 @@ class Handler(BaseHTTPRequestHandler):
                 if path == '/api/batches/delete-items':
                     return self.json_response(self.app.delete_items(body.get('selections'),
                         body.get('confirmation'), body.get('expected_count')))
+                if path == '/api/tasks/forget':
+                    return self.json_response(self.app.forget_items(body.get('selections')))
+                if path == '/api/tasks/clear':
+                    return self.json_response(self.app.forget_all_items())
+                if path == '/api/tasks/approve-all':
+                    return self.json_response(self.app.start_review_all(body))
                 if path == '/api/batches/clear':
                     return self.json_response(self.app.clear_batches(bool(body.get('delete_outputs')),
                         body.get('confirmation'), body.get('expected_count')))
@@ -1722,7 +1919,9 @@ class Handler(BaseHTTPRequestHandler):
                     compact = parse_qs(urlparse(self.path).query).get('compact') == ['1']
                     return self.json_response(self.app.scan_status(compact=compact) or {'status': 'idle'})
                 if path == '/api/batches':
-                    return self.json_response(self.app.store.batches())
+                    return self.json_response(self.app.visible_batches())
+                if path == '/api/tasks/approve-all':
+                    return self.json_response(self.app.review_all_status())
                 batch_review_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/approve-all', path)
                 if batch_review_match:
                     return self.json_response(self.app.batch_review_status(batch_review_match[1]))

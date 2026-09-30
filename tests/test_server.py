@@ -172,8 +172,9 @@ class ApplicationTestCase(unittest.TestCase):
         self.assertEqual('pending', restarted['items'][0]['status'])
         self.app.store.update(record['id'], lambda value: value.update(status='stopped'))
         deleted = self.app.item_action(record['id'], '2', 'delete')
-        self.assertEqual(['1'], [entry['id'] for entry in deleted['items']])
-        self.assertEqual(1, deleted['items'][0]['index'])
+        self.assertEqual(['1'], [entry['id'] for entry in deleted['updated_batches'][record['id']]['items']])
+        self.assertEqual(1, deleted['updated_batches'][record['id']]['items'][0]['index'])
+        self.assertEqual([], self.app.store.records('deletion:'))
         self.assertEqual(1, self.app.clear_batches(confirmation='DELETE_TASK_RECORDS')['deleted'])
         self.assertEqual([], self.app.store.batches())
 
