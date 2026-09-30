@@ -3,6 +3,8 @@ from datetime import datetime
 import hashlib
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -35,6 +37,70 @@ class ReviewTests(unittest.TestCase):
 
     def approve(self, item='1'):
         return self.app.approve({'batch_id': 'abc123', 'item_id': item, 'review_dir': str(self.target_root)})
+
+    def wait_for_batch_review(self):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = self.app.batch_review_status('abc123')
+            if job['status'] != 'running':
+                return job
+            time.sleep(.01)
+        self.fail('batch review did not finish')
+
+    def test_batch_review_uses_task_index_order_and_skips_approved(self):
+        self.record['items'].reverse()
+        self.app.store.put('batch:abc123', self.record)
+        calls = []
+        original = self.app.approve
+        def record_approval(body):
+            calls.append(body['item_id'])
+            return original(body)
+        with patch.object(self.app, 'approve', side_effect=record_approval):
+            self.app.start_batch_review('abc123', {'review_dir': str(self.target_root),
+                                                   'item_ids': ['1', '2']})
+            job = self.wait_for_batch_review()
+        self.assertEqual('completed', job['status'])
+        self.assertEqual(['1', '2'], calls)
+        self.assertEqual(2, job['completed'])
+        self.assertEqual(2, len(list(self.target_root.rglob('*.mp4'))))
+        with self.assertRaisesRegex(ValueError, '没有可审核'):
+            self.app.start_batch_review('abc123', {'review_dir': str(self.target_root), 'item_ids': []})
+
+    def test_batch_review_stops_on_error_and_can_resume(self):
+        original = self.app.approve
+        def fail_second(body):
+            if body['item_id'] == '2':
+                raise OSError('simulated archive failure')
+            return original(body)
+        with patch.object(self.app, 'approve', side_effect=fail_second):
+            self.app.start_batch_review('abc123', {'review_dir': str(self.target_root),
+                                                   'item_ids': ['1', '2']})
+            job = self.wait_for_batch_review()
+        self.assertEqual('failed', job['status'])
+        self.assertEqual('2', job['failed_item'])
+        self.assertEqual(1, job['completed'])
+        self.assertEqual('approved', self.app.batch('abc123')['items'][0]['review']['status'])
+        self.app.start_batch_review('abc123', {'review_dir': str(self.target_root), 'item_ids': ['2']})
+        self.assertEqual('completed', self.wait_for_batch_review()['status'])
+        self.assertEqual(2, len(list(self.target_root.rglob('*.mp4'))))
+
+    def test_batch_review_prevents_deleting_records_while_archiving(self):
+        entered, release = threading.Event(), threading.Event()
+        original = self.app.approve
+        def delayed_approval(body):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError('test review wait expired')
+            return original(body)
+        with patch.object(self.app, 'approve', side_effect=delayed_approval):
+            self.app.start_batch_review('abc123', {'review_dir': str(self.target_root),
+                                                   'item_ids': ['1', '2']})
+            self.assertTrue(entered.wait(2))
+            with self.assertRaisesRegex(ValueError, '正在一键审核'):
+                self.app.delete_items([{'batch_id': 'abc123', 'item_ids': ['1']}],
+                                      'DELETE_TASK_RECORDS', 1)
+            release.set()
+            self.assertEqual('completed', self.wait_for_batch_review()['status'])
 
     def test_copy_cleans_working_output_and_groups_approved_items(self):
         original = (self.export / '001.mp4').read_bytes()

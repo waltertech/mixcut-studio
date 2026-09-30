@@ -99,6 +99,9 @@ def bootstrap(port, timeout=1):
 def verify(release_version):
     if not WINDOW_EXECUTABLE.is_file():
         raise SystemExit('native WebKit window is missing from the app')
+    for tool in ('ffmpeg', 'ffprobe'):
+        binary = APP / 'Contents' / 'Frameworks' / 'bin' / tool
+        run([binary, '-version'], stdout=subprocess.DEVNULL)
     if bootstrap(VERIFY_PORT) is not None:
         raise SystemExit(f'port {VERIFY_PORT} is already in use')
     with tempfile.TemporaryDirectory(prefix='mixcut-macos-verify-') as state:

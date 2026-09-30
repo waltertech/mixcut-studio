@@ -8,6 +8,8 @@ ICON = MACOS / 'build_tools' / 'MixCutStudio.icns'
 VERSION = os.environ['MIXCUT_VERSION']
 FFMPEG = Path(os.environ['MIXCUT_FFMPEG'])
 FFPROBE = Path(os.environ['MIXCUT_FFPROBE'])
+FFMPEG_LIBRARIES = [path for path in FFMPEG.parent.parent.glob('*.dylib')
+                    if not path.name.startswith('libpython')]
 
 for required in (PROJECT / 'maclaunch.py', PROJECT / 'static' / 'app.js', PROJECT / 'VERSION',
                  ICON, FFMPEG, FFPROBE):
@@ -17,7 +19,8 @@ for required in (PROJECT / 'maclaunch.py', PROJECT / 'static' / 'app.js', PROJEC
 a = Analysis(
     [str(PROJECT / 'maclaunch.py')],
     pathex=[str(PROJECT)],
-    binaries=[(str(FFMPEG), 'bin'), (str(FFPROBE), 'bin')],
+    binaries=[(str(FFMPEG), 'bin'), (str(FFPROBE), 'bin')]
+             + [(str(path), '.') for path in FFMPEG_LIBRARIES],
     datas=[(str(PROJECT / 'static'), 'static'), (str(PROJECT / 'VERSION'), '.')],
     hiddenimports=[
         'mixcut.folders', 'mixcut.keyframes', 'mixcut.lockfile', 'mixcut.media',

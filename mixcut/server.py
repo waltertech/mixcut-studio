@@ -100,6 +100,8 @@ class Application:
         self.thumbnail_semaphore = threading.BoundedSemaphore(2)
         self.picker_lock = threading.Lock()
         self.review_lock = threading.RLock()
+        self.review_job_lock = threading.Lock()
+        self.review_jobs = {}
         self.archive_verifications = set()
         self.sticker_lock = threading.RLock()
         self.keyframes = KeyframeCache(self.store.directory / 'keyframes')
@@ -113,6 +115,8 @@ class Application:
         preferences = self.store.get('preferences', {})
         scan = library.get('scan', {'videos': [], 'music': [], 'errors': []})
         scan['music'] = [tag_music_style(song, library.get('music_dir')) for song in scan.get('music', [])]
+        with self.review_job_lock:
+            review_jobs = {batch_id: dict(job) for batch_id, job in self.review_jobs.items()}
         return {'video_dir': library.get('video_dir', str(DATA / '哔哩哔哩')),
                 'music_dir': library.get('music_dir', str(DATA / '去重歌曲03')),
                 'output_dir': preferences.get('output_dir', str(DATA / 'exports')),
@@ -120,6 +124,7 @@ class Application:
                 'scan': scan,
                 'scan_job': self.scan_status() if self.scan_job else None,
                 'batches': self.store.batches(),
+                'review_jobs': review_jobs,
                 'sticker_catalog': self.sticker_catalog(),
                 'version': app_version(),
                 'api_protocol': API_PROTOCOL,
@@ -757,11 +762,16 @@ class Application:
         if not isinstance(selections, list) or not selections:
             raise ValueError('请先选择要删除的任务')
         batches = {batch['id']: batch for batch in self.store.batches()}
+        with self.review_job_lock:
+            active_reviews = {batch_id for batch_id, job in self.review_jobs.items()
+                              if job['status'] == 'running'}
         selected = {}
         for entry in selections:
             if not isinstance(entry, dict) or not isinstance(entry.get('item_ids'), list):
                 raise ValueError('批量删除的任务格式无效')
             batch_id = str(entry.get('batch_id', ''))
+            if batch_id in active_reviews:
+                raise ValueError(f'批次 {batch_id} 正在一键审核，请等待审核结束后再删除任务')
             if batch_id in selected or batch_id not in batches:
                 raise ValueError('批次不存在或重复')
             ids = [str(value) for value in entry['item_ids']]
@@ -827,6 +837,9 @@ class Application:
         if confirmation != 'DELETE_TASK_RECORDS':
             raise ValueError('请完成删除任务记录的二次确认')
         batches = self.store.batches()
+        with self.review_job_lock:
+            if any(job['status'] == 'running' for job in self.review_jobs.values()):
+                raise ValueError('一键审核正在进行，请等待结束后再清除记录')
         if any(batch['status'] in {'running', 'queued', 'pausing', 'stopping'} for batch in batches):
             raise ValueError('请先停止所有执行中的批次')
         item_count = sum(len(batch['items']) for batch in batches)
@@ -1498,6 +1511,51 @@ class Application:
             self.preferences({'review_dir': str(root)})
             return self.batch(batch_id)
 
+    def start_batch_review(self, batch_id, body):
+        review_dir = str(body.get('review_dir', '')).strip()
+        if not review_dir:
+            raise ValueError('请先设置审核通过文件夹')
+        with self.review_lock, self.review_job_lock:
+            existing = self.review_jobs.get(batch_id)
+            if existing and existing['status'] == 'running':
+                return dict(existing)
+            batch = self.batch(batch_id)
+            candidates = sorted((item for item in batch.get('items', [])
+                                 if item.get('status') == 'success'
+                                 and item.get('review', {}).get('status') not in ('approved', 'superseded', 'copying')),
+                                 key=lambda item: (int(item.get('index') or 0), str(item['id'])))
+            item_ids = [str(item['id']) for item in candidates]
+            if not item_ids:
+                raise ValueError('此批次没有可审核的已完成任务')
+            if body.get('item_ids') != item_ids:
+                raise ValueError('任务列表已变化，请刷新后重新确认一键审核')
+            job = {'batch_id': batch_id, 'status': 'running', 'total': len(item_ids),
+                   'completed': 0, 'current_item': None, 'error': None}
+            self.review_jobs[batch_id] = job
+
+        def work():
+            for item_id in item_ids:
+                with self.review_job_lock:
+                    job['current_item'] = item_id
+                try:
+                    self.approve({'batch_id': batch_id, 'item_id': item_id, 'review_dir': review_dir})
+                except Exception as exc:
+                    with self.review_job_lock:
+                        job.update(status='failed', error=str(exc), failed_item=item_id,
+                                   current_item=None)
+                    return
+                with self.review_job_lock:
+                    job['completed'] += 1
+            with self.review_job_lock:
+                job.update(status='completed', current_item=None)
+
+        threading.Thread(target=work, name=f'mixcut-review-{batch_id}', daemon=True).start()
+        return dict(job)
+
+    def batch_review_status(self, batch_id):
+        with self.review_job_lock:
+            return dict(self.review_jobs.get(batch_id, {'batch_id': batch_id, 'status': 'idle'}))
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = 'MixCut/1.0'
@@ -1572,6 +1630,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response(self.app.preferences(body))
                 if path == '/api/approve':
                     return self.json_response(self.app.approve(body))
+                batch_review_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/approve-all', path)
+                if batch_review_match:
+                    return self.json_response(self.app.start_batch_review(batch_review_match[1], body))
                 if path == '/api/plan':
                     return self.json_response(self.app.create_plan(body))
                 music_order_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/music-order', path)
@@ -1615,6 +1676,9 @@ class Handler(BaseHTTPRequestHandler):
                     reveal(target)
                     return self.json_response({'ok': True})
                 if path == '/api/shutdown':
+                    with self.app.review_job_lock:
+                        if any(job['status'] == 'running' for job in self.app.review_jobs.values()):
+                            raise ValueError('一键审核正在进行，请等待结束后退出')
                     if any(b['status'] in ['running', 'pausing', 'stopping'] for b in self.app.store.batches()):
                         raise ValueError('请先暂停批次，等待当前成片完成后退出')
                     self.json_response({'ok': True})
@@ -1638,6 +1702,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response(self.app.scan_status(compact=compact) or {'status': 'idle'})
                 if path == '/api/batches':
                     return self.json_response(self.app.store.batches())
+                batch_review_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/approve-all', path)
+                if batch_review_match:
+                    return self.json_response(self.app.batch_review_status(batch_review_match[1]))
                 if path == '/api/deletion-records':
                     return self.json_response(self.app.store.records('deletion:'))
                 match = re.fullmatch(r'/api/batches/([a-f0-9]+)', path)
