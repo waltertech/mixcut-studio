@@ -7,6 +7,7 @@ import hashlib
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from mixcut import planner
 from mixcut.server import Application
@@ -90,6 +91,33 @@ class EditingAndDeletionTests(unittest.TestCase):
         self.assertIsNone(self.app.store.get('batch:' + self.batch['id']))
         snapshot = self.app.store.get('deletion:' + result['deletion_record_id'])
         self.assertFalse(snapshot['entries'][0]['items'][0]['cleanup']['original_recordings_deleted'])
+
+    def test_draft_partial_delete_returns_authoritative_remaining_batch(self):
+        second = copy.deepcopy(self.batch['items'][0])
+        second.update(id='two', index=2)
+        self.app.store.update(self.batch['id'], lambda batch: batch['items'].append(second))
+        result = self.app.delete_items([{'batch_id': self.batch['id'], 'item_ids': ['one']}],
+                                       'DELETE_TASK_RECORDS', 1)
+        remaining = result['updated_batches'][self.batch['id']]
+        self.assertEqual(['two'], [item['id'] for item in remaining['items']])
+        self.assertEqual(1, remaining['items'][0]['index'])
+        self.assertEqual(1, remaining['stats']['count'])
+        final = self.app.delete_items([{'batch_id': self.batch['id'], 'item_ids': ['two']}],
+                                      'DELETE_TASK_RECORDS', 1)
+        self.assertIsNone(final['updated_batches'][self.batch['id']])
+
+    def test_post_delete_cleanup_error_does_not_hide_successful_deletion(self):
+        second = copy.deepcopy(self.batch['items'][0])
+        second.update(id='two', index=2)
+        self.app.store.update(self.batch['id'], lambda batch: batch['items'].append(second))
+        with patch.object(self.app, '_cleanup_approved_sources', side_effect=RuntimeError('cleanup unavailable')), \
+                patch('mixcut.server.logging.exception') as logged:
+            result = self.app.delete_items([{'batch_id': self.batch['id'], 'item_ids': ['one']}],
+                                           'DELETE_TASK_RECORDS', 1)
+        logged.assert_called_once()
+        self.assertEqual(1, result['deleted_items'])
+        self.assertIn('cleanup unavailable', result['cleanup_warning'])
+        self.assertEqual(['two'], [item['id'] for item in result['updated_batches'][self.batch['id']]['items']])
 
     def test_bulk_delete_rejects_active_batch_before_writing_snapshot(self):
         self.app.store.update(self.batch['id'], lambda batch: batch.update(status='running'))

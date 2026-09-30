@@ -16,13 +16,13 @@ class MacLauncherTests(unittest.TestCase):
         self.assertIn('data.api_protocol === 3', source)
 
     def test_same_version_without_protocol_is_still_incompatible(self):
-        old = {'version': '1.4.2', 'batches': [], 'ffmpeg_available': True}
+        old = {'version': '1.4.3', 'batches': [], 'ffmpeg_available': True}
         self.assertFalse(maclaunch._compatible(old))
         self.assertTrue(maclaunch._compatible({**old, 'api_protocol': 3}))
 
     def test_idle_old_server_is_stopped_before_new_window_opens(self):
         old = {'version': '1.3.8', 'api_protocol': 3, 'batches': [], 'ffmpeg_available': True}
-        current = {**old, 'version': '1.4.2'}
+        current = {**old, 'version': '1.4.3'}
         with tempfile.TemporaryDirectory() as directory:
             events = []
             with patch('mixcut.runtime.data_root', return_value=Path(directory)), \

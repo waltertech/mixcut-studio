@@ -3,9 +3,15 @@
   const state = { scan: { videos: [], music: [], errors: [] }, batch: null, batches: [], poller: null, scanPoller: null, scanSignature: '', scanRunning: false, libraryDirs: null, dirtyLibrary: new Set(), mediaCache: new Map(), keyframeObserver: null, batchSignature: '', batchLayoutSignature: '', serverVersion: '', reviewJobs: new Map() };
   const selectedTasks = new Set();
   const taskKey = (batchId, itemId) => `${batchId}:${itemId}`;
-  const taskSelection = (batch, item) => { const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = 'task-select'; checkbox.setAttribute('aria-label', `选择任务 ${item.index || item.id}`); const key = taskKey(batch.id,item.id); checkbox.checked = selectedTasks.has(key); checkbox.disabled = ['queued','running','pausing','stopping'].includes(batch.status) || ['running','validating'].includes(item.status); checkbox.addEventListener('change', () => checkbox.checked ? selectedTasks.add(key) : selectedTasks.delete(key)); return checkbox; };
+  const taskSelection = (batch, item) => { const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = 'task-select'; checkbox.setAttribute('aria-label', `选择任务 ${item.index || item.id}`); const key = taskKey(batch.id,item.id); checkbox.checked = selectedTasks.has(key); checkbox.disabled = ['queued','running','pausing','stopping'].includes(batch.status) || ['running','validating'].includes(item.status); checkbox.addEventListener('change', () => { if (checkbox.checked) selectedTasks.add(key); else selectedTasks.delete(key); updateSelectionButtons(); }); return checkbox; };
   const $ = (s, root = document) => root.querySelector(s);
   const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+  const updateSelectionButtons = () => {
+    const planCount = (state.batch?.items || []).filter(item => selectedTasks.has(taskKey(state.batch.id, item.id))).length;
+    const taskCount = state.batches.reduce((total, batch) => total + (batch.items || []).filter(item => selectedTasks.has(taskKey(batch.id, item.id))).length, 0);
+    $('#delete-selected-plan').textContent = planCount ? `删除选中任务（${planCount}）` : '删除选中任务';
+    $('#delete-selected-tasks').textContent = taskCount ? `删除选中任务（${taskCount}）` : '删除选中任务';
+  };
   const fmt = (seconds) => { const raw = Number(seconds); if (!Number.isFinite(raw)) return '未知时长'; const total = Math.max(0, Math.round(raw)), h = Math.floor(total / 3600), m = Math.floor(total % 3600 / 60), s = total % 60; return (h ? `${h}:` : '') + `${String(m).padStart(h ? 2 : 1, '0')}:${String(s).padStart(2, '0')}`; };
   const safeClass = (value) => String(value || 'pending').toLowerCase().replace(/[^a-z0-9_-]/g, '');
   const toast = (message, isError = false) => { const el = $('#toast'); el.textContent = message; el.style.background = isError ? '#9c4035' : ''; el.classList.add('show'); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove('show'), 4200); };
@@ -185,11 +191,20 @@
     root.append(track);
   }
   function renderPlan(batch) {
-    state.batch = batch; $('#plan-message').textContent = batch ? `批次 ${batch.folder_name || batch.id} 已生成。仅在核对后开始渲染。${batch.output_folder ? ` 输出目录：${batch.output_folder}` : ''}` : '尚未生成方案。'; $('#start-btn').disabled = !batch || !batch.items?.length || batch.status !== 'draft'; $('#manifest-btn').disabled = !batch; const stats = $('#plan-stats'), warnings = $('#plan-warnings'), list = $('#plan-items'); stats.replaceChildren(); warnings.replaceChildren(); list.replaceChildren(); if (!batch) return;
+    state.batch = batch; $('#plan-message').textContent = batch ? `批次 ${batch.folder_name || batch.id} 已生成。仅在核对后开始渲染。${batch.output_folder ? ` 输出目录：${batch.output_folder}` : ''}` : '尚未生成方案。'; $('#start-btn').disabled = !batch || !batch.items?.length || batch.status !== 'draft'; $('#manifest-btn').disabled = !batch; const stats = $('#plan-stats'), warnings = $('#plan-warnings'), list = $('#plan-items'); stats.replaceChildren(); warnings.replaceChildren(); list.replaceChildren(); if (!batch) { updateSelectionButtons(); return; }
     if(batch.config?.sticker_layers?.length){const note=document.createElement('div');note.textContent=`贴图模板：${batch.config.sticker_template?.name || '已保存模板'} · ${batch.config.sticker_layers.length}层（位置、大小和出现时间已固定到本批次）`;warnings.append(note);}
-    const s = batch.stats || {}; const statLabels = { max_overlap_ratio: '最高两两重合', source_usage: '素材使用', video_usage: '视频素材使用', music_usage: '音乐素材使用', unique_music_orders: '不同歌曲顺序', unique_video_plans: '不同视频方案', estimated_output_bytes: '预计输出大小', total_duration: '总成片时长' }; const names = new Map([...state.scan.videos || [], ...state.scan.music || []].map(asset => [asset.id, asset.name || asset.path || asset.id])); const usage = value => Object.entries(value || {}).slice(0, 3).map(([id, count]) => `${names.get(id) || String(id).slice(0, 10)} ×${count}`).join('；') || '—'; const formatted = (key, value) => key === 'max_overlap_ratio' && Number.isFinite(Number(value)) ? `${Math.round(Number(value) * 100)}%` : key === 'estimated_output_bytes' && Number.isFinite(Number(value)) ? `${(Number(value) / 1024 ** 3).toFixed(2)} GB` : key === 'total_duration' && Number.isFinite(Number(value)) ? fmt(value) : (key.includes('usage') && typeof value === 'object' ? usage(value) : (typeof value === 'object' ? JSON.stringify(value) : String(value))); stats.append(stat('计划条数', batch.items?.length ?? 0), stat('目标数量', batch.config?.count ?? '—')); Object.entries(s).filter(([key]) => !['duplicate_count', 'count'].includes(key)).forEach(([key, value]) => stats.append(stat(statLabels[key] || key.replaceAll('_', ' '), formatted(key, value))));
+    const s = batch.stats || {};
+    const numberOrDash = value => Number.isFinite(Number(value)) ? Number(value) : '—';
+    stats.append(stat('当前方案', batch.items?.length ?? 0), stat('原定数量', batch.config?.count ?? '—'));
+    if (s.unique_music_orders !== undefined) stats.append(stat('不同歌曲顺序', numberOrDash(s.unique_music_orders)));
+    if (s.unique_video_plans !== undefined) stats.append(stat('不同视频方案', numberOrDash(s.unique_video_plans)));
+    if (s.segment_overlap_pairs !== undefined) stats.append(stat('片段重合对数', numberOrDash(s.segment_overlap_pairs)));
+    if (Number.isFinite(Number(s.max_overlap_ratio))) stats.append(stat('最高两两重合', `${Math.round(Number(s.max_overlap_ratio) * 100)}%`));
+    if (Number.isFinite(Number(s.estimated_output_bytes))) stats.append(stat('预计输出大小', `${(Number(s.estimated_output_bytes) / 1024 ** 3).toFixed(2)} GB`));
+    if (s.total_duration !== undefined) stats.append(stat('总成片时长', fmt(s.total_duration)));
     (batch.warnings || []).forEach(w => { const line = document.createElement('div'); line.textContent = typeof w === 'string' ? w : (w.message || JSON.stringify(w)); warnings.append(line); });
     const counts = planCounts(batch); (batch.items || []).forEach(item => { const card = document.createElement('article'); card.className = 'plan-item'; const head = document.createElement('div'); head.className = 'item-head'; const title = document.createElement('h3'); title.textContent = item.output_name || `成片 ${item.index ?? '—'}`; const duration = document.createElement('span'); duration.className = 'duration'; duration.textContent = fmt(item.duration); head.append(taskSelection(batch,item), title, duration); const tracks = document.createElement('div'); tracks.className = 'tracks'; appendVideoList(tracks,batch,item,counts); appendMusicOrder(tracks,batch,item,counts); card.append(head, tracks); list.append(card); });
+    updateSelectionButtons();
   }
   const stopScanPolling = () => { if (state.scanPoller) clearTimeout(state.scanPoller); state.scanPoller = null; };
   async function pollScan() { try { applyScanJob(await api('/api/scan/status?compact=1')); } catch (error) { stopScanPolling(); state.scanRunning = false; $('#scan-btn').disabled = false; $('#scan-btn').textContent = '扫描素材'; toast(error.message, true); } }
@@ -251,23 +266,44 @@
     if (!confirm(`将删除 ${items.length} 条任务记录，其中 ${pending} 条仍有原片清理待处理。导出视频和审核成片会保留，清理状态会写入删除记录。确定继续吗？`)) return false;
     return prompt(`请再次确认：输入“删除记录”以清除这 ${items.length} 条任务。`) === '删除记录';
   }
+  function applyDeletedBatches(updatedBatches) {
+    const byId = new Map(state.batches.map(batch => [batch.id, batch]));
+    Object.entries(updatedBatches).forEach(([id, batch]) => { if (batch) byId.set(id, batch); else byId.delete(id); });
+    state.batches = [...byId.values()].sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+    state.batchSignature = batchesSignature(state.batches);
+    state.batchLayoutSignature = batchesLayoutSignature(state.batches);
+    const anchor = currentView() === 'tasks' ? taskScrollAnchor() : null;
+    renderBatches(state.batches);
+    hydrateGalleries();
+    if (anchor) { restoreTaskScroll(anchor); requestAnimationFrame(() => restoreTaskScroll(anchor)); }
+    if (state.batch && Object.prototype.hasOwnProperty.call(updatedBatches, state.batch.id)) {
+      renderPlan(updatedBatches[state.batch.id]);
+    }
+    updateSelectionButtons();
+  }
   async function deleteSelectedTasks(scope = 'tasks') {
     const batches = scope === 'plan' ? (state.batch ? [state.batch] : []) : state.batches;
     const selections = batches.map(batch => ({batch_id:batch.id,item_ids:(batch.items || []).filter(item => selectedTasks.has(taskKey(batch.id,item.id))).map(item => item.id)})).filter(entry => entry.item_ids.length);
     const items = batches.flatMap(batch => (batch.items || []).filter(item => selectedTasks.has(taskKey(batch.id,item.id))));
     if (!items.length) return toast('请先勾选任务。',true);
     if (!confirmRecordDeletion(items)) return;
+    const button = $(scope === 'plan' ? '#delete-selected-plan' : '#delete-selected-tasks');
+    button.disabled = true; button.textContent = '删除中…';
     try {
       const result = await api('/api/batches/delete-items',{method:'POST',body:JSON.stringify({selections,expected_count:items.length,confirmation:'DELETE_TASK_RECORDS'})});
-      selections.forEach(entry => entry.item_ids.forEach(id => selectedTasks.delete(taskKey(entry.batch_id,id)))); state.batchSignature=''; await refreshBatches();
-      if (state.batch) renderPlan(state.batches.find(batch => batch.id === state.batch.id) || null);
-      toast(`已删除 ${result.deleted_items} 条任务记录；文件已保留。`);
+      selections.forEach(entry => entry.item_ids.forEach(id => selectedTasks.delete(taskKey(entry.batch_id,id))));
+      if (result.updated_batches) applyDeletedBatches(result.updated_batches);
+      else { state.batchSignature=''; await refreshBatches(); if (state.batch) renderPlan(state.batches.find(batch => batch.id === state.batch.id) || null); }
+      if (scope === 'plan') $('#plan-message').textContent = `已删除 ${result.deleted_items} 条任务记录，当前方案剩余 ${state.batch?.items?.length || 0} 条。导出和审核文件未删除。${result.cleanup_warning || ''}`;
+      toast(result.cleanup_warning || `已删除 ${result.deleted_items} 条任务记录；文件已保留。`, !!result.cleanup_warning);
     } catch(error) { toast(error.message,true); }
+    finally { button.disabled = false; updateSelectionButtons(); }
   }
   function selectAllTasks(scope) {
     const batches = scope === 'plan' ? (state.batch ? [state.batch] : []) : state.batches;
     batches.forEach(batch => { if (['queued','running','pausing','stopping'].includes(batch.status)) return; (batch.items || []).forEach(item => { if (!['running','validating'].includes(item.status)) selectedTasks.add(taskKey(batch.id,item.id)); }); });
     if (scope === 'plan') renderPlan(state.batch); else renderBatches(state.batches);
+    updateSelectionButtons();
   }
   async function clearAllBatches() {
     const items=state.batches.flatMap(batch => batch.items || []);

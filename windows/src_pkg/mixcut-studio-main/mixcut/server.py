@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 from pathlib import Path
@@ -508,11 +509,23 @@ class Application:
     def _update_plan_counts(self, batch):
         from . import planner
         items = batch['items']
-        batch.setdefault('stats', {}).update(planner.annotate_batch(items))
-        batch['stats']['unique_music_orders'] = len({self._fingerprint(tuple(song['id'] for song in item['music']))
-                                                      for item in items})
-        batch['stats']['unique_video_plans'] = len({self._fingerprint(planner.video_plan_key(
+        stats = batch.setdefault('stats', {})
+        stats.update(planner.annotate_batch(items))
+        stats['count'] = len(items)
+        stats['total_duration'] = sum(float(item.get('duration', 0)) for item in items)
+        config = batch.get('config', {})
+        bitrate = max(800_000, config.get('width', 1280) * config.get('height', 720) *
+                      config.get('fps', 30) * 0.12) + 192_000
+        stats['estimated_output_bytes'] = int(stats['total_duration'] * bitrate / 8)
+        stats['unique_music_orders'] = len({self._fingerprint(tuple(song['id'] for song in item['music']))
+                                             for item in items})
+        stats['unique_video_plans'] = len({self._fingerprint(planner.video_plan_key(
             item['segments'], batch.get('config', {}).get('fps', 30))) for item in items})
+        warnings = [message for message in batch.get('warnings', []) if not (
+            isinstance(message, str) and message.startswith((
+                '估计成片占用 ', '当前方案估计成片占用 ', '估计输出超过磁盘可用空间')))]
+        warnings.append(f"当前方案估计成片占用 {stats['estimated_output_bytes'] / 1024**3:.2f} GB；实际大小随编码变化。")
+        batch['warnings'] = warnings
 
     def _set_item_music(self, batch, item, order):
         root = self.store.get('library', {}).get('music_dir')
@@ -821,11 +834,19 @@ class Application:
                                  (json.dumps(current, ensure_ascii=False), 'batch:' + batch_id))
                 else:
                     conn.execute('DELETE FROM records WHERE id=?', ('batch:' + batch_id,))
-        if self.store.batches():
-            self._cleanup_approved_sources()
+        cleanup_warning = None
+        try:
+            if self.store.batches():
+                self._cleanup_approved_sources()
+        except Exception as exc:
+            logging.exception('source cleanup check failed after task records were deleted')
+            cleanup_warning = f'任务记录已删除，但原片清理检查失败：{exc}'
         return {'ok': True, 'deleted_items': count, 'deleted_batches': sum(
             len(ids) == len(batches[batch_id]['items']) for batch_id, ids in selected.items()),
-            'deletion_record_id': snapshot['id']}
+            'deletion_record_id': snapshot['id'],
+            'cleanup_warning': cleanup_warning,
+            'updated_batches': {batch_id: self.store.get('batch:' + batch_id)
+                                for batch_id in selected}}
 
     def clear_batches(self, delete_outputs=False, confirmation=None, expected_count=None):
         with self.review_lock:
