@@ -92,6 +92,27 @@ class ApplicationTestCase(unittest.TestCase):
         reopened = server.Store(self.root / 'state')
         self.assertEqual({'scan': {'videos': ['v']}}, reopened.get('library'))
 
+    def test_bootstrap_reports_process_version_and_hidden_active_work(self):
+        record = batch('hidden1', 'running', [item()], self.root / 'exports')
+        record['items'][0]['dismissed'] = True
+        self.save(record)
+        with patch('mixcut.server.app_version', return_value='different-on-disk'):
+            data = self.app.bootstrap()
+        self.assertEqual('1.4.5', data['version'])
+        self.assertEqual(4, data['api_protocol'])
+        self.assertTrue(data['active_work'])
+        self.assertEqual([], data['batches'])
+
+    def test_recovery_defers_large_archive_validation_until_background_work(self):
+        approved = batch('approved1', 'completed', [item(1, 'success')], self.root / 'exports')
+        approved['items'][0].update(review={'status': 'approved', 'path': str(self.root / 'archive.mp4')},
+                                    cleanup={'output_deleted': True, 'source_cleanup_requested': True})
+        self.save(approved)
+        with patch.object(server.Application, '_cleanup_approved_sources',
+                          side_effect=AssertionError('archive validation blocked startup')):
+            restarted = server.Application(self.root / 'state')
+        self.assertEqual('approved', restarted.batch('approved1')['items'][0]['review']['status'])
+
     def test_draft_music_order_can_change_but_cannot_duplicate_another_item(self):
         first = item(1)
         first['music'] = [{'id': 'a', 'name': 'A'}, {'id': 'b', 'name': 'B'}, {'id': 'c', 'name': 'C'}]

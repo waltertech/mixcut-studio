@@ -31,7 +31,7 @@ def _compatible(data):
 
 
 def _active_tasks(data):
-    return any(batch.get('status') in {'queued', 'running', 'pausing', 'stopping'}
+    return bool(data.get('active_work')) or any(batch.get('status') in {'queued', 'running', 'pausing', 'stopping'}
                for batch in data.get('batches', []))
 
 

@@ -93,6 +93,8 @@ class Store:
 
 class Application:
     def __init__(self, state_dir):
+        # Preserve the process version even if an installer replaces VERSION on disk.
+        self.running_version = app_version()
         self.store = Store(state_dir)
         self.closing = threading.Event()
         self.wake = threading.Event()
@@ -131,8 +133,10 @@ class Application:
                 'review_jobs': review_jobs,
                 'global_review_job': global_review_job,
                 'sticker_catalog': self.sticker_catalog(),
-                'version': app_version(),
+                'version': self.running_version,
                 'api_protocol': API_PROTOCOL,
+                'active_work': any(batch['status'] in {'queued', 'running', 'pausing', 'stopping'}
+                                   for batch in self.store.batches()),
                 'ffmpeg_available': bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))}
 
     def sticker_catalog(self):
@@ -1112,6 +1116,19 @@ class Application:
             elif review_changed:
                 batch['updated_at'] = time.time()
                 self.store.put('batch:' + batch['id'], batch)
+        # Resume an interrupted output/sticker cleanup before serving the
+        # result. Source cleanup can hash every archived video, so defer that.
+        for batch in self.store.batches():
+            for item in batch['items']:
+                if item.get('review', {}).get('status') != 'approved':
+                    continue
+                if not item.get('cleanup', {}).get('output_deleted'):
+                    self._cleanup_approved_output(batch['id'], item['id'])
+                if (batch.get('sticker_origin', {}).get('replace_origin_on_approval')
+                        and not item.get('cleanup', {}).get('origin_output_deleted')):
+                    self._cleanup_sticker_origin(batch['id'], item['id'])
+
+    def _complete_approved_cleanup(self):
         pending_source_cleanup = False
         for batch in self.store.batches():
             for item in batch['items']:
@@ -1136,16 +1153,20 @@ class Application:
         threading.Thread(target=self.run_housekeeping, daemon=True, name='task-housekeeping').start()
 
     def run_housekeeping(self):
-        while not self.closing.wait(60):
+        while not self.closing.is_set():
             if not self.review_lock.acquire(blocking=False):
+                if self.closing.wait(60):
+                    return
                 continue
             try:
-                self._cleanup_approved_sources()
+                self._complete_approved_cleanup()
                 self.prune_forgotten_items()
             except Exception:
                 logging.exception('background source cleanup failed')
             finally:
                 self.review_lock.release()
+            if self.closing.wait(60):
+                return
 
     def run_queue(self):
         last_prune = 0.0
