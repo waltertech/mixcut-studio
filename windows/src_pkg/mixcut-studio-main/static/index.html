@@ -27,7 +27,7 @@
       <main>
         <section id="assets" class="view">
           <div class="page-heading"><div><p class="eyebrow">MATERIAL LIBRARY</p><h1>素材</h1><p>填入本机绝对路径，递归扫描可用的视频与音乐。审核通过后，程序会按规则删除已用原始视频。</p></div><button id="scan-btn" class="button primary">扫描素材</button></div>
-          <div class="notice"><strong>音乐时长覆盖成片</strong>：每条歌曲总时长须达到目标视频时长；成片结束时可能截断最后一首歌曲，不变速、不循环。</div>
+          <div class="notice"><strong>音乐时长覆盖成片</strong>：候选池规划按读取到的时长分配歌曲，并预留视频时长的 0.5%（最多 3 秒）；成片结束时可能截断最后一首歌曲，不变速、不循环。渲染时识别到异常音乐会自动换歌重试。</div>
           <p id="scan-progress" class="field-help" role="status" aria-live="polite"></p>
           <form id="paths-form" class="panel paths-grid">
             <label>视频文件夹<span class="path-control"><input id="video-dir" name="video_dir" required placeholder="/Users/…/视频素材"><button class="button folder-picker" data-kind="video" type="button">选择文件夹</button></span></label>

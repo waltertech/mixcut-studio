@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import os
 from pathlib import Path
 import subprocess
@@ -14,6 +15,31 @@ import threading
 from .fsutil import publish
 
 from . import media, stickers
+
+
+class MusicInputError(ValueError):
+    """A render identified an invalid music input, eligible for bounded replacement."""
+    def __init__(self, message, asset_ids):
+        super().__init__(message)
+        self.asset_ids = list(asset_ids)
+
+
+def music_input_error(log, item):
+    # FFmpeg identifies decoder inputs as aist#<input>:<stream>; video inputs come first.
+    offset = len(item['segments'])
+    bad = set()
+    for line in log.splitlines():
+        if not any(token in line for token in ('Error', 'Invalid data', 'error code')):
+            continue
+        for number in re.findall(r'aist#(\d+):\d+', line):
+            index = int(number) - offset
+            if 0 <= index < len(item['music']):
+                bad.add(index)
+    if bad:
+        songs = [item['music'][index] for index in sorted(bad)]
+        return MusicInputError('音乐解码异常：' + '、'.join(song.get('name', song['path']) for song in songs),
+                               [song['id'] for song in songs])
+    return None
 
 
 def _codec_candidates(requested, platform_name=sys.platform, os_name=os.name):
@@ -187,7 +213,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
     try:
         for codec in codecs:
             encoding = _encoding(codec, width, height, fps, requested, config.get('video_bitrate_mbps', 0))
-            command = ['ffmpeg', '-nostdin', '-y', '-hide_banner', '-loglevel', 'error',
+            command = ['ffmpeg', '-nostdin', '-y', '-hide_banner', '-loglevel', 'error', '-xerror',
                        '-filter_complex_threads', _filter_threads(), *inputs, '-filter_complex', ';'.join(filters),
                        '-map', f'[{output_label}]', '-map', '[aout]', *encoding, '-pix_fmt', 'yuv420p',
                        '-r', str(fps), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
@@ -206,6 +232,9 @@ def render(item, config, output_path, work_dir, progress_callback=None):
                     process.wait()
                     process.stdout.close()
                     raise
+            music_error = music_input_error(log_path.read_text(encoding='utf-8'), item)
+            if music_error:
+                raise music_error
             if result == 0:
                 chosen = codec
                 break
@@ -213,7 +242,15 @@ def render(item, config, output_path, work_dir, progress_callback=None):
             raise ValueError('FFmpeg 渲染失败：' + log_path.read_text(encoding='utf-8')[-1500:])
         if progress_callback:
             progress_callback({'stage': 'validating', 'progress': 0.96})
-        checked = validate(str(temporary), duration)
+        try:
+            checked = validate(str(temporary), duration)
+        except ValueError as exc:
+            if str(exc).startswith('音乐流时长'):
+                info = _probe(temporary)
+                audio = next(stream for stream in info['streams'] if stream['codec_type'] == 'audio')
+                if float(audio.get('duration', 0)) < duration - 0.05:
+                    raise MusicInputError('音乐实际时长不足：' + str(exc), []) from exc
+            raise
         publish(temporary, output)
         checked.update(path=str(output), encoder=chosen, elapsed_seconds=round(time.monotonic() - started, 3))
         if progress_callback:

@@ -105,7 +105,9 @@ def _asset(path: Path, kind: str, *, quick_music=False) -> dict[str, Any]:
         raise ValueError("没有视频流")
     if kind == "music" and audio is None:
         raise ValueError("没有音频流")
-    raw_duration = info.get("format", {}).get("duration")
+    raw_duration = (audio or {}).get("duration") if kind == "music" else None
+    if raw_duration in (None, "N/A", ""):
+        raw_duration = info.get("format", {}).get("duration")
     try:
         duration = float(raw_duration)
     except (TypeError, ValueError):

@@ -21,7 +21,7 @@ class ScheduledMediaIntegration(unittest.TestCase):
         self.base = time.time() + 20
         self.make_video('a', 'blue')
         for number in range(4):
-            self.ffmpeg('-f', 'lavfi', '-i', f'sine=f={300 + number * 100}:r=48000:d=1',
+            self.ffmpeg('-f', 'lavfi', '-i', f'sine=f={300 + number * 100}:r=48000:d=1.1',
                         '-c:a', 'libmp3lame', str(self.music / f'{number}.mp3'))
         self.app = Application(self.root / 'state')
         self.app.scheduler = Scheduler(self.app, background_checks=False)

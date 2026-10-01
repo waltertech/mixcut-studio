@@ -81,6 +81,10 @@ def _allocate(total: float, count: int, lo: float, hi: float, rng: random.Random
 
 def allocate_music(music, target, config, rng, usage=None):
     """Choose a feasible song set, exhausting each usage round before the next."""
+    margin = min(float(config.get('music_margin_seconds', 0)), max(0, float(target)) * 0.005)
+    if not math.isfinite(margin) or margin < 0:
+        raise ValueError('音乐时长余量必须是非负有限数字')
+    target += margin
     usage = defaultdict(int, usage or {})
     minimum = max(1, int(config.get('min_songs', 1)))
     maximum = min(len(music), int(config.get('max_songs', len(music))))

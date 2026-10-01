@@ -613,13 +613,7 @@ class Application:
         library = library_record.get('scan', {})
         if not library.get('videos') or not library.get('music'):
             raise ValueError('请先扫描视频和音乐素材')
-        selected_music = set(config.get('music_ids') or [song['id'] for song in library['music']])
-        prepared_music = media.precise_music(library['music'], selected_music,
-                                             str(self.store.directory / 'cache'))
-        if prepared_music != library['music']:
-            library = dict(library, music=prepared_music)
-            library_record['scan'] = library
-            self.store.put('library', library_record)
+        config.setdefault('music_margin_seconds', 3.0)
         output = Path(config.get('output_dir') or self.bootstrap()['output_dir']).expanduser().resolve()
         if output.exists() and not output.is_dir():
             raise ValueError('导出路径必须是文件夹')
@@ -750,10 +744,13 @@ class Application:
 
         return self.store.update(batch_id, change)
 
-    def _choose_item_music(self, batch, item, target, *, avoid_current=False):
+    def _choose_item_music(self, batch, item, target, *, avoid_current=False, excluded_ids=()):
         from . import planner
-        selected = set(batch.get('config', {}).get('music_ids') or [])
-        music = [asset for asset in batch.get('assets', []) if asset.get('id') in selected]
+        selected = set(batch.get('config', {}).get('music_ids') or
+                       [song['id'] for song in self.store.get('library', {}).get('scan', {}).get('music', [])] or
+                       [song['id'] for entry in batch['items'] for song in entry.get('music', [])])
+        music = [asset for asset in batch.get('assets', [])
+                 if asset.get('id') in selected and asset.get('id') not in excluded_ids]
         usage = defaultdict(int)
         for other in batch['items']:
             if other is not item:
@@ -768,6 +765,26 @@ class Application:
             if ids not in used_orders and (not avoid_current or ids != old_ids):
                 return order
         raise ValueError('没有找到符合整批使用次数和时长要求的另一组音乐')
+
+    def _replace_failed_music(self, batch_id, index, failed_ids):
+        """Persist replacement under the store lock so parallel tasks see usage updates."""
+        def change(batch):
+            item = batch['items'][index]
+            if item.get('dismissed') or item.get('cancel_requested') or item['status'] == 'cancelled':
+                raise ValueError('任务已删除或终止')
+            blocked = set(batch.get('failed_music_ids', [])) | set(failed_ids)
+            batch['failed_music_ids'] = sorted(blocked)
+            order = self._choose_item_music(batch, item, float(item['duration']),
+                                            avoid_current=True, excluded_ids=blocked)
+            # Keep the planned output location stable while updating music metadata.
+            output_name, output_path = item['output_name'], item['output_path']
+            previous = [song['id'] for song in item['music']]
+            self._set_item_music(batch, item, order)
+            item.update(output_name=output_name, output_path=output_path)
+            item.setdefault('music_replacements', []).append({
+                'failed_ids': list(failed_ids), 'previous_ids': previous,
+                'replacement_ids': [song['id'] for song in order], 'at': time.time()})
+        return self.store.update(batch_id, change)
 
     def refresh_music(self, batch_id, item_id):
         def change(batch):
@@ -816,7 +833,8 @@ class Application:
                             usage[song['id']] += 1
                 remaining_duration = sum(float(song['duration']) for n, song in enumerate(current) if n != index)
                 candidates = [song for song in batch['assets'] if song['id'] in selected and song['id'] not in ids
-                              and remaining_duration + float(song['duration']) + 1e-7 >= float(item['duration'])]
+                              and remaining_duration + float(song['duration']) + 1e-7 >= float(item['duration']) +
+                              min(float(config.get('music_margin_seconds', 0)), float(item['duration']) * 0.005)]
                 if not candidates:
                     raise ValueError('没有满足时长和任务内去重要求的替换歌曲')
                 least = min(usage[song['id']] for song in candidates)
@@ -1462,6 +1480,15 @@ class Application:
                     or current.get('scheduled_cancelled') or self.closing.is_set()
                     or current['status'] in {'pausing', 'stopping', 'paused'}):
                 return
+            blocked = set(current.get('failed_music_ids', [])) & {song['id'] for song in item.get('music', [])}
+            if blocked and item.get('kind') != 'sticker_variant':
+                try:
+                    batch = self._replace_failed_music(batch_id, index, blocked)
+                    item = batch['items'][index]
+                except (ValueError, OSError) as exc:
+                    self.store.update(batch_id, lambda b: b['items'][index].update(
+                        status='failed', error='无法替换已知异常音乐：' + str(exc)))
+                    return
             self.store.update(batch_id, lambda b: b['items'][index].update(
                 status='running', attempts=attempt + 1, progress=0, error=None))
             last_update = [0.0]
@@ -1507,6 +1534,14 @@ class Application:
                     self.scheduler.finish_cancelled_batch(batch_id)
                     return
                 message = str(exc)
+                if isinstance(exc, getattr(renderer, 'MusicInputError', ())) and attempt < 2 and item.get('kind') != 'sticker_variant':
+                    try:
+                        updated = self._replace_failed_music(batch_id, index, exc.asset_ids)
+                        batch = updated
+                        item = updated['items'][index]
+                        continue
+                    except (ValueError, OSError) as replacement_error:
+                        message += '；自动替换音乐失败：' + str(replacement_error)
                 self.store.update(batch_id, lambda b: b['items'][index].update(
                     status='failed', error=message))
                 current = self.batch(batch_id)

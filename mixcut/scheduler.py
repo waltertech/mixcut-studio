@@ -360,7 +360,7 @@ class Scheduler:
                     excluded.append(str(Path(batch.get('output_folder') or Path(batch['config']['output_dir']) / batch['id'])))
                     excluded.extend(batch.get('review_folders', {}).values())
                 scan = media.scan(schedule['video_dir'], schedule['music_dir'],
-                                  str(self.store.directory / 'schedule-cache' / run_id), exclude_dirs=excluded)
+                                  str(self.store.directory / 'schedule-cache' / run_id), exclude_dirs=excluded, quick_music=True)
                 # Avoid files that are still being copied into the watched folder.
                 for kind in ['videos', 'music']:
                     scan[kind] = [a for a in scan[kind] if now - a.get('mtime_ns', 0) / 1e9 >= 2]
@@ -380,6 +380,7 @@ class Scheduler:
                     previous = [i for batch in self._run_batches(run) for i in batch['items'] if i['status'] == 'success']
                     config = copy.deepcopy(schedule['config'])
                     config['count'] = run['target_count'] - run['completed_count']
+                    config.setdefault('music_margin_seconds', 3.0)
                     config.setdefault('seed', random.SystemRandom().randrange(2**63))
                     config['source_video_dir'] = schedule['video_dir']
                 result = planner.plan(scan['videos'], scan['music'], config, allow_partial=True, previous_items=previous)
