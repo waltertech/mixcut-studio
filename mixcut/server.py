@@ -17,6 +17,7 @@ import mimetypes
 import os
 from pathlib import Path
 import random
+import queue
 import re
 import shutil
 import sqlite3
@@ -116,6 +117,10 @@ class Application:
         self.keyframes = KeyframeCache(self.store.directory / 'keyframes')
         self.executing_batches = set()
         self.worker = None
+        self.preview_queue = queue.Queue()
+        self.preview_jobs = {}
+        self.preview_lock = threading.RLock()
+        self.preview_worker = None
         self.recover()
         from .scheduler import Scheduler
         self.scheduler = Scheduler(self)
@@ -140,7 +145,7 @@ class Application:
                 'sticker_catalog': self.sticker_catalog(),
                 'version': self.running_version,
                 'api_protocol': API_PROTOCOL,
-                'active_work': bool(self.executing_batches) or any(batch['status'] in {'queued', 'running', 'pausing', 'stopping'}
+                'active_work': bool(self.executing_batches) or bool(self.preview_jobs) or any(batch['status'] in {'queued', 'running', 'pausing', 'stopping'}
                                    for batch in self.store.batches()),
                 'ffmpeg_available': bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))}
 
@@ -230,6 +235,7 @@ class Application:
                         active_tasks=len(self.cache_users) + self.cache_preview_users, errors=errors)
 
     def cleanup_task_cache(self, batch, item):
+        self.delete_previews(batch, item)
         ids = {part['asset_id'] for part in item.get('segments', []) if part.get('asset_id')}
         origin = batch.get('sticker_origin')
         if origin:
@@ -285,6 +291,80 @@ class Application:
                     self._drain_cache_cleanup()
                 except OSError:
                     logging.exception('deferred cache cleanup failed')
+
+    @staticmethod
+    def review_ready(item):
+        # Legacy records are migrated when the production worker starts.
+        return not item.get('thumbnails') or item['thumbnails'].get('status') == 'ready'
+
+    def enqueue_previews(self, batch_id, item_id):
+        with self.preview_lock:
+            key = (batch_id, str(item_id))
+            if key in self.preview_jobs:
+                return
+            batch = self.batch(batch_id)
+            item = next((i for i in batch['items'] if str(i['id']) == str(item_id)), None)
+            if not item or item.get('dismissed') or item['status'] != 'success' or item.get('review', {}).get('status') in {'approved', 'superseded'}:
+                return
+            version = self.keyframes._version(item['output_path'])
+            self.store.update(batch_id, lambda b: next(i for i in b['items'] if str(i['id']) == str(item_id)).update(
+                thumbnails={'status': 'queued', 'version': version}))
+            cancel = threading.Event()
+            self.preview_jobs[key] = cancel
+            self.preview_queue.put((key, item['output_path'], cancel))
+
+    def start_preview_worker(self):
+        if self.preview_worker and self.preview_worker.is_alive():
+            return
+        def work():
+            while not self.closing.is_set():
+                try:
+                    key, path, cancel = self.preview_queue.get(timeout=.2)
+                except queue.Empty:
+                    continue
+                def update(value):
+                    def change(batch):
+                        item = next((i for i in batch['items'] if str(i['id']) == key[1]), None)
+                        if item and not item.get('dismissed') and not cancel.is_set():
+                            item['thumbnails'].update(value)
+                    self.store.update(key[0], change)
+                try:
+                    if cancel.is_set():
+                        continue
+                    update({'status': 'generating'})
+                    with self.cached_preview():
+                        data = self.keyframes.prepare(path, lambda: cancel.is_set() or self.closing.is_set())
+                    update({'status': 'ready', 'total': data['total'], 'version': data['version'], 'error': None})
+                except InterruptedError:
+                    pass
+                except Exception as exc:
+                    try:
+                        update({'status': 'failed', 'error': str(exc)})
+                    except ValueError:
+                        pass
+                finally:
+                    with self.preview_lock:
+                        self.preview_jobs.pop(key, None)
+                    self.preview_queue.task_done()
+        self.preview_worker = threading.Thread(target=work, daemon=True, name='thumbnail-queue')
+        self.preview_worker.start()
+
+    def delete_previews(self, batch, item):
+        with self.preview_lock:
+            cancel = self.preview_jobs.get((batch.get('id'), str(item.get('id'))))
+            if cancel:
+                cancel.set()
+        version = item.get('thumbnails', {}).get('version')
+        if not version:
+            try:
+                version = self.keyframes._version(item['output_path'])
+            except (KeyError, OSError):
+                result = item.get('result', {})
+                if not result.get('output_size') or not result.get('output_mtime_ns'):
+                    return
+                identity = f"{Path(item['output_path']).resolve()}:{result['output_size']}:{result['output_mtime_ns']}:keyframes-v2-30s"
+                version = hashlib.sha256(identity.encode()).hexdigest()[:24]
+        self.keyframes.remove(version)
 
     def retry_failed_tasks(self):
         retried = 0
@@ -986,6 +1066,7 @@ class Application:
                 reviewing = {key for key, job in self.review_jobs.items() if job['status'] == 'running'}
             changed = {}
             removed = 0
+            preview_cleanup = []
             with self.store.lock, self.store.connection() as conn:
                 for entry in selections:
                     if not isinstance(entry, dict) or not isinstance(entry.get('item_ids'), list):
@@ -1006,6 +1087,7 @@ class Application:
                         if str(item['id']) not in wanted:
                             retained.append(item)
                             continue
+                        preview_cleanup.append((dict(batch), dict(item)))
                         if not item.get('dismissed'):
                             removed += 1
                         if active:
@@ -1030,8 +1112,14 @@ class Application:
         finally:
             if review_available:
                 self.review_lock.release()
+        cleanup_errors = []
+        for batch, item in preview_cleanup:
+            try:
+                self.delete_previews(batch, item)
+            except OSError as exc:
+                cleanup_errors.append(str(exc))
         self.wake.set()
-        return {'ok': True, 'deleted_items': removed, 'updated_batches': changed}
+        return {'ok': True, 'deleted_items': removed, 'updated_batches': changed, 'preview_cleanup_errors': cleanup_errors}
 
     def forget_all_items(self):
         selections = [{'batch_id': batch['id'], 'item_ids': [item['id'] for item in batch['items']]}
@@ -1333,6 +1421,11 @@ class Application:
             self._cleanup_approved_sources()
 
     def start_worker(self):
+        self.start_preview_worker()
+        for batch in self.visible_batches():
+            for item in batch['items']:
+                if item['status'] == 'success' and item.get('review', {}).get('status') not in {'approved', 'superseded'}:
+                    self.enqueue_previews(batch['id'], item['id'])
         self.worker = threading.Thread(target=self.run_queue, daemon=True, name='render-queue')
         self.worker.start()
         self.scheduler.start()
@@ -1467,7 +1560,8 @@ class Application:
                 metadata = renderer.validate(str(output), item['duration'])
                 metadata.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns)
                 self.store.update(batch_id, lambda b: b['items'][index].update(
-                    status='success', progress=1, result=metadata, error=None))
+                    status='success', progress=1, result=metadata, error=None, thumbnails={'status': 'queued'}))
+                self.enqueue_previews(batch_id, item['id'])
                 return
             except Exception:
                 self.store.update(batch_id, lambda b: b['items'][index].update(
@@ -1523,7 +1617,8 @@ class Application:
                     result = self.render_with_cache(batch_id, item, lambda: renderer.render(item, render_config, str(output), work_dir, progress))
                 result.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns)
                 self.store.update(batch_id, lambda b: b['items'][index].update(
-                    status='success', progress=1, error=None, result=result))
+                    status='success', progress=1, error=None, result=result, thumbnails={'status': 'queued'}))
+                self.enqueue_previews(batch_id, item['id'])
                 break
             except Exception as exc:
                 if isinstance(exc, InterruptedError):
@@ -1602,7 +1697,7 @@ class Application:
     def completed_output(self, batch_id, item_id):
         batch = self.batch(batch_id)
         item = next((i for i in batch['items'] if i['id'] == str(item_id)), None)
-        if not item or item['status'] != 'success':
+        if not item or item.get('dismissed') or item['status'] != 'success':
             raise ValueError('该成片尚未完成或不存在')
         path = Path(item['output_path'])
         review = item.get('review', {})
@@ -1859,6 +1954,12 @@ class Application:
                 raise ValueError('只能审核已成功生成的视频')
             item = batch['items'][index]
             previous = item.get('review', {})
+            if previous.get('status') != 'approved' and item.get('thumbnails'):
+                preview = item['thumbnails']
+                if not self.review_ready(item) or not self.keyframes.ready(preview.get('version'), preview.get('total', 0)):
+                    if self.review_ready(item):
+                        self.enqueue_previews(batch_id, item_id)
+                    raise ValueError('缩略图尚未全部准备好，请等待完成或重试生成后审核')
             if previous.get('status') == 'approved':
                 archived = Path(previous['path'])
                 if archived.is_file() and self.file_digest(archived) == previous.get('sha256'):
@@ -1951,7 +2052,7 @@ class Application:
                 return dict(existing)
             batch = self.batch(batch_id)
             candidates = sorted((item for item in batch.get('items', [])
-                                 if item.get('status') == 'success'
+                                 if item.get('status') == 'success' and self.review_ready(item)
                                  and item.get('review', {}).get('status') not in ('approved', 'superseded', 'copying')),
                                  key=lambda item: (int(item.get('index') or 0), str(item['id'])))
             item_ids = [str(item['id']) for item in candidates]
@@ -1999,7 +2100,7 @@ class Application:
                           sorted(self.visible_batches(), key=lambda entry: entry.get('created_at', 0))
                           for item in sorted(batch['items'], key=lambda entry: (int(entry.get('index') or 0),
                                                                                str(entry['id'])))
-                          if item['status'] == 'success' and
+                          if item['status'] == 'success' and self.review_ready(item) and
                           item.get('review', {}).get('status') not in {'approved', 'superseded', 'copying'}]
             if not candidates:
                 raise ValueError('没有待审核的已完成任务')
@@ -2138,6 +2239,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response(self.app.forget_items(body.get('selections')))
                 if path == '/api/cache/clear':
                     return self.json_response(self.app.clear_cache())
+                preview_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/prepare-previews', path)
+                if preview_match:
+                    self.app.enqueue_previews(*preview_match.groups())
+                    return self.json_response({'ok': True})
                 if path == '/api/tasks/retry-failed':
                     return self.json_response(self.app.retry_failed_tasks())
                 if path == '/api/tasks/clear':
@@ -2224,6 +2329,16 @@ class Handler(BaseHTTPRequestHandler):
                                         finally:
                                             temporary.unlink(missing_ok=True)
                         return self.send_file(target, content_type=asset.get('mime_type') if path == '/api/media' else None)
+                if path in ['/api/keyframes', '/api/keyframe']:
+                    item = next(i for i in self.app.batch(query['batch'][0])['items'] if i['id'] == query['item'][0])
+                    if item.get('dismissed') or item.get('review', {}).get('status') in {'approved', 'superseded'}:
+                        raise ValueError('该任务的缩略图已清理')
+                    preview = item.get('thumbnails')
+                    if preview and self.app.review_ready(item) and not self.app.keyframes.ready(preview.get('version'), preview.get('total', 0)):
+                        self.app.enqueue_previews(query['batch'][0], query['item'][0])
+                        raise ValueError('缩略图缓存已清除，正在重新准备')
+                    if preview and not self.app.review_ready(item):
+                        raise ValueError('缩略图正在准备，请稍后查看')
                 if path in ['/api/output', '/api/keyframes', '/api/keyframe']:
                     output = self.app.completed_output(query['batch'][0], query['item'][0])
                     with self.app.cached_preview():
