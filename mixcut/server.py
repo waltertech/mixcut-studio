@@ -98,6 +98,9 @@ class Application:
         self.store = Store(state_dir)
         self.closing = threading.Event()
         self.wake = threading.Event()
+        self.cache_lock = threading.RLock()
+        self.cache_users = {}
+        self.cache_preview_users = 0
         self.scan_lock = threading.Lock()
         self.scan_state_lock = threading.RLock()
         self.scan_job = None
@@ -138,6 +141,162 @@ class Application:
                 'active_work': any(batch['status'] in {'queued', 'running', 'pausing', 'stopping'}
                                    for batch in self.store.batches()),
                 'ffmpeg_available': bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))}
+
+    @contextmanager
+    def cached_preview(self):
+        with self.cache_lock:
+            self.cache_preview_users += 1
+        try:
+            yield
+        finally:
+            with self.cache_lock:
+                self.cache_preview_users -= 1
+
+    def cache_status(self):
+        """Measure generated video conversion and render-work files without reading contents."""
+        total = count = 0
+        for root in tuple(self.store.directory / name for name in ('cache', 'work', 'thumbnails', 'keyframes')):
+            if root.is_symlink():
+                continue
+            for directory, _, names in os.walk(root, followlinks=False):
+                for name in names:
+                    path = Path(directory) / name
+                    try:
+                        if path.is_symlink():
+                            continue
+                        stat = path.stat()
+                        total += stat.st_blocks * 512 if hasattr(stat, 'st_blocks') else stat.st_size
+                        count += 1
+                    except FileNotFoundError:
+                        pass
+        return {'bytes': total, 'files': count}
+
+    def _remove_cache_files(self, asset_ids=None):
+        protected_ids = {identity for ids in self.cache_users.values() for identity in ids}
+        removed = 0
+        errors = []
+        cache = self.store.directory / 'cache' / 'seekable'
+        if not (self.store.directory / 'cache').is_symlink() and not cache.is_symlink():
+            for path in cache.glob('*'):
+                # Only generated cache files are managed; never follow links or user paths.
+                identity = path.name.split('.')[0]
+                if path.is_symlink() or not path.is_file() or identity in protected_ids:
+                    continue
+                if asset_ids is not None and identity not in asset_ids:
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+                except OSError as exc:
+                    errors.append(str(exc))
+        return removed, errors
+
+    def clear_cache(self):
+        with self.cache_lock:
+            removed, errors = self._remove_cache_files()
+            work = self.store.directory / 'work'
+            if not work.is_symlink():
+                for batch_dir in work.glob('*'):
+                    if batch_dir.is_symlink() or not batch_dir.is_dir():
+                        continue
+                    for task_dir in batch_dir.iterdir():
+                        if task_dir.is_symlink() or (batch_dir.name, task_dir.name) in self.cache_users:
+                            continue
+                        try:
+                            if task_dir.is_dir():
+                                shutil.rmtree(task_dir)
+                            else:
+                                task_dir.unlink(missing_ok=True)
+                        except OSError as exc:
+                            errors.append(str(exc))
+            if not self.cache_preview_users:
+                for name in ('thumbnails', 'keyframes'):
+                    root = self.store.directory / name
+                    if root.is_symlink():
+                        continue
+                    for path in root.glob('*'):
+                        if path.is_symlink():
+                            continue
+                        try:
+                            if path.is_dir():
+                                shutil.rmtree(path)
+                            else:
+                                path.unlink(missing_ok=True)
+                        except OSError as exc:
+                            errors.append(str(exc))
+            return dict(self.cache_status(), removed_files=removed,
+                        active_tasks=len(self.cache_users) + self.cache_preview_users, errors=errors)
+
+    def cleanup_task_cache(self, batch, item):
+        ids = {part['asset_id'] for part in item.get('segments', []) if part.get('asset_id')}
+        origin = batch.get('sticker_origin')
+        if origin:
+            original_batch = self.store.get('batch:' + origin['batch_id'])
+            original = next((entry for entry in (original_batch or {}).get('items', [])
+                             if entry['id'] == origin['item_id']), None)
+            if original:
+                ids.update(part['asset_id'] for part in original.get('segments', []) if part.get('asset_id'))
+        with self.cache_lock:
+            pending = set(self.store.get('cache-cleanup-pending', [])) | ids
+            previews = set(self.store.get('cache-preview-cleanup-pending', []))
+            try:
+                previews.add(self.keyframes._version(item['output_path']))
+            except (KeyError, OSError):
+                pass
+            self.store.put('cache-preview-cleanup-pending', sorted(previews))
+            self.store.put('cache-cleanup-pending', sorted(pending))
+            self._drain_cache_cleanup()
+
+    def _drain_cache_cleanup(self):
+        with self.cache_lock:
+            previews = set(self.store.get('cache-preview-cleanup-pending', []))
+            if not self.cache_preview_users and not self.keyframes.root.is_symlink():
+                remaining_previews = []
+                for version in previews:
+                    if not re.fullmatch(r'[a-f0-9]{24}', version):
+                        continue
+                    target = self.keyframes.root / version
+                    try:
+                        if not target.is_symlink() and target.is_dir():
+                            shutil.rmtree(target)
+                    except OSError:
+                        remaining_previews.append(version)
+                self.store.put('cache-preview-cleanup-pending', remaining_previews)
+            pending = set(self.store.get('cache-cleanup-pending', []))
+            if not pending:
+                return
+            self._remove_cache_files(pending)
+            remaining = {identity for identity in pending
+                         if any((self.store.directory / 'cache' / 'seekable').glob(identity + '.*'))}
+            self.store.put('cache-cleanup-pending', sorted(remaining))
+
+    def render_with_cache(self, batch_id, item, render):
+        key = (batch_id, item['id'])
+        with self.cache_lock:
+            self.cache_users[key] = {part['asset_id'] for part in item.get('segments', [])}
+        try:
+            return render()
+        finally:
+            with self.cache_lock:
+                self.cache_users.pop(key, None)
+                try:
+                    self._drain_cache_cleanup()
+                except OSError:
+                    logging.exception('deferred cache cleanup failed')
+
+    def retry_failed_tasks(self):
+        retried = 0
+        errors = []
+        for batch in self.visible_batches():
+            for item in batch['items']:
+                if item['status'] != 'failed':
+                    continue
+                try:
+                    self.item_action(batch['id'], item['id'], 'start')
+                    retried += 1
+                except (ValueError, OSError) as exc:
+                    errors.append(str(exc))
+        return {'retried': retried, 'errors': errors}
 
     def sticker_catalog(self):
         return {'assets': self.store.get('sticker-assets', []),
@@ -770,8 +929,11 @@ class Application:
             elif action == 'start':
                 if item['status'] not in {'cancelled', 'failed'}:
                     raise ValueError('只有已终止或失败的单条任务可以重新开始')
-                item.update(status='pending', error=None, attempts=0, progress=0)
-                batch['status'] = 'queued'
+                if batch.get('scheduled_cancelled'):
+                    raise ValueError('该定时任务已取消，请生成新方案')
+                item.update(status='pending', error=None, attempts=0, progress=0, cancel_requested=False)
+                if batch['status'] not in {'running', 'queued', 'pausing', 'stopping'}:
+                    batch['status'] = 'queued'
             else:
                 raise ValueError('未知单条任务操作')
         result = self.store.update(batch_id, change)
@@ -1160,6 +1322,7 @@ class Application:
                 continue
             try:
                 self._complete_approved_cleanup()
+                self._drain_cache_cleanup()
                 self.prune_forgotten_items()
             except Exception:
                 logging.exception('background source cleanup failed')
@@ -1273,11 +1436,11 @@ class Application:
                     render_config = dict(batch['config'], cache_dir=str(self.store.directory / 'cache'))
                     work_dir = str(self.store.directory / 'work' / batch_id / item['id'])
                     if item.get('kind') == 'sticker_variant':
-                        result = renderer.overlay_existing(item['source_asset']['path'], render_config['sticker_layers'],
+                        result = self.render_with_cache(batch_id, item, lambda: renderer.overlay_existing(item['source_asset']['path'], render_config['sticker_layers'],
                                                            str(output), work_dir, progress,
-                                                           video_bitrate_mbps=render_config.get('video_bitrate_mbps', 0))
+                                                           video_bitrate_mbps=render_config.get('video_bitrate_mbps', 0)))
                     else:
-                        result = renderer.render(item, render_config, str(output), work_dir, progress)
+                        result = self.render_with_cache(batch_id, item, lambda: renderer.render(item, render_config, str(output), work_dir, progress))
                     result.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns)
                     self.store.update(batch_id, lambda b: b['items'][index].update(
                         status='success', progress=1, error=None, result=result))
@@ -1303,6 +1466,8 @@ class Application:
         batch = self.batch(batch_id)
         completed = all(item['status'] == 'success' for item in batch['items'])
         status = 'completed' if completed else ('stopped' if batch['status'] == 'stopping' else 'paused' if batch['status'] == 'pausing' else 'failed')
+        if batch['status'] == 'running' and any(entry['status'] == 'pending' for entry in batch['items']):
+            status = 'queued'
         self.store.update(batch_id, lambda b: b.update(status=status))
         self.write_manifest(batch_id)
 
@@ -1401,6 +1566,7 @@ class Application:
             output = Path(item['output_path'])
             if output.is_file() and self.file_digest(output) != review['sha256']:
                 raise ValueError('制作目录中的同名文件已变化，暂不删除')
+            self.cleanup_task_cache(batch, item)
             output.unlink(missing_ok=True)
             output.with_suffix('.txt').unlink(missing_ok=True)
             shutil.rmtree(self.store.directory / 'work' / batch_id / item_id, ignore_errors=True)
@@ -1502,6 +1668,7 @@ class Application:
                 original.setdefault('cleanup', {}).update(
                     source_cleanup_requested=bool(original.get('segments')))
             self.store.update(source_batch['id'], mark_replaced)
+            self.cleanup_task_cache(source_batch, source_item)
             source_path.unlink(missing_ok=True)
             source_path.with_suffix('.txt').unlink(missing_ok=True)
             shutil.rmtree(self.store.directory / 'work' / source_batch['id'] / source_item['id'], ignore_errors=True)
@@ -1889,6 +2056,10 @@ class Handler(BaseHTTPRequestHandler):
                         body.get('confirmation'), body.get('expected_count')))
                 if path == '/api/tasks/forget':
                     return self.json_response(self.app.forget_items(body.get('selections')))
+                if path == '/api/cache/clear':
+                    return self.json_response(self.app.clear_cache())
+                if path == '/api/tasks/retry-failed':
+                    return self.json_response(self.app.retry_failed_tasks())
                 if path == '/api/tasks/clear':
                     return self.json_response(self.app.forget_all_items())
                 if path == '/api/tasks/approve-all':
@@ -1939,6 +2110,8 @@ class Handler(BaseHTTPRequestHandler):
                 if path == '/api/scan/status':
                     compact = parse_qs(urlparse(self.path).query).get('compact') == ['1']
                     return self.json_response(self.app.scan_status(compact=compact) or {'status': 'idle'})
+                if path == '/api/cache':
+                    return self.json_response(self.app.cache_status())
                 if path == '/api/batches':
                     return self.json_response(self.app.visible_batches())
                 if path == '/api/tasks/approve-all':
@@ -1954,31 +2127,33 @@ class Handler(BaseHTTPRequestHandler):
                 if path in ['/api/media', '/api/thumbnail']:
                     asset = self.app.asset(query.get('id', [''])[0])
                     target = Path(asset['path'])
-                    if path == '/api/thumbnail':
-                        target = self.app.store.directory / 'thumbnails' / (asset['id'] + '.jpg')
-                        if not target.is_file() or target.stat().st_size == 0:
-                            with self.app.thumbnail_semaphore:
-                                if not target.is_file() or target.stat().st_size == 0:
-                                    target.parent.mkdir(parents=True, exist_ok=True)
-                                    temporary = target.with_name('.' + asset['id'] + '-' + uuid.uuid4().hex + '.jpg')
-                                    try:
-                                        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-ss', '1', '-i', asset['path'],
-                                                        '-frames:v', '1', '-vf', 'scale=320:-2', str(temporary)],
-                                                       check=True, timeout=30, stdout=subprocess.DEVNULL,
-                                                       stderr=subprocess.PIPE)
-                                        os.replace(temporary, target)
-                                    finally:
-                                        temporary.unlink(missing_ok=True)
-                    return self.send_file(target, content_type=asset.get('mime_type') if path == '/api/media' else None)
+                    with self.app.cached_preview():
+                        if path == '/api/thumbnail':
+                            target = self.app.store.directory / 'thumbnails' / (asset['id'] + '.jpg')
+                            if not target.is_file() or target.stat().st_size == 0:
+                                with self.app.thumbnail_semaphore:
+                                    if not target.is_file() or target.stat().st_size == 0:
+                                        target.parent.mkdir(parents=True, exist_ok=True)
+                                        temporary = target.with_name('.' + asset['id'] + '-' + uuid.uuid4().hex + '.jpg')
+                                        try:
+                                            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-ss', '1', '-i', asset['path'],
+                                                            '-frames:v', '1', '-vf', 'scale=320:-2', str(temporary)],
+                                                           check=True, timeout=30, stdout=subprocess.DEVNULL,
+                                                           stderr=subprocess.PIPE)
+                                            os.replace(temporary, target)
+                                        finally:
+                                            temporary.unlink(missing_ok=True)
+                        return self.send_file(target, content_type=asset.get('mime_type') if path == '/api/media' else None)
                 if path in ['/api/output', '/api/keyframes', '/api/keyframe']:
                     output = self.app.completed_output(query['batch'][0], query['item'][0])
-                    if path == '/api/keyframes':
-                        return self.json_response(self.app.keyframes.describe(output))
-                    if path == '/api/keyframe':
-                        target = self.app.keyframes.image(output, int(query['index'][0]),
-                                                          query.get('size', ['thumb'])[0],
-                                                          query.get('v', [None])[0])
-                        return self.send_file(target)
+                    with self.app.cached_preview():
+                        if path == '/api/keyframes':
+                            return self.json_response(self.app.keyframes.describe(output))
+                        if path == '/api/keyframe':
+                            target = self.app.keyframes.image(output, int(query['index'][0]),
+                                                              query.get('size', ['thumb'])[0],
+                                                              query.get('v', [None])[0])
+                            return self.send_file(target)
                     return self.send_file(output)
                 if path == '/api/manifest':
                     return self.json_response(self.app.batch(query['batch'][0]))

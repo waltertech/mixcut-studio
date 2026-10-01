@@ -122,7 +122,7 @@ def verify(release_version):
                 raise SystemExit('bundled FFmpeg was not detected')
             if data.get('version') != release_version:
                 raise SystemExit(f'embedded version mismatch: {data.get("version")}')
-            if data.get('api_protocol') != 4:
+            if data.get('api_protocol') != 5:
                 raise SystemExit('embedded API protocol mismatch')
             request = Request(f'http://127.0.0.1:{VERIFY_PORT}/api/tasks/forget',
                               data=b'{"selections":[]}', method='POST',
@@ -135,6 +135,14 @@ def verify(release_version):
                 review_status = json.load(response)
             if review_status.get('status') != 'idle':
                 raise SystemExit('packaged review API did not respond correctly')
+            for route, payload, required in [('/api/cache', None, 'bytes'),
+                                               ('/api/cache/clear', b'{}', 'errors'),
+                                               ('/api/tasks/retry-failed', b'{}', 'retried')]:
+                request = Request(f'http://127.0.0.1:{VERIFY_PORT}' + route, data=payload,
+                                  headers={'Content-Type': 'application/json'})
+                with urlopen(request, timeout=10) as response:
+                    if required not in json.load(response):
+                        raise SystemExit('packaged API verification failed: ' + route)
             print(f'==> verified version={data["version"]} ffmpeg_available=True')
             request = Request(f'http://127.0.0.1:{VERIFY_PORT}/api/shutdown', data=b'{}', method='POST',
                               headers={'Content-Type': 'application/json'})
