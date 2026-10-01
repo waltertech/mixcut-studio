@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import uuid
+import threading
 
 from .fsutil import publish
 
@@ -53,7 +54,25 @@ def _probe(path):
     return json.loads(result.stdout)
 
 
+_seekable_guard = threading.Lock()
+_seekable_locks = {}
+
+
 def _seekable_source(segment, cache_dir):
+    source = Path(segment['path'])
+    if source.suffix.lower() not in {'.ts', '.mts', '.m2ts'}:
+        return str(source)
+    stat = source.stat()
+    # Path IDs stay stable when files change, so cache versions include file metadata.
+    version = dict(segment, asset_id=f"{segment['asset_id']}.{stat.st_size}-{stat.st_mtime_ns}")
+    key = str(Path(cache_dir) / version['asset_id'])
+    with _seekable_guard:
+        lock = _seekable_locks.setdefault(key, threading.Lock())
+    with lock:
+        return _seekable_source_locked(version, cache_dir)
+
+
+def _seekable_source_locked(segment, cache_dir):
     source = Path(segment['path'])
     if source.suffix.lower() not in {'.ts', '.mts', '.m2ts'}:
         return str(source)

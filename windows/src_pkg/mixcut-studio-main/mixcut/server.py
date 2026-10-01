@@ -7,6 +7,7 @@ import binascii
 import copy
 from collections import defaultdict
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 import hashlib
 import json
@@ -113,6 +114,7 @@ class Application:
         self.archive_verifications = set()
         self.sticker_lock = threading.RLock()
         self.keyframes = KeyframeCache(self.store.directory / 'keyframes')
+        self.executing_batches = set()
         self.worker = None
         self.recover()
         from .scheduler import Scheduler
@@ -138,7 +140,7 @@ class Application:
                 'sticker_catalog': self.sticker_catalog(),
                 'version': self.running_version,
                 'api_protocol': API_PROTOCOL,
-                'active_work': any(batch['status'] in {'queued', 'running', 'pausing', 'stopping'}
+                'active_work': bool(self.executing_batches) or any(batch['status'] in {'queued', 'running', 'pausing', 'stopping'}
                                    for batch in self.store.batches()),
                 'ffmpeg_available': bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))}
 
@@ -492,7 +494,7 @@ class Application:
             excluded = [str(ROOT / 'exports'), str(self.store.directory)]
             excluded += [str(batch_output_folder(batch)) for batch in self.store.batches()]
             excluded += [folder for batch in self.store.batches() for folder in batch.get('review_folders', {}).values()]
-            result = media.scan(str(video_dir), str(music_dir), str(self.store.directory / 'cache'), exclude_dirs=excluded)
+            result = media.scan(str(video_dir), str(music_dir), str(self.store.directory / 'cache'), exclude_dirs=excluded, quick_music=True)
             self.store.put('library', {'video_dir': str(video_dir), 'music_dir': str(music_dir), 'scan': result})
             return result
 
@@ -585,6 +587,10 @@ class Application:
         if not 1 <= count <= 500:
             raise ValueError('每批数量须为 1～500')
         config['count'] = count
+        concurrency = config.get('parallel_tasks', 1)
+        if isinstance(concurrency, bool) or str(concurrency) not in {'1', '2', '3', '4'}:
+            raise ValueError('并行剪辑数量须为 1、2、3 或 4')
+        config['parallel_tasks'] = int(concurrency)
         for field, default in [('width', 1280), ('height', 720), ('fps', 30)]:
             config[field] = int(config.get(field, default))
         if (config['width'], config['height']) not in [(1280, 720), (1920, 1080), (640, 360)]:
@@ -976,7 +982,7 @@ class Application:
                     batch = json.loads(row[0])
                     wanted = {str(item_id) for item_id in entry['item_ids']}
                     active = (batch['status'] in {'running', 'queued', 'pausing', 'stopping'}
-                              or batch_id in reviewing or not review_available)
+                              or batch_id in self.executing_batches or batch_id in reviewing or not review_available)
                     retained = []
                     for item in batch['items']:
                         if str(item['id']) not in wanted:
@@ -1026,7 +1032,7 @@ class Application:
                 dependents = {(origin.get('batch_id'), origin.get('item_id')) for batch in batches
                               if (origin := batch.get('sticker_origin')) and batch.get('items')}
                 for batch in batches:
-                    if batch['status'] in {'running', 'queued', 'pausing', 'stopping'} or batch['id'] in reviewing:
+                    if batch['status'] in {'running', 'queued', 'pausing', 'stopping'} or batch['id'] in self.executing_batches or batch['id'] in reviewing:
                         continue
                     retained = []
                     for item in batch['items']:
@@ -1169,7 +1175,7 @@ class Application:
             if batch.get('scheduled_cancelled') and action in {'start', 'resume', 'retry'}:
                 raise ValueError('该定时目标已取消，不能再继续旧任务')
             if action in ['start', 'resume', 'retry']:
-                if status in ['running', 'queued', 'pausing', 'stopping']:
+                if batch_id in self.executing_batches or status in ['running', 'queued', 'pausing', 'stopping']:
                     raise ValueError('批次正在执行，请等待当前操作完成')
                 if action == 'retry':
                     for item in batch['items']:
@@ -1358,7 +1364,17 @@ class Application:
                 self.store.update(batch['id'], failed)
 
     def execute_batch(self, batch_id):
-        from . import media, renderer
+        with self.store.lock:
+            if batch_id in self.executing_batches:
+                return
+            self.executing_batches.add(batch_id)
+        try:
+            self._execute_batch(batch_id)
+        finally:
+            with self.store.lock:
+                self.executing_batches.discard(batch_id)
+
+    def _execute_batch(self, batch_id):
         def begin(batch):
             if batch['status'] == 'queued' and not batch.get('scheduled_cancelled'):
                 batch['status'] = 'running'
@@ -1366,110 +1382,139 @@ class Application:
         batch = self.store.update(batch_id, begin)
         if batch['status'] != 'running':
             return
-        for index in range(len(batch['items'])):
-            batch = self.batch(batch_id)
-            if batch.get('scheduled_cancelled'):
-                self.scheduler.finish_cancelled_batch(batch_id)
-                return
-            if self.closing.is_set() or batch['status'] in ['pausing', 'stopping']:
-                state = 'stopped' if batch['status'] == 'stopping' else 'paused'
-                self.store.update(batch_id, lambda b: b.update(status=state))
-                return
-            item = batch['items'][index]
-            if item['status'] != 'pending':
-                continue
-            output = Path(item['output_path'])
-            try:
-                output.parent.mkdir(parents=True, exist_ok=True)
-                self.check_space(output.parent)
-            except OSError as exc:
-                self.store.update(batch_id, lambda b: b.update(status='paused', error=str(exc)))
-                return
-            used_ids = {seg['asset_id'] for seg in item['segments']} | {song['id'] for song in item['music']}
-            try:
-                if item.get('kind') == 'sticker_variant':
-                    media.verify_asset(item['source_asset'])
-                for asset in batch.get('assets', []):
-                    if asset['id'] in used_ids:
-                        if media.verify_asset(asset) is False:
-                            raise ValueError('素材已变化：' + asset.get('name', asset['path']))
-            except (ValueError, OSError) as exc:
-                self.store.update(batch_id, lambda b: b.update(status='paused', error=str(exc)))
-                return
-            # A crash after final rename but before SQLite commit must not duplicate an export.
-            if output.exists():
-                try:
-                    metadata = renderer.validate(str(output), item['duration'])
-                    metadata.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns)
-                    self.store.update(batch_id, lambda b: b['items'][index].update(
-                        status='success', progress=1, result=metadata, error=None))
-                    continue
-                except Exception:
-                    self.store.update(batch_id, lambda b: b['items'][index].update(
-                        status='failed', error='输出位置已有文件但校验失败；请移走该文件后重试，程序不会覆盖'))
-                    continue
-            for attempt in range(int(item.get('attempts', 0)), 3):
-                self.store.update(batch_id, lambda b: b['items'][index].update(
-                    status='running', attempts=attempt + 1, progress=0, error=None))
-                last_update = [0.0]
-                def progress(value, *args, **kwargs):
-                    now = time.monotonic()
-                    stage = value.get('stage') if isinstance(value, dict) else None
-                    current_item = next(entry for entry in self.batch(batch_id)['items'] if entry['id'] == item['id'])
-                    if stage != 'complete' and current_item.get('cancel_requested'):
-                        raise InterruptedError('单条任务已手动终止')
-                    if stage != 'complete' and self.batch(batch_id).get('scheduled_cancelled'):
-                        from .scheduler import ScheduledRunCancelled
-                        raise ScheduledRunCancelled('新定时任务已启动，旧目标取消')
-                    if now - last_update[0] < 0.5 and stage != 'validating':
-                        return
-                    last_update[0] = now
-                    if isinstance(value, dict):
-                        value = value.get('progress', 0)
-                    try:
-                        value = min(0.99, max(0, float(value)))
-                    except (ValueError, TypeError):
-                        return
-                    self.store.update(batch_id, lambda b: b['items'][index].update(
-                        progress=value, status='validating' if stage == 'validating' else 'running'))
-                try:
-                    render_config = dict(batch['config'], cache_dir=str(self.store.directory / 'cache'))
-                    work_dir = str(self.store.directory / 'work' / batch_id / item['id'])
-                    if item.get('kind') == 'sticker_variant':
-                        result = self.render_with_cache(batch_id, item, lambda: renderer.overlay_existing(item['source_asset']['path'], render_config['sticker_layers'],
-                                                           str(output), work_dir, progress,
-                                                           video_bitrate_mbps=render_config.get('video_bitrate_mbps', 0)))
-                    else:
-                        result = self.render_with_cache(batch_id, item, lambda: renderer.render(item, render_config, str(output), work_dir, progress))
-                    result.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns)
-                    self.store.update(batch_id, lambda b: b['items'][index].update(
-                        status='success', progress=1, error=None, result=result))
+        parallel = max(1, min(4, int(batch['config'].get('parallel_tasks', 1))))
+        submitted = set()
+        with ThreadPoolExecutor(max_workers=parallel, thread_name_prefix='mixcut-render') as pool:
+            active = set()
+            while True:
+                batch = self.batch(batch_id)
+                if batch.get('scheduled_cancelled'):
+                    self.scheduler.finish_cancelled_batch(batch_id)
+                allowed = (not self.closing.is_set() and batch['status'] == 'running'
+                           and not batch.get('scheduled_cancelled'))
+                if allowed:
+                    for index, item in enumerate(batch['items']):
+                        if len(active) >= parallel:
+                            break
+                        if item['status'] == 'pending' and item['id'] not in submitted:
+                            submitted.add(item['id'])
+                            active.add(pool.submit(self.execute_item, batch_id, index))
+                if not active:
                     break
-                except Exception as exc:
-                    if isinstance(exc, InterruptedError):
-                        self.store.update(batch_id, lambda b: b['items'][index].update(
-                            status='cancelled', error=str(exc), cancel_requested=False))
-                        break
-                    if self.batch(batch_id).get('scheduled_cancelled'):
-                        self.scheduler.finish_cancelled_batch(batch_id)
-                        return
-                    message = str(exc)
-                    self.store.update(batch_id, lambda b: b['items'][index].update(
-                        status='failed', error=message))
-                    current = self.batch(batch_id)
-                    if self.closing.is_set() or current['status'] in ['pausing', 'stopping']:
-                        break
-                    if 'space' in message.lower() or '空间' in message:
-                        self.store.update(batch_id, lambda b: b.update(status='pausing', error=message))
-                        break
-            self.write_manifest(batch_id)
+                done, active = wait(active, return_when=FIRST_COMPLETED)
+                for future in done:
+                    future.result()
+                self.write_manifest(batch_id)
         batch = self.batch(batch_id)
         completed = all(item['status'] == 'success' for item in batch['items'])
-        status = 'completed' if completed else ('stopped' if batch['status'] == 'stopping' else 'paused' if batch['status'] == 'pausing' else 'failed')
+        if batch.get('scheduled_cancelled'):
+            self.scheduler.finish_cancelled_batch(batch_id)
+            return
+        status = ('stopped' if batch['status'] == 'stopping' else
+                  'paused' if self.closing.is_set() or batch['status'] in {'pausing', 'paused'} else
+                  'completed' if completed else 'failed')
         if batch['status'] == 'running' and any(entry['status'] == 'pending' for entry in batch['items']):
             status = 'queued'
         self.store.update(batch_id, lambda b: b.update(status=status))
         self.write_manifest(batch_id)
+
+    def execute_item(self, batch_id, index):
+        from . import media, renderer
+        batch = self.batch(batch_id)
+        item = batch['items'][index]
+        if (item['status'] != 'pending' or item.get('dismissed') or self.closing.is_set()
+                or batch['status'] != 'running' or batch.get('scheduled_cancelled')):
+            return
+        output = Path(item['output_path'])
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            self.check_space(output.parent)
+        except OSError as exc:
+            self.store.update(batch_id, lambda b: b.update(status='paused', error=str(exc)))
+            return
+        used_ids = {seg['asset_id'] for seg in item['segments']} | {song['id'] for song in item['music']}
+        try:
+            if item.get('kind') == 'sticker_variant':
+                media.verify_asset(item['source_asset'])
+            for asset in batch.get('assets', []):
+                if asset['id'] in used_ids:
+                    if media.verify_asset(asset) is False:
+                        raise ValueError('素材已变化：' + asset.get('name', asset['path']))
+        except (ValueError, OSError) as exc:
+            self.store.update(batch_id, lambda b: b.update(status='paused', error=str(exc)))
+            return
+        # A crash after final rename but before SQLite commit must not duplicate an export.
+        if output.exists():
+            try:
+                metadata = renderer.validate(str(output), item['duration'])
+                metadata.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns)
+                self.store.update(batch_id, lambda b: b['items'][index].update(
+                    status='success', progress=1, result=metadata, error=None))
+                return
+            except Exception:
+                self.store.update(batch_id, lambda b: b['items'][index].update(
+                    status='failed', error='输出位置已有文件但校验失败；请移走该文件后重试，程序不会覆盖'))
+                return
+        for attempt in range(int(item.get('attempts', 0)), 3):
+            current = self.batch(batch_id)
+            live = current['items'][index]
+            if (live.get('dismissed') or live.get('cancel_requested') or live['status'] == 'cancelled'
+                    or current.get('scheduled_cancelled') or self.closing.is_set()
+                    or current['status'] in {'pausing', 'stopping', 'paused'}):
+                return
+            self.store.update(batch_id, lambda b: b['items'][index].update(
+                status='running', attempts=attempt + 1, progress=0, error=None))
+            last_update = [0.0]
+            def progress(value, *args, **kwargs):
+                now = time.monotonic()
+                stage = value.get('stage') if isinstance(value, dict) else None
+                current_item = next(entry for entry in self.batch(batch_id)['items'] if entry['id'] == item['id'])
+                if stage != 'complete' and current_item.get('cancel_requested'):
+                    raise InterruptedError('单条任务已手动终止')
+                if stage != 'complete' and self.batch(batch_id).get('scheduled_cancelled'):
+                    from .scheduler import ScheduledRunCancelled
+                    raise ScheduledRunCancelled('新定时任务已启动，旧目标取消')
+                if now - last_update[0] < 0.5 and stage != 'validating':
+                    return
+                last_update[0] = now
+                if isinstance(value, dict):
+                    value = value.get('progress', 0)
+                try:
+                    value = min(0.99, max(0, float(value)))
+                except (ValueError, TypeError):
+                    return
+                self.store.update(batch_id, lambda b: b['items'][index].update(
+                    progress=value, status='validating' if stage == 'validating' else 'running'))
+            try:
+                render_config = dict(batch['config'], cache_dir=str(self.store.directory / 'cache'))
+                work_dir = str(self.store.directory / 'work' / batch_id / item['id'])
+                if item.get('kind') == 'sticker_variant':
+                    result = self.render_with_cache(batch_id, item, lambda: renderer.overlay_existing(item['source_asset']['path'], render_config['sticker_layers'],
+                                                       str(output), work_dir, progress,
+                                                       video_bitrate_mbps=render_config.get('video_bitrate_mbps', 0)))
+                else:
+                    result = self.render_with_cache(batch_id, item, lambda: renderer.render(item, render_config, str(output), work_dir, progress))
+                result.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns)
+                self.store.update(batch_id, lambda b: b['items'][index].update(
+                    status='success', progress=1, error=None, result=result))
+                break
+            except Exception as exc:
+                if isinstance(exc, InterruptedError):
+                    self.store.update(batch_id, lambda b: b['items'][index].update(
+                        status='cancelled', error=str(exc), cancel_requested=False))
+                    break
+                if self.batch(batch_id).get('scheduled_cancelled'):
+                    self.scheduler.finish_cancelled_batch(batch_id)
+                    return
+                message = str(exc)
+                self.store.update(batch_id, lambda b: b['items'][index].update(
+                    status='failed', error=message))
+                current = self.batch(batch_id)
+                if self.closing.is_set() or current['status'] in ['pausing', 'stopping']:
+                    break
+                if 'space' in message.lower() or '空间' in message:
+                    self.store.update(batch_id, lambda b: b.update(status='pausing', error=message))
+                    break
 
     def write_manifest(self, batch_id):
         batch = self.batch(batch_id)

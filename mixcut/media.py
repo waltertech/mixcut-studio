@@ -81,6 +81,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def path_identity(path: Path) -> str:
+    """An inexpensive stable key for a canonical path, never for file contents."""
+    return hashlib.sha256(os.path.normcase(str(path.resolve())).encode('utf-8')).hexdigest()
+
+
 def _asset(path: Path, kind: str, *, quick_music=False) -> dict[str, Any]:
     info = _run_probe(path)
     streams = info.get("streams", [])
@@ -104,7 +109,7 @@ def _asset(path: Path, kind: str, *, quick_music=False) -> dict[str, Any]:
     if kind == 'music' and not quick_music:
         duration = _decoded_audio_duration(path)
     stat = path.stat()
-    fingerprint = _sha256(path)
+    fingerprint = path_identity(path)
     return {
         "id": fingerprint,
         "path": str(path.resolve()),
@@ -117,7 +122,8 @@ def _asset(path: Path, kind: str, *, quick_music=False) -> dict[str, Any]:
         "mime_type": _media_mime(info, kind),
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "index_version": 2,
+        "index_version": 3,
+        "identity_mode": "path",
         **({"duration_precise": not quick_music} if kind == 'music' else {}),
     }
 
@@ -152,7 +158,9 @@ def _cached_asset(path: Path, kind: str, cache: dict[str, Any], identities: dict
     stat = path.stat()
     legacy = cache.get(key)
     old = cache.get(record_key) or (legacy if legacy and legacy.get('kind') in (None, kind) else None)
-    if old and old.get('asset', {}).get('index_version') == 2 and old.get("size") == stat.st_size and old.get("mtime_ns") == stat.st_mtime_ns:
+    if old and old.get('asset', {}).get('index_version') in {2, 3} and old.get("size") == stat.st_size and old.get("mtime_ns") == stat.st_mtime_ns:
+        old['asset'] = dict(old['asset'], id=path_identity(path), path=key, name=path.name,
+                            identity_mode='path', index_version=3)
         old.update(dev=stat.st_dev, ino=stat.st_ino, kind=kind)
         identities[(kind, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)] = old
         if not old['asset'].get('mime_type'):
@@ -165,8 +173,9 @@ def _cached_asset(path: Path, kind: str, cache: dict[str, Any], identities: dict
         return old["asset"]
     identity = (kind, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
     known = identities.get(identity)
-    if known and known.get('asset', {}).get('index_version') == 2:
-        asset = dict(known['asset'], path=key, name=path.name)
+    if known and known.get('asset', {}).get('index_version') in {2, 3}:
+        asset = dict(known['asset'], path=key, name=path.name, id=path_identity(path),
+                     identity_mode='path', index_version=3)
         if not asset.get('mime_type'):
             asset['mime_type'] = _media_mime(_run_probe(path), kind)
         if kind == 'music' and not quick_music and asset.get('duration_precise') is False:
@@ -244,7 +253,7 @@ def _scan_paths(paths: list[Path], kind: str, root: Path, cache: dict[str, Any],
             asset = _cached_asset(path, kind, cache, identities, quick_music=quick_music)
             if asset and kind == 'music':
                 asset = tag_music_style(asset, root)
-            if asset and asset["id"] not in seen:  # content, not filename, defines a source asset
+            if asset and asset["id"] not in seen:  # canonical path defines a source asset
                 seen.add(asset["id"])
                 found.append(asset)
             else:
@@ -262,7 +271,7 @@ def _scan_paths(paths: list[Path], kind: str, root: Path, cache: dict[str, Any],
 
 def scan(video_dir: str, music_dir: str, cache_dir: str | None = None, exclude_dirs=(), *,
          kinds=('video', 'music'), previous=None, progress=None, quick_music=False) -> dict[str, Any]:
-    """Recursively discover supported media and content-deduplicate each collection."""
+    """Recursively discover supported media and path-deduplicate each collection."""
     cache_path = Path(cache_dir or ".mixcut-cache").expanduser() / "media-index.json"
     try:
         cache = json.loads(cache_path.read_text("utf-8")) if cache_path.exists() else {}
@@ -344,7 +353,8 @@ def verify_asset(asset: dict[str, Any]) -> bool:
         path = Path(asset["path"])
         stat = path.stat()
         valid = (stat.st_size == asset["size"] and stat.st_mtime_ns == asset["mtime_ns"]
-                 and _sha256(path) == asset["id"])
+                 and (asset.get('identity_mode') == 'path' and path_identity(path) == asset['id']
+                      or asset.get('identity_mode') != 'path' and _sha256(path) == asset['id']))
         if not valid:
             raise ValueError(f"素材已变化：{path.name}")
         return True

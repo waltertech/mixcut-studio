@@ -105,14 +105,14 @@ class IncrementalScanTests(unittest.TestCase):
         self.assertEqual([video.name], [entry['name'] for entry in result['videos']])
         self.assertTrue(any('still.mp4' in error['path'] for error in result['errors']))
 
-    def test_same_volume_rename_reuses_verified_metadata_and_digest(self):
+    def test_same_volume_rename_reuses_metadata_but_gets_new_path_id(self):
         self.make_video()
         old = self.make_music()
         first = media.scan(str(self.videos), str(self.music), str(self.root / 'cache'))
         renamed = old.rename(self.music / 'renamed.m4a')
         with patch('mixcut.media._asset', side_effect=AssertionError('unnecessary reanalysis')):
             second = media.scan(str(self.videos), str(self.music), str(self.root / 'cache'))
-        self.assertEqual(first['music'][0]['id'], second['music'][0]['id'])
+        self.assertNotEqual(first['music'][0]['id'], second['music'][0]['id'])
         self.assertEqual(str(renamed.resolve()), second['music'][0]['path'])
 
     def test_shared_path_has_separate_video_and_music_cache_records(self):

@@ -45,7 +45,7 @@ final class MixCutWindow: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavig
         webView.callAsyncJavaScript("""
             const response = await fetch('/api/bootstrap');
             const data = await response.json();
-            return document.querySelector('#scan-btn') !== null && data.api_protocol === 5;
+            return document.querySelector('#scan-btn') !== null && data.api_protocol === 6;
             """, arguments: [:], in: nil, in: .page) { result in
             switch result {
             case .success(let valid) where valid as? Bool == true:
