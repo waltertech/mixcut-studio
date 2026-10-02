@@ -115,11 +115,11 @@ class SharedCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);source=root/'source.ts';source.write_bytes(b'source');cache=root/'cache'
             segment={'asset_id':'path-id','path':str(source)};guard=threading.Lock();calls=[]
-            def remux(command,**kwargs):
+            def remux(command,log,output=None,callback=None,stage=None,**kwargs):
                 with guard:calls.append(command)
                 Path(command[-1]).write_bytes(b'mp4-cache')
-                return type('Result',(),{'returncode':0})()
-            with patch.object(renderer.subprocess,'run',side_effect=remux),ThreadPoolExecutor(max_workers=4) as pool:
+                return 0
+            with patch.object(renderer,'run_watched',side_effect=remux),ThreadPoolExecutor(max_workers=4) as pool:
                 targets=list(pool.map(lambda _:renderer._seekable_source(segment,cache),range(4)))
                 self.assertEqual(1,len(calls));self.assertEqual(1,len(set(targets)))
                 source.write_bytes(b'changed source')

@@ -13,6 +13,7 @@ import uuid
 import threading
 
 from .fsutil import publish
+from .processwatch import run as run_watched, RenderStalled
 
 from . import media, stickers
 
@@ -84,7 +85,7 @@ _seekable_guard = threading.Lock()
 _seekable_locks = {}
 
 
-def _seekable_source(segment, cache_dir):
+def _seekable_source(segment, cache_dir, progress_callback=None):
     source = Path(segment['path'])
     if source.suffix.lower() not in {'.ts', '.mts', '.m2ts'}:
         return str(source)
@@ -95,10 +96,10 @@ def _seekable_source(segment, cache_dir):
     with _seekable_guard:
         lock = _seekable_locks.setdefault(key, threading.Lock())
     with lock:
-        return _seekable_source_locked(version, cache_dir)
+        return _seekable_source_locked(version, cache_dir, progress_callback)
 
 
-def _seekable_source_locked(segment, cache_dir):
+def _seekable_source_locked(segment, cache_dir, progress_callback=None):
     source = Path(segment['path'])
     if source.suffix.lower() not in {'.ts', '.mts', '.m2ts'}:
         return str(source)
@@ -107,19 +108,21 @@ def _seekable_source_locked(segment, cache_dir):
     if not target.exists():
         partial = cache_dir / (segment['asset_id'] + '.' + uuid.uuid4().hex[:8] + '.mp4')
         try:
-            result = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(source),
-                                     '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy',
-                                     '-avoid_negative_ts', 'make_zero', str(partial)],
-                                    capture_output=True, text=True)
-            if result.returncode:
-                raise ValueError('TS 时间轴缓存失败：' + result.stderr[-1000:])
+            command = ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(source),
+                       '-map', '0:v:0', '-map', '0:a:0?', '-c', 'copy',
+                       '-avoid_negative_ts', 'make_zero', str(partial)]
+            with target.with_suffix('.log').open('w+', encoding='utf-8') as log:
+                result = run_watched(command, log, partial, progress_callback, stage='preparing')
+                if result:
+                    log.seek(0)
+                    raise ValueError('TS 时间轴缓存失败：' + log.read()[-1000:])
             partial.replace(target)
         finally:
             partial.unlink(missing_ok=True)
     return str(target)
 
 
-def validate(path, expected_duration):
+def validate(path, expected_duration, progress_callback=None, log_path=None):
     path = Path(path)
     if not path.is_file() or not path.stat().st_size:
         raise ValueError('输出文件不存在或为空')
@@ -138,11 +141,15 @@ def validate(path, expected_duration):
         raise ValueError(f'音乐流时长 {audio_duration:.4f}s 不符合完整歌曲总长 {expected_duration:.4f}s')
     if abs(video_duration - expected_duration) > tolerance or abs(duration - expected_duration) > tolerance:
         raise ValueError(f'画面时长 {video_duration:.4f}s 不符合计划 {expected_duration:.4f}s')
-    decoded = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-xerror', '-i', str(path),
-                              '-map', '0:v:0', '-map', '0:a:0', '-f', 'null', '-'],
-                             capture_output=True, text=True)
-    if decoded.returncode:
-        raise ValueError('输出不能完整解码：' + decoded.stderr[-1000:])
+    command = ['ffmpeg', '-nostdin', '-v', 'error', '-xerror', '-i', str(path),
+               '-map', '0:v:0', '-map', '0:a:0', '-f', 'null', '-']
+    import tempfile
+    with (Path(log_path).open('w+', encoding='utf-8') if log_path else
+          tempfile.TemporaryFile(mode='w+', encoding='utf-8')) as log:
+        result = run_watched(command, log, callback=progress_callback, stage='validating', duration=duration)
+        if result:
+            log.seek(0)
+            raise ValueError('输出不能完整解码：' + log.read()[-1000:])
     return {'path': str(path.resolve()), 'duration': duration, 'audio_duration': audio_duration,
             'video_duration': video_duration, 'size': path.stat().st_size,
             'width': video['width'], 'height': video['height'], 'fps': fps, 'valid': True}
@@ -166,14 +173,15 @@ def render(item, config, output_path, work_dir, progress_callback=None):
     work.mkdir(parents=True, exist_ok=True)
     temporary = output.parent / f'.{output.stem}-{uuid.uuid4().hex[:8]}.partial.mp4'
     log_path = work / 'ffmpeg.log'
+    log_path.write_text('', encoding='utf-8')
     inputs, filters = [], []
     sources = {asset['id']: asset for asset in item.get('video_assets', [])}
     count = len(item['segments'])
     original_volume = float(config.get('original_volume', 0))
     for index, segment in enumerate(item['segments']):
         length = float(segment['duration'])
-        source_path = _seekable_source(segment, Path(config.get('cache_dir', work / 'cache')) / 'seekable')
-        inputs += ['-ss', f"{float(segment['start']):.6f}", '-t', f'{length + 0.1:.6f}', '-i', source_path]
+        source_path = _seekable_source(segment, Path(config.get('cache_dir', work / 'cache')) / 'seekable', progress_callback)
+        inputs += ['-ss', f"{float(segment['start']):.6f}", '-t', f'{length + 0.1:.6f}', '-reinit_filter:v', '0', '-i', source_path]
         filters.append(f'[{index}:v:0]setpts=PTS-STARTPTS,trim=duration={length:.8f},'
                        f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
                        f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}[v{index}]')
@@ -230,20 +238,9 @@ def render(item, config, output_path, work_dir, progress_callback=None):
                        '-map', f'[{output_label}]', '-map', '[aout]', *encoding, '-pix_fmt', 'yuv420p',
                        '-r', str(fps), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
                        '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', str(temporary)]
-            with log_path.open('w', encoding='utf-8') as log:
-                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=log, text=True)
-                try:
-                    for line in process.stdout:
-                        key, _, value = line.strip().partition('=')
-                        if key == 'out_time_us' and value.isdigit() and progress_callback:
-                            progress_callback({'stage': 'rendering', 'progress': min(0.95, int(value) / 1e6 / duration * 0.95)})
-                    process.stdout.close()
-                    result = process.wait()
-                except BaseException:
-                    process.terminate()
-                    process.wait()
-                    process.stdout.close()
-                    raise
+            with log_path.open('a', encoding='utf-8') as log:
+                log.write(f'\nEncoder attempt: {codec}\n'); log.flush()
+                result = run_watched(command, log, temporary, progress_callback, duration=duration)
             music_error = music_input_error(log_path.read_text(encoding='utf-8'), item)
             if music_error:
                 raise music_error
@@ -255,7 +252,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
         if progress_callback:
             progress_callback({'stage': 'validating', 'progress': 0.96})
         try:
-            checked = validate(str(temporary), duration)
+            checked = validate(str(temporary), duration, progress_callback, work / 'validation.log')
         except ValueError as exc:
             if str(exc).startswith('音乐流时长'):
                 info = _probe(temporary)
@@ -269,7 +266,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
                                                 '-c', 'copy', '-movflags', '+faststart', str(shortened)],
                                                capture_output=True, text=True, timeout=120)
                         if remux.returncode: raise ValueError('截短成片失败：' + remux.stderr[-500:])
-                        checked = validate(str(shortened), actual)
+                        checked = validate(str(shortened), actual, progress_callback, work / 'validation-short.log')
                         os.replace(shortened, temporary)
                     finally:
                         shortened.unlink(missing_ok=True)
@@ -306,7 +303,7 @@ def overlay_existing(source, layers, output_path, work_dir, progress_callback=No
         raise ValueError('输出文件已存在，程序不会覆盖：' + str(output))
     work = Path(work_dir).resolve(); work.mkdir(parents=True, exist_ok=True)
     temporary = output.parent / f'.{output.stem}-{uuid.uuid4().hex[:8]}.partial.mp4'
-    inputs, filters = ['-i', str(source)], []
+    inputs, filters = ['-reinit_filter:v', '0', '-i', str(source)], []
     label = stickers.add_overlay_filters(inputs, filters, layers or [], 1, '0:v', width, height, fps, duration)
     if not layers:
         # No work and no re-encode is the only way to preserve the original byte-for-byte.
@@ -314,33 +311,23 @@ def overlay_existing(source, layers, output_path, work_dir, progress_callback=No
     requested = 'auto'
     codecs = _codec_candidates(requested)
     log_path = work / 'overlay-ffmpeg.log'
+    log_path.write_text('', encoding='utf-8')
     try:
         for codec in codecs:
             encoding = _encoding(codec, width, height, fps, requested, video_bitrate_mbps)
             command = ['ffmpeg', '-nostdin', '-y', '-v', 'error', '-filter_complex_threads', _filter_threads(), *inputs, '-filter_complex', ';'.join(filters),
                        '-map', f'[{label}]', '-map', '0:a:0', *encoding, '-pix_fmt', 'yuv420p', '-c:a', 'copy',
                        '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', str(temporary)]
-            with log_path.open('w', encoding='utf-8') as log:
-                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=log, text=True)
-                try:
-                    for line in process.stdout:
-                        key, _, value = line.strip().partition('=')
-                        if key == 'out_time_us' and value.isdigit() and progress_callback:
-                            progress_callback({'stage': 'rendering', 'progress': min(.95, int(value) / 1e6 / duration * .95)})
-                    process.stdout.close()
-                    result = process.wait()
-                except BaseException:
-                    process.terminate()
-                    process.wait()
-                    process.stdout.close()
-                    raise
+            with log_path.open('a', encoding='utf-8') as log:
+                log.write(f'\nEncoder attempt: {codec}\n'); log.flush()
+                result = run_watched(command, log, temporary, progress_callback, duration=duration)
             if result == 0:
                 break
         else:
             raise ValueError('贴纸渲染失败：' + log_path.read_text(encoding='utf-8')[-1000:])
         if progress_callback:
             progress_callback({'stage': 'validating', 'progress': .96})
-        checked = validate(str(temporary), duration)
+        checked = validate(str(temporary), duration, progress_callback, work / 'validation.log')
         publish(temporary, output)
         checked['path'] = str(output)
         if progress_callback:

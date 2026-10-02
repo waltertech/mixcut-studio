@@ -98,7 +98,7 @@ class ApplicationTestCase(unittest.TestCase):
         self.save(record)
         with patch('mixcut.server.app_version', return_value='different-on-disk'):
             data = self.app.bootstrap()
-        self.assertEqual('1.5.0', data['version'])
+        self.assertEqual('1.5.1', data['version'])
         self.assertEqual(9, data['api_protocol'])
         self.assertTrue(data['active_work'])
         self.assertEqual([], data['batches'])

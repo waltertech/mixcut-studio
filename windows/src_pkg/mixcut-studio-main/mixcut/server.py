@@ -1034,8 +1034,8 @@ class Application:
                 elif item['status'] == 'pending':
                     item.update(status='cancelled', error='已手动终止')
             elif action == 'start':
-                if item['status'] not in {'cancelled', 'failed'}:
-                    raise ValueError('只有已终止或失败的单条任务可以重新开始')
+                if item['status'] not in {'cancelled', 'failed', 'stalled_paused'}:
+                    raise ValueError('只有已终止、失败或停滞暂停的单条任务可以重新开始')
                 if batch.get('scheduled_cancelled'):
                     raise ValueError('该定时任务已取消，请生成新方案')
                 item.update(status='pending', error=None, attempts=0, progress=0, cancel_requested=False)
@@ -1533,6 +1533,7 @@ class Application:
         self.write_manifest(batch_id)
 
     def execute_item(self, batch_id, index):
+        from .processwatch import RenderStalled
         from . import media, renderer
         batch = self.batch(batch_id)
         item = batch['items'][index]
@@ -1598,6 +1599,8 @@ class Application:
                 if stage != 'complete' and self.batch(batch_id).get('scheduled_cancelled'):
                     from .scheduler import ScheduledRunCancelled
                     raise ScheduledRunCancelled('新定时任务已启动，旧目标取消')
+                if isinstance(value, dict) and value.get('heartbeat'):
+                    return
                 if now - last_update[0] < 0.5 and stage != 'validating':
                     return
                 last_update[0] = now
@@ -1640,6 +1643,24 @@ class Application:
                 self.enqueue_previews(batch_id, item['id'])
                 break
             except Exception as exc:
+                if isinstance(exc, RenderStalled):
+                    self.store.update(batch_id, lambda b: b['items'][index].update(
+                        status='stalled_paused', render_stage='stalled_paused', error=str(exc),
+                        stalled_at=time.time(), cancel_requested=False))
+                    # Keep small diagnostic snapshots outside caches, which the user may clear.
+                    try:
+                        directory = self.store.directory / 'diagnostics'
+                        directory.mkdir(exist_ok=True)
+                        snapshot = {'batch_id': batch_id, 'item': self.batch(batch_id)['items'][index],
+                                    'config': batch['config'], 'time': time.time()}
+                        logs = Path(work_dir)
+                        snapshot['logs'] = {p.name: p.read_text(encoding='utf-8', errors='replace')[-30000:]
+                                            for p in logs.glob('*.log')}
+                        (directory / f'{batch_id}-{item["id"]}-{time.time_ns()}.json').write_text(
+                            json.dumps(snapshot, ensure_ascii=False), encoding='utf-8')
+                    except OSError:
+                        pass
+                    break
                 if isinstance(exc, InterruptedError):
                     self.store.update(batch_id, lambda b: b['items'][index].update(
                         status='cancelled', error=str(exc), cancel_requested=False))
