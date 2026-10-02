@@ -193,11 +193,23 @@ def render(item, config, output_path, work_dir, progress_callback=None):
                    f'trim=duration={duration:.8f},setpts=PTS-STARTPTS[vout]')
     for index, song in enumerate(item['music']):
         inputs += ['-i', song['path']]
-        filters.append(f'[{count + index}:a:0]asetpts=PTS-STARTPTS,aresample=48000,'
+        edges = song.get('nonstop_edges') if item.get('nonstop') else None
+        trim = f"atrim=start={edges['start']:.8f}:end={edges['end']:.8f}," if edges else ''
+        filters.append(f'[{count + index}:a:0]{trim}asetpts=PTS-STARTPTS,aresample=48000,'
                        f'aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]')
-    music_labels = ''.join(f'[a{i}]' for i in range(len(item['music'])))
-    filters.append(f'{music_labels}concat=n={len(item["music"])}:v=0:a=1,'
-                   f'atrim=duration={duration:.8f},volume={float(config.get("music_volume", 1))}[music]')
+    if item.get('nonstop'):
+        label = 'a0'
+        for index, fade in enumerate(item['nonstop']['crossfades'], 1):
+            next_label = f'join{index}'
+            filters.append(f'[{label}][a{index}]acrossfade=d={fade:.8f}:c1=tri:c2=tri[{next_label}]')
+            label = next_label
+        filters.append(f'[{label}]atrim=duration={duration:.8f},'
+                       f'volume={float(config.get("music_volume", 1))},afade=t=out:'
+                       f'st={max(0.,duration-.15):.8f}:d={min(.15,duration):.8f}[music]')
+    else:
+        music_labels = ''.join(f'[a{i}]' for i in range(len(item['music'])))
+        filters.append(f'{music_labels}concat=n={len(item["music"])}:v=0:a=1,'
+                       f'atrim=duration={duration:.8f},volume={float(config.get("music_volume", 1))}[music]')
     if original_volume:
         original_labels = ''.join(f'[o{i}]' for i in range(count))
         filters.append(f'{original_labels}concat=n={count}:v=0:a=1[original]')
@@ -248,9 +260,25 @@ def render(item, config, output_path, work_dir, progress_callback=None):
             if str(exc).startswith('音乐流时长'):
                 info = _probe(temporary)
                 audio = next(stream for stream in info['streams'] if stream['codec_type'] == 'audio')
-                if float(audio.get('duration', 0)) < duration - 0.05:
+                actual = float(audio.get('duration', 0))
+                if item.get('nonstop') and actual > .1 and actual < duration - .05:
+                    shortened = temporary.with_name(temporary.stem + '-short.mp4')
+                    try:
+                        remux = subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(temporary),
+                                                '-t', str(actual), '-map', '0:v:0', '-map', '0:a:0',
+                                                '-c', 'copy', '-movflags', '+faststart', str(shortened)],
+                                               capture_output=True, text=True, timeout=120)
+                        if remux.returncode: raise ValueError('截短成片失败：' + remux.stderr[-500:])
+                        checked = validate(str(shortened), actual)
+                        os.replace(shortened, temporary)
+                    finally:
+                        shortened.unlink(missing_ok=True)
+                elif actual < duration - .05:
                     raise MusicInputError('音乐实际时长不足：' + str(exc), []) from exc
-            raise
+                else:
+                    raise
+            else:
+                raise
         publish(temporary, output)
         checked.update(path=str(output), encoder=chosen, elapsed_seconds=round(time.monotonic() - started, 3))
         if progress_callback:

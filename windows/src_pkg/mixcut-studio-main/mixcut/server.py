@@ -98,6 +98,8 @@ class Application:
         # Preserve the process version even if an installer replaces VERSION on disk.
         self.running_version = app_version()
         self.store = Store(state_dir)
+        from .nonstop import MusicEdges
+        self.music_edges = MusicEdges(self.store)
         self.closing = threading.Event()
         self.wake = threading.Event()
         self.cache_lock = threading.RLock()
@@ -671,6 +673,7 @@ class Application:
         if isinstance(concurrency, bool) or str(concurrency) not in {'1', '2', '3', '4'}:
             raise ValueError('并行剪辑数量须为 1、2、3 或 4')
         config['parallel_tasks'] = int(concurrency)
+        config['nonstop_music'] = str(config.get('nonstop_music', 'true')).lower() not in {'false', '0'}
         for field, default in [('width', 1280), ('height', 720), ('fps', 30)]:
             config[field] = int(config.get(field, default))
         if (config['width'], config['height']) not in [(1280, 720), (1920, 1080), (640, 360)]:
@@ -1605,8 +1608,21 @@ class Application:
                 except (ValueError, TypeError):
                     return
                 self.store.update(batch_id, lambda b: b['items'][index].update(
-                    progress=value, status='validating' if stage == 'validating' else 'running'))
+                    progress=value, render_stage=stage or 'rendering',
+                    status='validating' if stage == 'validating' else 'running'))
             try:
+                if batch['config'].get('nonstop_music', False) and item.get('kind') != 'sticker_variant':
+                    def cancelled():
+                        current = self.batch(batch_id)['items'][index]
+                        return self.closing.is_set() or current.get('cancel_requested') or current.get('dismissed')
+                    def detecting(done, total):
+                        if cancelled(): raise InterruptedError('任务已取消')
+                        self.store.update(batch_id, lambda b: b['items'][index].update(
+                            render_stage='silence_detection', music_detection={'done': done, 'total': total}))
+                    item = self.music_edges.prepare(item, cancelled, detecting)
+                    self.store.update(batch_id, lambda b: b['items'][index].update(
+                        duration=item['duration'], planned_duration=item['planned_duration'], music=item['music'],
+                        nonstop=item['nonstop'], render_stage='rendering'))
                 render_config = dict(batch['config'], cache_dir=str(self.store.directory / 'cache'))
                 work_dir = str(self.store.directory / 'work' / batch_id / item['id'])
                 if item.get('kind') == 'sticker_variant':
@@ -1615,9 +1631,12 @@ class Application:
                                                        video_bitrate_mbps=render_config.get('video_bitrate_mbps', 0)))
                 else:
                     result = self.render_with_cache(batch_id, item, lambda: renderer.render(item, render_config, str(output), work_dir, progress))
-                result.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns)
+                result.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns,
+                              planned_duration=item.get('planned_duration', item['duration']))
+                result.setdefault('duration', item['duration'])
+                result['shortened_seconds'] = max(0., result['planned_duration'] - result['duration'])
                 self.store.update(batch_id, lambda b: b['items'][index].update(
-                    status='success', progress=1, error=None, result=result, thumbnails={'status': 'queued'}))
+                    status='success', progress=1, error=None, result=result, duration=result['duration'], thumbnails={'status': 'queued'}))
                 self.enqueue_previews(batch_id, item['id'])
                 break
             except Exception as exc:

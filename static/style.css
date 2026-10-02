@@ -14,3 +14,5 @@
 #batches .task-item:not(.expanded) .review-action,#batches .task-item:not(.expanded) video,#batches .task-item:not(.expanded) .keyframe-gallery{display:none}
 
 #batches .task-item .preview-status{display:block!important;color:var(--muted)}
+
+#batches .task-item .duration-note{grid-column:3/-1;display:block;margin:0}
