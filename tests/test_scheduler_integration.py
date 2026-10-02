@@ -93,7 +93,7 @@ class ScheduledMediaIntegration(unittest.TestCase):
         batch = self.app.store.batches()[0]
         item = batch['items'][0]
         def cancel(progress):
-            if progress.get('stage') == 'rendering':
+            if progress.get('stage') in {'rendering', 'video_segments'}:
                 raise ScheduledRunCancelled('test supersession')
         with self.assertRaises(ScheduledRunCancelled):
             renderer.render(item, batch['config'], item['output_path'], str(self.root / 'work'), cancel)

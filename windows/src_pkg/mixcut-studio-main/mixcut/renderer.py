@@ -27,7 +27,7 @@ class MusicInputError(ValueError):
 
 def music_input_error(log, item):
     # FFmpeg identifies decoder inputs as aist#<input>:<stream>; video inputs come first.
-    offset = len(item['segments'])
+    offset = item.get('_video_input_count', len(item['segments']))
     bad = set()
     for line in log.splitlines():
         if not any(token in line for token in ('Error', 'Invalid data', 'error code')):
@@ -155,6 +155,61 @@ def validate(path, expected_duration, progress_callback=None, log_path=None):
             'width': video['width'], 'height': video['height'], 'fps': fps, 'valid': True}
 
 
+def render_video_chunk(segment, config, target, log_path, callback, tolerant=False):
+    """Publish one normalized, independently decodable video checkpoint."""
+    width, height, fps = (int(config.get(k, d)) for k, d in
+                          [('width', 1280), ('height', 720), ('fps', 30)])
+    length = float(segment['duration'])
+    partial = target.with_suffix('.partial.mov')
+    source = _seekable_source(segment, Path(config.get('cache_dir', target.parent / 'cache')) / 'seekable', callback)
+    inputs = ['-ss', str(segment['start']), '-t', str(length + .1), '-reinit_filter:v', '0', '-i', source]
+    if tolerant:
+        inputs = ['-err_detect', 'ignore_err', '-fflags', '+discardcorrupt', *inputs]
+    video = (f'[0:v:0]setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,'
+             f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},'
+             f'tpad=stop_mode=clone:stop_duration={2/fps},trim=duration={length}[v]')
+    filters = [video]
+    mapping = ['-map', '[v]']
+    if config.get('original_volume', 0):
+        has_audio = any(stream['codec_type'] == 'audio' for stream in _probe(source)['streams'])
+        prefix = '[0:a:0]asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,apad,' if has_audio else 'anullsrc=r=48000:cl=stereo,'
+        filters.append(prefix + f'atrim=duration={length}[a]')
+        # PCM audio avoids AAC priming/gaps at video checkpoint boundaries.
+        mapping += ['-map', '[a]', '-c:a', 'pcm_s16le']
+    requested = config.get('hardware', 'auto')
+    try:
+        for codec in _codec_candidates(requested):
+            command = ['ffmpeg', '-nostdin', '-y', '-hide_banner', '-v', 'error']
+            if not tolerant:
+                command += ['-xerror']
+            command += ['-filter_complex_threads', _filter_threads(), *inputs,
+                        '-filter_complex', ';'.join(filters), *mapping,
+                        *_encoding(codec, width, height, fps, requested, config.get('video_bitrate_mbps', 0)),
+                        '-pix_fmt', 'yuv420p', '-r', str(fps), '-video_track_timescale', str(fps * 1000),
+                        '-movflags', '+faststart', str(partial)]
+            with Path(log_path).open('w+', encoding='utf-8') as log:
+                code = run_watched(command, log, partial, callback, duration=length)
+                log.seek(0); error = log.read()[-1500:]
+            if code:
+                if any(word in error.lower() for word in ('decod', 'invalid data', 'no such file', 'matches no streams', 'does not contain any stream', 'could not find codec parameters')):
+                    raise ValueError('视频片段解码失败：' + error)
+                continue
+            info = _probe(partial)
+            stream = next((stream for stream in info['streams'] if stream['codec_type'] == 'video'), None)
+            if not stream:
+                raise ValueError('视频片段解码失败：没有视频流')
+            actual = float(stream.get('duration', 0))
+            if abs(actual - length) > 1 / fps + .02:
+                raise ValueError(f'视频片段时长不足：需要{length:.3f}s，得到{actual:.3f}s')
+            from .fsutil import flush_to_disk
+            flush_to_disk(partial)
+            partial.replace(target)
+            return codec
+        raise ValueError('视频片段编码失败：' + error)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
 def render(item, config, output_path, work_dir, progress_callback=None):
     width, height, fps = (int(config.get(key, default)) for key, default in
                           [('width', 1280), ('height', 720), ('fps', 30)])
@@ -163,7 +218,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
         raise ValueError('导出规格或时长无效')
     if not item.get('segments') or not item.get('music'):
         raise ValueError('方案缺少视频或音乐')
-    for asset in {a['id']: a for a in item['music'] + item.get('video_assets', [])}.values():
+    for asset in {a['id']: a for a in item['music']}.values():
         media.verify_asset(asset)
     output = Path(output_path).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -174,31 +229,15 @@ def render(item, config, output_path, work_dir, progress_callback=None):
     temporary = output.parent / f'.{output.stem}-{uuid.uuid4().hex[:8]}.partial.mp4'
     log_path = work / 'ffmpeg.log'
     log_path.write_text('', encoding='utf-8')
-    inputs, filters = [], []
-    sources = {asset['id']: asset for asset in item.get('video_assets', [])}
-    count = len(item['segments'])
+    from . import checkpoints
+    concat, video_duration, checkpoint_state = checkpoints.prepare(item, config, work, progress_callback)
+    duration = min(duration, video_duration)
+    inputs = ['-f', 'concat', '-safe', '1', '-i', str(concat)]
+    filters = []
+    count = 1
     original_volume = float(config.get('original_volume', 0))
-    for index, segment in enumerate(item['segments']):
-        length = float(segment['duration'])
-        source_path = _seekable_source(segment, Path(config.get('cache_dir', work / 'cache')) / 'seekable', progress_callback)
-        inputs += ['-ss', f"{float(segment['start']):.6f}", '-t', f'{length + 0.1:.6f}', '-reinit_filter:v', '0', '-i', source_path]
-        filters.append(f'[{index}:v:0]setpts=PTS-STARTPTS,trim=duration={length:.8f},'
-                       f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
-                       f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}[v{index}]')
-        if original_volume:
-            has_audio = sources.get(segment['asset_id'], {}).get('has_audio')
-            if has_audio is None:
-                has_audio = any(s['codec_type'] == 'audio' for s in _probe(segment['path'])['streams'])
-            if has_audio:
-                filters.append(f'[{index}:a:0]asetpts=PTS-STARTPTS,atrim=duration={length:.8f},'
-                               f'aresample=48000,aformat=channel_layouts=stereo,apad,'
-                               f'atrim=duration={length:.8f},volume={original_volume}[o{index}]')
-            else:
-                filters.append(f'anullsrc=r=48000:cl=stereo,atrim=duration={length:.8f}[o{index}]')
-    video_labels = ''.join(f'[v{i}]' for i in range(count))
-    filters.append(f'{video_labels}concat=n={count}:v=1:a=0,'
-                   f'tpad=stop_mode=clone:stop_duration={count / fps + 0.1:.6f},'
-                   f'trim=duration={duration:.8f},setpts=PTS-STARTPTS[vout]')
+    if original_volume:
+        filters.append(f'[0:a:0]volume={original_volume}[original]')
     for index, song in enumerate(item['music']):
         inputs += ['-i', song['path']]
         edges = song.get('nonstop_edges') if item.get('nonstop') else None
@@ -219,29 +258,34 @@ def render(item, config, output_path, work_dir, progress_callback=None):
         filters.append(f'{music_labels}concat=n={len(item["music"])}:v=0:a=1,'
                        f'atrim=duration={duration:.8f},volume={float(config.get("music_volume", 1))}[music]')
     if original_volume:
-        original_labels = ''.join(f'[o{i}]' for i in range(count))
-        filters.append(f'{original_labels}concat=n={count}:v=0:a=1[original]')
         filters.append('[music][original]amix=inputs=2:duration=first:normalize=0:dropout_transition=0[aout]')
     else:
         filters.append('[music]anull[aout]')
     output_label = stickers.add_overlay_filters(inputs, filters, config.get('sticker_layers') or [],
-                                                count + len(item['music']), 'vout', width, height, fps, duration)
+                                                count + len(item['music']), '0:v:0', width, height, fps, duration)
     requested = config.get('hardware', 'auto')
-    codecs = _codec_candidates(requested)
+    codecs = _codec_candidates(requested) if config.get('sticker_layers') else ['copy']
     started = time.monotonic()
     chosen = None
     try:
         for codec in codecs:
-            encoding = _encoding(codec, width, height, fps, requested, config.get('video_bitrate_mbps', 0))
+            encoding = (['-c:v', 'copy'] if codec == 'copy' else
+                        _encoding(codec, width, height, fps, requested, config.get('video_bitrate_mbps', 0)))
             command = ['ffmpeg', '-nostdin', '-y', '-hide_banner', '-loglevel', 'error', '-xerror',
                        '-filter_complex_threads', _filter_threads(), *inputs, '-filter_complex', ';'.join(filters),
-                       '-map', f'[{output_label}]', '-map', '[aout]', *encoding, '-pix_fmt', 'yuv420p',
-                       '-r', str(fps), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+                       '-map', (f'[{output_label}]' if config.get('sticker_layers') else '0:v:0'), '-map', '[aout]', *encoding, '-pix_fmt', 'yuv420p',
+                       '-r', str(fps), '-t', str(duration), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
                        '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', str(temporary)]
             with log_path.open('a', encoding='utf-8') as log:
                 log.write(f'\nEncoder attempt: {codec}\n'); log.flush()
-                result = run_watched(command, log, temporary, progress_callback, duration=duration)
-            music_error = music_input_error(log_path.read_text(encoding='utf-8'), item)
+                def mux_progress(value):
+                    if progress_callback:
+                        value = dict(value)
+                        if value.get('stage') == 'rendering':
+                            value.update(stage='assembling', progress=.8 + value.get('progress', 0) / .95 * .15)
+                        progress_callback(value)
+                result = run_watched(command, log, temporary, mux_progress, duration=duration)
+            music_error = music_input_error(log_path.read_text(encoding='utf-8'), dict(item, _video_input_count=1))
             if music_error:
                 raise music_error
             if result == 0:
@@ -276,8 +320,18 @@ def render(item, config, output_path, work_dir, progress_callback=None):
                     raise
             else:
                 raise
+        recovery_result = dict(checked, recovery_warnings=checkpoint_state['warnings'],
+                               rendered_segments=checkpoints.rendered_segments(checkpoint_state['chunks']))
+        snapshot = work / 'render-result.json'
+        snapshot.write_text(json.dumps(recovery_result, ensure_ascii=False), encoding='utf-8')
+        from .fsutil import flush_to_disk
+        flush_to_disk(snapshot)
         publish(temporary, output)
-        checked.update(path=str(output), encoder=chosen, elapsed_seconds=round(time.monotonic() - started, 3))
+        checked.update(path=str(output), encoder=checkpoint_state['chunks'][0].get('encoder', chosen), assembly_encoder=chosen, elapsed_seconds=round(time.monotonic() - started, 3),
+                       recovery_warnings=checkpoint_state['warnings'],
+                       rendered_segments=checkpoints.rendered_segments(checkpoint_state['chunks']))
+        import shutil
+        shutil.rmtree(work / 'checkpoints', ignore_errors=True)
         if progress_callback:
             progress_callback({'stage': 'complete', 'progress': 1})
         return checked

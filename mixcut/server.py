@@ -236,8 +236,20 @@ class Application:
             return dict(self.cache_status(), removed_files=removed,
                         active_tasks=len(self.cache_users) + self.cache_preview_users, errors=errors)
 
+    def remove_task_work(self, batch_id, item_id):
+        with self.cache_lock:
+            if (batch_id, item_id) in self.cache_users:
+                return
+            root = self.store.directory / 'work'
+            folder = root / str(batch_id) / str(item_id)
+            if (folder.resolve().is_relative_to(root.resolve()) and not root.is_symlink()
+                    and not folder.parent.is_symlink() and not folder.is_symlink() and folder.is_dir()):
+                shutil.rmtree(folder)
+
     def cleanup_task_cache(self, batch, item):
         self.delete_previews(batch, item)
+        if batch.get('id') and item.get('id'):
+            self.remove_task_work(batch['id'], item['id'])
         ids = {part['asset_id'] for part in item.get('segments', []) if part.get('asset_id')}
         origin = batch.get('sticker_origin')
         if origin:
@@ -289,6 +301,10 @@ class Application:
         finally:
             with self.cache_lock:
                 self.cache_users.pop(key, None)
+                current = self.store.get('batch:' + batch_id, {})
+                live = next((entry for entry in current.get('items', []) if entry['id'] == item['id']), None)
+                if not live or live.get('dismissed'):
+                    self.remove_task_work(batch_id, item['id'])
                 try:
                     self._drain_cache_cleanup()
                 except OSError:
@@ -1034,7 +1050,7 @@ class Application:
                 elif item['status'] == 'pending':
                     item.update(status='cancelled', error='已手动终止')
             elif action == 'start':
-                if item['status'] not in {'cancelled', 'failed', 'stalled_paused'}:
+                if item['status'] not in {'cancelled', 'failed', 'stalled_paused', 'recovery_paused'}:
                     raise ValueError('只有已终止、失败或停滞暂停的单条任务可以重新开始')
                 if batch.get('scheduled_cancelled'):
                     raise ValueError('该定时任务已取消，请生成新方案')
@@ -1119,6 +1135,7 @@ class Application:
         for batch, item in preview_cleanup:
             try:
                 self.delete_previews(batch, item)
+                self.remove_task_work(batch['id'], item['id'])
             except OSError as exc:
                 cleanup_errors.append(str(exc))
         self.wake.set()
@@ -1534,6 +1551,7 @@ class Application:
 
     def execute_item(self, batch_id, index):
         from .processwatch import RenderStalled
+        from .checkpoints import VideoRecoveryNeeded
         from . import media, renderer
         batch = self.batch(batch_id)
         item = batch['items'][index]
@@ -1547,7 +1565,7 @@ class Application:
         except OSError as exc:
             self.store.update(batch_id, lambda b: b.update(status='paused', error=str(exc)))
             return
-        used_ids = {seg['asset_id'] for seg in item['segments']} | {song['id'] for song in item['music']}
+        used_ids = {song['id'] for song in item['music']}
         try:
             if item.get('kind') == 'sticker_variant':
                 media.verify_asset(item['source_asset'])
@@ -1556,12 +1574,22 @@ class Application:
                     if media.verify_asset(asset) is False:
                         raise ValueError('素材已变化：' + asset.get('name', asset['path']))
         except (ValueError, OSError) as exc:
-            self.store.update(batch_id, lambda b: b.update(status='paused', error=str(exc)))
+            self.store.update(batch_id, lambda b: b['items'][index].update(status='failed', error=str(exc)))
             return
         # A crash after final rename but before SQLite commit must not duplicate an export.
         if output.exists():
             try:
-                metadata = renderer.validate(str(output), item['duration'])
+                snapshot_path = self.store.directory / 'work' / batch_id / item['id'] / 'render-result.json'
+                try:
+                    recovered = json.loads(snapshot_path.read_text(encoding='utf-8'))
+                except (OSError, ValueError):
+                    recovered = {}
+                metadata = renderer.validate(str(output), recovered.get('duration', item['duration']))
+                metadata.update(recovery_warnings=recovered.get('recovery_warnings', []))
+                if recovered.get('rendered_segments'):
+                    self.store.update(batch_id, lambda b: b['items'][index].update(
+                        segments=recovered['rendered_segments'], video_assets=item.get('checkpoint_video_assets', item.get('video_assets', [])),
+                        duration=metadata['duration'], checkpoint_segments=[]))
                 metadata.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns)
                 self.store.update(batch_id, lambda b: b['items'][index].update(
                     status='success', progress=1, result=metadata, error=None, thumbnails={'status': 'queued'}))
@@ -1628,12 +1656,71 @@ class Application:
                         nonstop=item['nonstop'], render_stage='rendering'))
                 render_config = dict(batch['config'], cache_dir=str(self.store.directory / 'cache'))
                 work_dir = str(self.store.directory / 'work' / batch_id / item['id'])
+                library = self.store.get('library', {}).get('scan', {}).get('videos', [])
+                candidates = {asset['id']: asset for asset in library + batch.get('assets', [])
+                              if asset in library or str(asset.get('mime_type', '')).startswith('video/')}
+                candidates.update({asset['id']: asset for asset in item.get('video_assets', [])})
+                if batch['config'].get('video_ids') is not None:
+                    selected = set(batch['config']['video_ids'])
+                    candidates = {identity: asset for identity, asset in candidates.items() if identity in selected}
+                usage = defaultdict(int)
+                occupied = []
+                for entry in self.batch(batch_id)['items']:
+                    if entry['id'] != item['id'] and not entry.get('dismissed'):
+                        for seg in entry.get('segments', []) + entry.get('checkpoint_segments', []):
+                            occupied.append(seg)
+                        for identity in {seg['asset_id'] for seg in entry.get('segments', []) + entry.get('checkpoint_segments', [])}:
+                            usage[identity] += 1
+                def record_bad(version, entry):
+                    with self.store.lock:
+                        known = self.store.get('bad-video-sources', {})
+                        previous = known.get(version, {}).get('ranges', [])
+                        known[version] = {'ranges': previous + [r for r in entry['ranges'] if r not in previous]}
+                        # Metadata records only; keep the most recent 2000 versions.
+                        self.store.put('bad-video-sources', dict(list(known.items())[-2000:]))
+                def checkpoint_ready(chunks, warnings):
+                    from .checkpoints import rendered_segments
+                    segments = rendered_segments(chunks)
+                    self.store.update(batch_id, lambda b: b['items'][index].update(
+                        checkpoint_segments=segments, recovery_warnings=warnings, reserved_video_segment=None,
+                        checkpoint_video_assets=[candidates[sid] for sid in dict.fromkeys(seg['asset_id'] for seg in segments) if sid in candidates]))
+                    with self.cache_lock:
+                        self.cache_users[(batch_id, item['id'])].update(seg['asset_id'] for seg in segments)
+                def reserve_segment(segment):
+                    accepted = [False]
+                    def reserve(current):
+                        for other in current['items']:
+                            if other['id'] == item['id'] or other.get('dismissed'):
+                                continue
+                            spans = other.get('segments', []) + other.get('checkpoint_segments', [])
+                            if other.get('reserved_video_segment'):
+                                spans += [other['reserved_video_segment']]
+                            if any(span['asset_id'] == segment['asset_id'] and
+                                   segment['start'] < span['start'] + span['duration'] and
+                                   segment['start'] + segment['duration'] > span['start'] for span in spans):
+                                return
+                        current['items'][index]['reserved_video_segment'] = segment
+                        accepted[0] = True
+                    self.store.update(batch_id, reserve)
+                    return accepted[0]
+                render_config.update(video_candidates=list(candidates.values()), video_usage=dict(usage),
+                                     occupied_video_segments=occupied,
+                                     bad_video_sources=self.store.get('bad-video-sources', {}),
+                                     record_bad_video=record_bad, checkpoint_ready=checkpoint_ready, reserve_video_segment=reserve_segment)
+
                 if item.get('kind') == 'sticker_variant':
                     result = self.render_with_cache(batch_id, item, lambda: renderer.overlay_existing(item['source_asset']['path'], render_config['sticker_layers'],
                                                        str(output), work_dir, progress,
                                                        video_bitrate_mbps=render_config.get('video_bitrate_mbps', 0)))
                 else:
                     result = self.render_with_cache(batch_id, item, lambda: renderer.render(item, render_config, str(output), work_dir, progress))
+                if result.get('rendered_segments'):
+                    actual_segments = result['rendered_segments']
+                    actual_assets = [candidates[identity] for identity in
+                                     dict.fromkeys(seg['asset_id'] for seg in actual_segments) if identity in candidates]
+                    self.store.update(batch_id, lambda b: b['items'][index].update(
+                        segments=actual_segments, video_assets=actual_assets, checkpoint_segments=[]))
+                    self.store.update(batch_id, self._update_plan_counts)
                 result.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns,
                               planned_duration=item.get('planned_duration', item['duration']))
                 result.setdefault('duration', item['duration'])
@@ -1643,9 +1730,10 @@ class Application:
                 self.enqueue_previews(batch_id, item['id'])
                 break
             except Exception as exc:
-                if isinstance(exc, RenderStalled):
+                if isinstance(exc, (RenderStalled, VideoRecoveryNeeded)):
                     self.store.update(batch_id, lambda b: b['items'][index].update(
-                        status='stalled_paused', render_stage='stalled_paused', error=str(exc),
+                        status=('recovery_paused' if isinstance(exc, VideoRecoveryNeeded) else 'stalled_paused'),
+                        render_stage='paused', error=str(exc),
                         stalled_at=time.time(), cancel_requested=False))
                     # Keep small diagnostic snapshots outside caches, which the user may clear.
                     try:
@@ -1685,6 +1773,11 @@ class Application:
                 if 'space' in message.lower() or '空间' in message:
                     self.store.update(batch_id, lambda b: b.update(status='pausing', error=message))
                     break
+                if item.get('kind') != 'sticker_variant' and not isinstance(exc, getattr(renderer, 'MusicInputError', ())):
+                    break
+
+            finally:
+                self.store.update(batch_id, lambda b: b['items'][index].update(reserved_video_segment=None))
 
     def write_manifest(self, batch_id):
         batch = self.batch(batch_id)
@@ -1907,9 +2000,13 @@ class Application:
         references = defaultdict(list)
         for batch in batches:
             for item in batch.get('items', []):
-                for segment in item.get('segments', []):
+                seen = set()
+                for segment in item.get('segments', []) + item.get('checkpoint_segments', []) + ([item['reserved_video_segment']] if item.get('reserved_video_segment') else []):
                     if segment.get('path'):
-                        references[str(Path(segment['path']).resolve())].append((batch, item, segment))
+                        path = str(Path(segment['path']).resolve())
+                        if path not in seen:
+                            references[path].append((batch, item, segment))
+                            seen.add(path)
         updates = defaultdict(dict)
         verified_archives = set()
         for path_text, refs in references.items():
