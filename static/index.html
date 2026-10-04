@@ -57,7 +57,8 @@
               <div class="form-grid mode-single"><label>起点最小间隔（秒）<input name="start_gap" type="number" min="0" value="30"></label><label class="switch-label"><input name="allow_overlap" type="checkbox" checked><span>无空闲视频区间时允许下一轮复用</span></label></div>
             </section>
             <section class="panel span-2"><div class="section-title"><h2>歌曲分配规则</h2></div>
-              <div class="choice-row"><label class="choice"><input type="radio" name="music_mode" value="fixed"><span><strong>固定歌曲集合</strong><small>每条都用所选歌曲，只改变顺序</small></span></label><label class="choice"><input type="radio" name="music_mode" value="pool" checked><span><strong>候选池组合</strong><small>每条选不同子集，再改变顺序</small></span></label></div>
+              <div class="choice-row"><label class="choice"><input type="radio" name="music_mode" value="folder"><span><strong>单文件夹音乐</strong><small>每条只用一个子文件夹，随机排列并循环补足时长</small></span></label><label class="choice"><input type="radio" name="music_mode" value="fixed"><span><strong>固定歌曲集合</strong><small>每条都用所选歌曲，只改变顺序</small></span></label><label class="choice"><input type="radio" name="music_mode" value="pool" checked><span><strong>全路径音乐随机</strong><small>每条选不同子集，再改变顺序</small></span></label></div>
+              <p id="folder-mode-help" class="field-help" hidden>整组优先使用不同子文件夹，用完后再随机轮转。包括子文件夹内的全部有效音频及更深层目录；根目录直接放置的歌曲不参与。此模式不限制歌曲首数。</p>
               <div class="form-grid pool-settings"><label>每条最少歌曲数<input name="min_songs" type="number" min="1" value="3"></label><label>每条最多歌曲数<input name="max_songs" type="number" min="1" value="20"></label></div>
               <p class="field-help">整批优先分配未用歌曲；需要覆盖成片时长才进入下一轮。选定歌曲后再随机播放顺序，任意歌曲都可排第一。</p>
             </section>

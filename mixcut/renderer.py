@@ -218,8 +218,20 @@ def render(item, config, output_path, work_dir, progress_callback=None):
         raise ValueError('导出规格或时长无效')
     if not item.get('segments') or not item.get('music'):
         raise ValueError('方案缺少视频或音乐')
+    if item.get('music_folder') and not item.get('nonstop'):
+        # The rest of a shuffled round is stored for review but never opened by FFmpeg.
+        total, prefix = 0., []
+        for song in item['music']:
+            prefix.append(song); total += float(song['duration'])
+            if total >= duration: break
+        item = dict(item, music=prefix)
     for asset in {a['id']: a for a in item['music']}.values():
-        media.verify_asset(asset)
+        try:
+            media.verify_asset(asset)
+        except (OSError, ValueError) as exc:
+            if item.get('music_folder'):
+                raise MusicInputError('当前文件夹音乐无法读取：' + str(exc), [asset['id']]) from exc
+            raise
     output = Path(output_path).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():

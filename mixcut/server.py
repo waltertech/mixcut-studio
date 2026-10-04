@@ -735,6 +735,7 @@ class Application:
             raise ValueError('导出路径必须是文件夹')
         config['output_dir'] = str(output)
         config['source_video_dir'] = self.store.get('library', {}).get('video_dir')
+        config['music_root'] = library_record.get('music_dir')
         config.setdefault('seed', random.SystemRandom().randrange(2**63))
         result = planner.plan(library['videos'], library['music'], config)
         if len(result['items']) != count:
@@ -765,6 +766,12 @@ class Application:
             '实际大小随编码变化；另需 TS 缓存和临时文件空间。')
         if estimated_bytes > free_bytes:
             result['warnings'].append('估计输出超过磁盘可用空间，请更换输出磁盘或减少数量。')
+        if config.get('music_mode') == 'folder':
+            from . import foldermusic
+            config['music_root'] = music_root or config.get('music_root')
+            folder_catalog = foldermusic.catalog(foldermusic.groups([a for a in assets if str(a.get('mime_type', '')).startswith('audio/')], config['music_root']))
+        else:
+            folder_catalog = []
         items = result['items']
         output_folder = self.reserve_output_folder(output)
         for index, item in enumerate(items, 1):
@@ -779,7 +786,7 @@ class Application:
         batch = {'id': batch_id, 'status': 'draft', 'created_at': time.time(),
                  'updated_at': time.time(), 'config': config, 'items': items,
                  'stats': result.get('stats', {}), 'warnings': result.get('warnings', []),
-                 'assets': assets,
+                 'assets': assets, 'music_folder_catalog': folder_catalog,
                  'output_folder': str(output_folder), 'folder_name': output_folder.name}
         if scheduled_run_id:
             batch.update(scheduled_run_id=scheduled_run_id, schedule_name=schedule_name)
@@ -819,7 +826,7 @@ class Application:
         batch['warnings'] = warnings
 
     def _set_item_music(self, batch, item, order):
-        root = self.store.get('library', {}).get('music_dir')
+        root = batch['config'].get('music_root') or self.store.get('library', {}).get('music_dir')
         item['music'] = [tag_music_style(song, root) for song in order]
         item['music_total_duration'] = sum(float(song['duration']) for song in order)
         item['music_fingerprint'] = self._fingerprint(tuple(song['id'] for song in order))
@@ -847,7 +854,7 @@ class Application:
                 raise ValueError('只能调整当前方案已有歌曲的顺序')
             candidate = fingerprint(music_ids)
             for other in batch['items']:
-                if other is item:
+                if other is item or batch['config'].get('music_mode') == 'folder':
                     continue
                 other_ids = [song['id'] for song in other.get('music', [])]
                 if fingerprint(other_ids) == candidate:
@@ -862,6 +869,16 @@ class Application:
 
     def _choose_item_music(self, batch, item, target, *, avoid_current=False, excluded_ids=()):
         from . import planner
+        if batch['config'].get('music_mode') == 'folder':
+            excluded_ids = set(excluded_ids) | set(batch.get('failed_music_ids', []))
+            from . import foldermusic
+            grouped = foldermusic.groups([a for a in batch.get('assets', []) if str(a.get('mime_type', '')).startswith('audio/') and a['id'] not in excluded_ids], batch['config'].get('music_root'))
+            songs = grouped.get(item.get('music_folder'), [])
+            if not songs:
+                raise ValueError('当前音乐文件夹没有可用歌曲，请更换文件夹')
+            order, _ = foldermusic.allocate(songs, target, batch['config'], random.Random(time.time_ns()))
+            item['music_folder_song_count'] = len(songs)
+            return order
         selected = set(batch.get('config', {}).get('music_ids') or
                        [song['id'] for song in self.store.get('library', {}).get('scan', {}).get('music', [])] or
                        [song['id'] for entry in batch['items'] for song in entry.get('music', [])])
@@ -906,12 +923,36 @@ class Application:
         def change(batch):
             if batch['status'] != 'draft':
                 raise ValueError('只有草稿方案可以刷新音乐')
-            if batch['config'].get('music_mode', 'pool') != 'pool':
+            if batch['config'].get('music_mode', 'pool') not in {'pool', 'folder'}:
                 raise ValueError('固定歌曲集合模式不能随机刷新；请选择候选池组合')
             item = next((entry for entry in batch['items'] if str(entry['id']) == str(item_id)), None)
             if item is None:
                 raise ValueError('方案条目不存在')
             order = self._choose_item_music(batch, item, float(item['duration']), avoid_current=True)
+            self._set_item_music(batch, item, order)
+        return self.store.update(batch_id, change)
+
+    def change_music_folder(self, batch_id, item_id, body):
+        from . import foldermusic
+        def change(batch):
+            if batch['status'] != 'draft' or batch['config'].get('music_mode') != 'folder':
+                raise ValueError('只有单文件夹模式的草稿方案可以更换音乐文件夹')
+            item = next((i for i in batch['items'] if str(i['id']) == str(item_id)), None)
+            if item is None: raise ValueError('方案条目不存在')
+            blocked = set(batch.get('failed_music_ids', []))
+            grouped = foldermusic.groups([a for a in batch['assets'] if str(a.get('mime_type', '')).startswith('audio/') and a['id'] not in blocked], batch['config'].get('music_root'))
+            usage = defaultdict(int)
+            for other in batch['items']:
+                if other is not item and not other.get('dismissed') and other.get('music_folder'):
+                    usage[other['music_folder']] += 1
+            rng = random.Random(time.time_ns())
+            folder = body.get('folder')
+            if body.get('random') is True:
+                folder = foldermusic.choose_folder(grouped, usage, rng, item.get('music_folder'))
+            if not isinstance(folder, str) or folder not in grouped: raise ValueError('所选文件夹不在当前方案的音乐库中或没有可用歌曲')
+            order, _ = foldermusic.allocate(grouped[folder], item['duration'], batch['config'], rng)
+            item.update(music_folder=folder, music_folder_song_count=len(grouped[folder]))
+            item.pop('manual_music_order', None)
             self._set_item_music(batch, item, order)
         return self.store.update(batch_id, change)
 
@@ -937,8 +978,21 @@ class Application:
             config = batch['config']
             rng = random.Random(time.time_ns())
             if kind == 'music':
-                if config.get('music_mode', 'pool') != 'pool':
+                if config.get('music_mode', 'pool') not in {'pool', 'folder'}:
                     raise ValueError('固定歌曲集合模式不能替换单曲')
+                if config.get('music_mode') == 'folder':
+                    from . import foldermusic
+                    blocked = set(batch.get('failed_music_ids', []))
+                    grouped = foldermusic.groups([a for a in batch['assets'] if str(a.get('mime_type', '')).startswith('audio/') and a['id'] not in blocked], config.get('music_root'))
+                    candidates = [song for song in grouped.get(item['music_folder'], []) if song['id'] != item['music'][index]['id']]
+                    if not candidates:
+                        raise ValueError('该文件夹没有其他可替换歌曲')
+                    order = list(item['music'])
+                    order[index] = rng.choice(candidates)
+                    if sum(float(song['duration']) for song in order) < float(item['duration']):
+                        order = self._choose_item_music(batch, item, float(item['duration']), excluded_ids=blocked)
+                    self._set_item_music(batch, item, order)
+                    return
                 selected = set(config.get('music_ids') or [])
                 current = item['music']
                 ids = {song['id'] for song in current}
@@ -1028,7 +1082,7 @@ class Application:
                     continue
                 order = None
                 if abs(target - float(item['duration'])) > 1e-5:
-                    if config.get('music_mode', 'pool') == 'pool':
+                    if config.get('music_mode', 'pool') in {'pool', 'folder'}:
                         try:
                             order = self._choose_item_music(batch, item, target)
                         except ValueError as exc:
@@ -1587,7 +1641,8 @@ class Application:
         except OSError as exc:
             self.store.update(batch_id, lambda b: b.update(status='paused', error=str(exc)))
             return
-        used_ids = {song['id'] for song in item['music']}
+        # Folder playlists include unused suffixes; verify actual inputs during preparation/render.
+        used_ids = set() if item.get('music_folder') else {song['id'] for song in item['music']}
         try:
             if item.get('kind') == 'sticker_variant':
                 media.verify_asset(item['source_asset'])
@@ -1675,7 +1730,8 @@ class Application:
                     item = self.music_edges.prepare(item, cancelled, detecting)
                     self.store.update(batch_id, lambda b: b['items'][index].update(
                         duration=item['duration'], planned_duration=item['planned_duration'], music=item['music'],
-                        nonstop=item['nonstop'], render_stage='rendering'))
+                        nonstop=item['nonstop'], render_stage='rendering',
+                        **({key:item[key] for key in ('music_unique_count','music_play_count','music_rounds')} if item.get('music_folder') else {})))
                 render_config = dict(batch['config'], cache_dir=str(self.store.directory / 'cache'))
                 work_dir = str(self.store.directory / 'work' / batch_id / item['id'])
                 library = self.store.get('library', {}).get('scan', {}).get('videos', [])
@@ -2478,6 +2534,9 @@ class Handler(BaseHTTPRequestHandler):
                 music_refresh_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/refresh-music', path)
                 if music_refresh_match:
                     return self.json_response(self.app.refresh_music(*music_refresh_match.groups()))
+                folder_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/music-folder', path)
+                if folder_match:
+                    return self.json_response(self.app.change_music_folder(*folder_match.groups(), body))
                 replacement_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/replace', path)
                 if replacement_match:
                     return self.json_response(self.app.replace_media(*replacement_match.groups(), body))

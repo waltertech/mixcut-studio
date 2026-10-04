@@ -13,17 +13,17 @@ class MacLauncherTests(unittest.TestCase):
     def test_native_window_supports_confirmation_text_input(self):
         source = (Path(__file__).resolve().parent.parent / 'macos' / 'build_tools' / 'window.swift').read_text(encoding='utf-8')
         self.assertIn('runJavaScriptTextInputPanelWithPrompt', source)
-        self.assertIn('data.api_protocol === 10', source)
+        self.assertIn('data.api_protocol === 11', source)
 
     def test_same_version_without_protocol_is_still_incompatible(self):
-        old = {'version': '1.5.3', 'batches': [], 'ffmpeg_available': True}
+        old = {'version': '1.5.4', 'batches': [], 'ffmpeg_available': True}
         self.assertFalse(maclaunch._compatible(old))
         self.assertFalse(maclaunch._compatible({**old, 'api_protocol': 3}))
-        self.assertTrue(maclaunch._compatible({**old, 'api_protocol': 10}))
+        self.assertTrue(maclaunch._compatible({**old, 'api_protocol': 11}))
 
     def test_idle_old_server_is_stopped_before_new_window_opens(self):
         old = {'version': '1.4.4', 'api_protocol': 3, 'batches': [], 'ffmpeg_available': True}
-        current = {**old, 'version': '1.5.3', 'api_protocol': 10}
+        current = {**old, 'version': '1.5.4', 'api_protocol': 11}
         with tempfile.TemporaryDirectory() as directory:
             events = []
             with patch('mixcut.runtime.data_root', return_value=Path(directory)), \

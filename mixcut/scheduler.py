@@ -151,9 +151,9 @@ class Scheduler:
                 raise ValueError('时长和间隔必须是非负有限数字')
         if config['min_duration'] > config['max_duration'] or config['segment_min'] <= 0 or config['segment_max'] < config['segment_min']:
             raise ValueError('最短/最长时长设置无效')
-        if not 1 <= int(config['min_songs']) <= int(config['max_songs']):
+        if config.get('music_mode') != 'folder' and not 1 <= int(config['min_songs']) <= int(config['max_songs']):
             raise ValueError('歌曲数量范围无效')
-        if config.get('music_mode', 'pool') not in {'fixed', 'pool'}:
+        if config.get('music_mode', 'pool') not in {'fixed', 'pool', 'folder'}:
             raise ValueError('音乐模式无效')
         template, layers = self.app.resolve_sticker_template(config.get('sticker_template_id'))
         config.update(sticker_template=template, sticker_layers=layers)
@@ -384,6 +384,7 @@ class Scheduler:
                     config.setdefault('music_margin_seconds', 3.0)
                     config.setdefault('seed', random.SystemRandom().randrange(2**63))
                     config['source_video_dir'] = schedule['video_dir']
+                    config['music_root'] = schedule['music_dir']
                 result = planner.plan(scan['videos'], scan['music'], config, allow_partial=True, previous_items=previous)
                 with self.lock:
                     run = self.active()
