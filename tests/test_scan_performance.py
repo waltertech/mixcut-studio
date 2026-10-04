@@ -105,14 +105,14 @@ class IncrementalScanTests(unittest.TestCase):
         self.assertEqual([video.name], [entry['name'] for entry in result['videos']])
         self.assertTrue(any('still.mp4' in error['path'] for error in result['errors']))
 
-    def test_same_volume_rename_reuses_verified_metadata_and_digest(self):
+    def test_same_volume_rename_reuses_metadata_but_gets_new_path_id(self):
         self.make_video()
         old = self.make_music()
         first = media.scan(str(self.videos), str(self.music), str(self.root / 'cache'))
         renamed = old.rename(self.music / 'renamed.m4a')
         with patch('mixcut.media._asset', side_effect=AssertionError('unnecessary reanalysis')):
             second = media.scan(str(self.videos), str(self.music), str(self.root / 'cache'))
-        self.assertEqual(first['music'][0]['id'], second['music'][0]['id'])
+        self.assertNotEqual(first['music'][0]['id'], second['music'][0]['id'])
         self.assertEqual(str(renamed.resolve()), second['music'][0]['path'])
 
     def test_shared_path_has_separate_video_and_music_cache_records(self):
@@ -252,7 +252,7 @@ class IncrementalScanTests(unittest.TestCase):
         self.assertEqual(first['music'][0]['id'], second['music'][0]['id'])
         self.assertEqual('audio/mpeg', second['music'][0]['mime_type'])
 
-    def test_library_load_defers_full_music_decode_until_planning(self):
+    def test_library_load_and_planning_do_not_decode_music(self):
         self.make_video()
         self.make_music()
         body = {'video_dir': str(self.videos), 'music_dir': str(self.music)}
@@ -272,7 +272,7 @@ class IncrementalScanTests(unittest.TestCase):
             'allow_overlap': False, 'video_ids': [video['id']], 'music_ids': [song['id']],
             'width': 640, 'height': 360, 'fps': 24, 'output_dir': str(self.root / 'exports')}})
         self.assertEqual(1, len(batch['items']))
-        self.assertIs(True, self.app.bootstrap()['scan']['music'][0]['duration_precise'])
+        self.assertIs(False, self.app.bootstrap()['scan']['music'][0]['duration_precise'])
 
 
 if __name__ == '__main__':

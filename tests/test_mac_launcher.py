@@ -13,16 +13,17 @@ class MacLauncherTests(unittest.TestCase):
     def test_native_window_supports_confirmation_text_input(self):
         source = (Path(__file__).resolve().parent.parent / 'macos' / 'build_tools' / 'window.swift').read_text(encoding='utf-8')
         self.assertIn('runJavaScriptTextInputPanelWithPrompt', source)
-        self.assertIn('data.api_protocol === 3', source)
+        self.assertIn('data.api_protocol === 10', source)
 
     def test_same_version_without_protocol_is_still_incompatible(self):
-        old = {'version': '1.4.0', 'batches': [], 'ffmpeg_available': True}
+        old = {'version': '1.5.3', 'batches': [], 'ffmpeg_available': True}
         self.assertFalse(maclaunch._compatible(old))
-        self.assertTrue(maclaunch._compatible({**old, 'api_protocol': 3}))
+        self.assertFalse(maclaunch._compatible({**old, 'api_protocol': 3}))
+        self.assertTrue(maclaunch._compatible({**old, 'api_protocol': 10}))
 
     def test_idle_old_server_is_stopped_before_new_window_opens(self):
-        old = {'version': '1.3.8', 'api_protocol': 3, 'batches': [], 'ffmpeg_available': True}
-        current = {**old, 'version': '1.4.0'}
+        old = {'version': '1.4.4', 'api_protocol': 3, 'batches': [], 'ffmpeg_available': True}
+        current = {**old, 'version': '1.5.3', 'api_protocol': 10}
         with tempfile.TemporaryDirectory() as directory:
             events = []
             with patch('mixcut.runtime.data_root', return_value=Path(directory)), \
@@ -36,7 +37,7 @@ class MacLauncherTests(unittest.TestCase):
             self.assertEqual(['stop', 'spawn', 'window'], events)
 
     def test_running_old_tasks_prevent_automatic_shutdown(self):
-        old = {'version': '1.3.8', 'api_protocol': 3, 'ffmpeg_available': True,
+        old = {'version': '1.4.4', 'api_protocol': 3, 'ffmpeg_available': True,
                'batches': [{'id': 'job', 'status': 'running'}]}
         with tempfile.TemporaryDirectory() as directory:
             with patch('mixcut.runtime.data_root', return_value=Path(directory)), \
@@ -45,6 +46,11 @@ class MacLauncherTests(unittest.TestCase):
                  patch.object(maclaunch, '_stop') as stop:
                 self.assertEqual(1, maclaunch.main([]))
                 stop.assert_not_called()
+
+    def test_hidden_active_work_also_prevents_automatic_shutdown(self):
+        old = {'version': '1.4.4', 'api_protocol': 3, 'ffmpeg_available': True,
+               'batches': [], 'active_work': True}
+        self.assertTrue(maclaunch._active_tasks(old))
 
 
 if __name__ == '__main__':

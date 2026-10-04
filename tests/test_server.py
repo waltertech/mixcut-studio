@@ -92,6 +92,27 @@ class ApplicationTestCase(unittest.TestCase):
         reopened = server.Store(self.root / 'state')
         self.assertEqual({'scan': {'videos': ['v']}}, reopened.get('library'))
 
+    def test_bootstrap_reports_process_version_and_hidden_active_work(self):
+        record = batch('hidden1', 'running', [item()], self.root / 'exports')
+        record['items'][0]['dismissed'] = True
+        self.save(record)
+        with patch('mixcut.server.app_version', return_value='different-on-disk'):
+            data = self.app.bootstrap()
+        self.assertEqual('1.5.3', data['version'])
+        self.assertEqual(10, data['api_protocol'])
+        self.assertTrue(data['active_work'])
+        self.assertEqual([], data['batches'])
+
+    def test_recovery_defers_large_archive_validation_until_background_work(self):
+        approved = batch('approved1', 'completed', [item(1, 'success')], self.root / 'exports')
+        approved['items'][0].update(review={'status': 'approved', 'path': str(self.root / 'archive.mp4')},
+                                    cleanup={'output_deleted': True, 'source_cleanup_requested': True})
+        self.save(approved)
+        with patch.object(server.Application, '_cleanup_approved_sources',
+                          side_effect=AssertionError('archive validation blocked startup')):
+            restarted = server.Application(self.root / 'state')
+        self.assertEqual('approved', restarted.batch('approved1')['items'][0]['review']['status'])
+
     def test_draft_music_order_can_change_but_cannot_duplicate_another_item(self):
         first = item(1)
         first['music'] = [{'id': 'a', 'name': 'A'}, {'id': 'b', 'name': 'B'}, {'id': 'c', 'name': 'C'}]
@@ -172,8 +193,9 @@ class ApplicationTestCase(unittest.TestCase):
         self.assertEqual('pending', restarted['items'][0]['status'])
         self.app.store.update(record['id'], lambda value: value.update(status='stopped'))
         deleted = self.app.item_action(record['id'], '2', 'delete')
-        self.assertEqual(['1'], [entry['id'] for entry in deleted['items']])
-        self.assertEqual(1, deleted['items'][0]['index'])
+        self.assertEqual(['1'], [entry['id'] for entry in deleted['updated_batches'][record['id']]['items']])
+        self.assertEqual(1, deleted['updated_batches'][record['id']]['items'][0]['index'])
+        self.assertEqual([], self.app.store.records('deletion:'))
         self.assertEqual(1, self.app.clear_batches(confirmation='DELETE_TASK_RECORDS')['deleted'])
         self.assertEqual([], self.app.store.batches())
 
@@ -192,11 +214,11 @@ class ApplicationTestCase(unittest.TestCase):
         self.assertEqual(1, len(renderer.validations))
         self.assertEqual('success', saved['items'][0]['status'])
         self.assertEqual('completed', saved['status'])
-        self.assertEqual(['video', 'song'], media.verified)
+        self.assertEqual(['song'], media.verified)
         self.assertEqual(output.stat().st_size, saved['items'][0]['result']['output_size'])
         self.assertEqual(output.stat().st_mtime_ns, saved['items'][0]['result']['output_mtime_ns'])
 
-    def test_failed_render_is_limited_to_three_total_attempts(self):
+    def test_unrecoverable_encoder_error_does_not_repeat_whole_task(self):
         record = self.save(batch('retry1', output_dir=self.root / 'exports'))
         renderer = FakeRenderer()
 
@@ -207,8 +229,8 @@ class ApplicationTestCase(unittest.TestCase):
         self.execute(record, renderer=renderer)
         saved = self.app.batch(record['id'])
 
-        self.assertEqual(['1', '1', '1'], renderer.renders)
-        self.assertEqual(3, saved['items'][0]['attempts'])
+        self.assertEqual(['1'], renderer.renders)
+        self.assertEqual(1, saved['items'][0]['attempts'])
         self.assertEqual('failed', saved['items'][0]['status'])
         self.assertEqual('failed', saved['status'])
 
@@ -244,7 +266,7 @@ class ApplicationTestCase(unittest.TestCase):
         self.assertEqual('success', saved['items'][0]['status'])
         self.assertEqual('pending', saved['items'][1]['status'])
 
-    def test_changed_source_pauses_without_rendering_or_losing_item(self):
+    def test_changed_music_fails_only_its_task_without_rendering(self):
         """The queue turns a changed source into a paused, user-actionable batch."""
         record = self.save(batch('source1', output_dir=self.root / 'exports'))
         def changed(asset):
@@ -260,9 +282,8 @@ class ApplicationTestCase(unittest.TestCase):
             self.app.run_queue()
         saved = self.app.batch(record['id'])
 
-        self.assertEqual('paused', saved['status'])
-        self.assertEqual('pending', saved['items'][0]['status'])
-        self.assertIn('素材已变更', saved.get('error', ''))
+        self.assertEqual('failed', saved['items'][0]['status'])
+        self.assertIn('素材已变更', saved['items'][0].get('error', ''))
         self.assertEqual([], renderer.renders)
 
 

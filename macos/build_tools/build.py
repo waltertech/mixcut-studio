@@ -99,6 +99,9 @@ def bootstrap(port, timeout=1):
 def verify(release_version):
     if not WINDOW_EXECUTABLE.is_file():
         raise SystemExit('native WebKit window is missing from the app')
+    for tool in ('ffmpeg', 'ffprobe'):
+        binary = APP / 'Contents' / 'Frameworks' / 'bin' / tool
+        run([binary, '-version'], stdout=subprocess.DEVNULL)
     if bootstrap(VERIFY_PORT) is not None:
         raise SystemExit(f'port {VERIFY_PORT} is already in use')
     with tempfile.TemporaryDirectory(prefix='mixcut-macos-verify-') as state:
@@ -119,8 +122,27 @@ def verify(release_version):
                 raise SystemExit('bundled FFmpeg was not detected')
             if data.get('version') != release_version:
                 raise SystemExit(f'embedded version mismatch: {data.get("version")}')
-            if data.get('api_protocol') != 3:
+            if data.get('api_protocol') != 10:
                 raise SystemExit('embedded API protocol mismatch')
+            request = Request(f'http://127.0.0.1:{VERIFY_PORT}/api/tasks/forget',
+                              data=b'{"selections":[]}', method='POST',
+                              headers={'Content-Type': 'application/json'})
+            with urlopen(request, timeout=10) as response:
+                result = json.load(response)
+            if result.get('ok') is not True or result.get('deleted_items') != 0:
+                raise SystemExit('packaged task deletion API did not respond correctly')
+            with urlopen(f'http://127.0.0.1:{VERIFY_PORT}/api/tasks/approve-all', timeout=10) as response:
+                review_status = json.load(response)
+            if review_status.get('status') != 'idle':
+                raise SystemExit('packaged review API did not respond correctly')
+            for route, payload, required in [('/api/cache', None, 'bytes'),
+                                               ('/api/cache/clear', b'{}', 'errors'),
+                                               ('/api/tasks/retry-failed', b'{}', 'retried')]:
+                request = Request(f'http://127.0.0.1:{VERIFY_PORT}' + route, data=payload,
+                                  headers={'Content-Type': 'application/json'})
+                with urlopen(request, timeout=10) as response:
+                    if required not in json.load(response):
+                        raise SystemExit('packaged API verification failed: ' + route)
             print(f'==> verified version={data["version"]} ffmpeg_available=True')
             request = Request(f'http://127.0.0.1:{VERIFY_PORT}/api/shutdown', data=b'{}', method='POST',
                               headers={'Content-Type': 'application/json'})

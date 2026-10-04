@@ -27,7 +27,7 @@
       <main>
         <section id="assets" class="view">
           <div class="page-heading"><div><p class="eyebrow">MATERIAL LIBRARY</p><h1>素材</h1><p>填入本机绝对路径，递归扫描可用的视频与音乐。审核通过后，程序会按规则删除已用原始视频。</p></div><button id="scan-btn" class="button primary">扫描素材</button></div>
-          <div class="notice"><strong>音乐时长覆盖成片</strong>：每条歌曲总时长须达到目标视频时长；成片结束时可能截断最后一首歌曲，不变速、不循环。</div>
+          <div class="notice"><strong>音乐时长覆盖成片</strong>：候选池规划按读取到的时长分配歌曲，并预留视频时长的 0.5%（最多 3 秒）；成片结束时可能截断最后一首歌曲，不变速、不循环。渲染时识别到异常音乐会自动换歌重试。</div>
           <p id="scan-progress" class="field-help" role="status" aria-live="polite"></p>
           <form id="paths-form" class="panel paths-grid">
             <label>视频文件夹<span class="path-control"><input id="video-dir" name="video_dir" required placeholder="/Users/…/视频素材"><button class="button folder-picker" data-kind="video" type="button">选择文件夹</button></span></label>
@@ -39,14 +39,15 @@
           <div id="scan-errors" class="error-list" hidden></div>
           <div class="asset-summary" id="asset-summary"><span>尚未扫描</span></div>
           <div class="library-grid">
-            <section class="library"><div class="section-title"><h2>视频素材</h2><span id="video-count">0 条</span></div><div id="video-assets" class="asset-list empty">扫描后在这里显示视频、缩略图和分组。</div></section>
-            <section class="library"><div class="section-title"><h2>音乐素材</h2><span id="music-count">0 首</span></div><div id="music-assets" class="asset-list empty">扫描后在这里试听和选择歌曲。</div></section>
+            <section class="library"><details><summary>视频素材 · <span id="video-count">0 条</span>（展开选择）</summary><div id="video-assets" class="asset-list empty">扫描后在这里显示视频、缩略图和分组。</div></details></section>
+            <section class="library"><details><summary>音乐素材 · <span id="music-count">0 首</span>（展开选择）</summary><div id="music-assets" class="asset-list empty">扫描后在这里试听和选择歌曲。</div></details></section>
           </div>
         </section>
 
         <section id="settings" class="view" hidden>
           <div class="page-heading"><div><p class="eyebrow">EDITING RULES</p><h1>剪辑设置</h1><p>先选择素材和规则，再生成一批可复现的方案。</p></div><button id="plan-btn" class="button primary">生成方案</button></div>
           <form id="config-form" class="settings-grid" novalidate>
+            <section class="panel span-2"><div class="section-title"><h2>导出规格</h2></div><div class="form-grid"><label>分辨率<select name="resolution"><option value="1280x720">1280 × 720（默认）</option><option value="1920x1080">1920 × 1080</option></select></label><label>帧率<select name="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label><label>视频码率（Mbps；0 为自动）<input name="video_bitrate_mbps" type="number" min="0" max="50" step="0.5" value="0"></label><label>同时并行剪辑数量<select name="parallel_tasks"><option value="1">1（默认）</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></label><label>编码方式<select name="hardware"><option value="auto">自动硬件加速（推荐）</option><option value="software_fast">软件极速（文件较大）</option><option value="software">软件高质量（较慢）</option></select></label><label>原音音量<input name="original_volume" type="number" min="0" max="1" step=".05" value="0"></label><label>无缝音乐衔接<select name="nonstop_music"><option value="true">开启（去首尾静音＋短过渡）</option><option value="false">关闭</option></select></label><label>音乐音量<input name="music_volume" type="number" min="0" max="1" step=".05" value="1"></label></div><p class="field-help">视频码率设为 0 时沿用自动编码设置；设置固定码率可控制输出大小。720p/30fps 通常最快。并行数量为同时执行的任务上限，旧方案默认 1；暂停后等待所有执行中的任务完成。</p></section>
             <section class="panel span-2"><div class="section-title"><h2>画面组织</h2></div>
               <div class="choice-row"><label class="choice"><input type="radio" name="mode" value="single" checked><span><strong>单源连续截取</strong><small>每条只从一个视频中连续截取</small></span></label><label class="choice"><input type="radio" name="mode" value="multi"><span><strong>多源片段拼接</strong><small>至少两个来源，按原顺序拼接</small></span></label></div>
               <div class="form-grid"><label>生成数量<input name="count" type="number" min="1" value="3"></label><label>期望最短时长（秒）<input name="min_duration" type="number" min="1" value="30"></label><label>期望最长时长（秒）<input name="max_duration" type="number" min="1" value="450"></label><label>随机种子（留空每批随机）<input name="seed" type="number" placeholder="自动生成"></label></div>
@@ -59,10 +60,8 @@
               <div class="choice-row"><label class="choice"><input type="radio" name="music_mode" value="fixed"><span><strong>固定歌曲集合</strong><small>每条都用所选歌曲，只改变顺序</small></span></label><label class="choice"><input type="radio" name="music_mode" value="pool" checked><span><strong>候选池组合</strong><small>每条选不同子集，再改变顺序</small></span></label></div>
               <div class="form-grid pool-settings"><label>每条最少歌曲数<input name="min_songs" type="number" min="1" value="3"></label><label>每条最多歌曲数<input name="max_songs" type="number" min="1" value="20"></label></div>
               <p class="field-help">整批优先分配未用歌曲；需要覆盖成片时长才进入下一轮。选定歌曲后再随机播放顺序，任意歌曲都可排第一。</p>
-              <div id="music-picker" class="picker empty">请先在“素材”页扫描音乐。</div>
             </section>
-            <section class="panel"><div class="section-title"><h2>视频范围与分组</h2></div><div id="video-picker" class="picker empty">请先在“素材”页扫描视频。</div><label>贴图模板<select id="generation-sticker-template" name="sticker_template_id"><option value="">不添加贴图</option></select></label></section>
-            <section class="panel"><div class="section-title"><h2>导出规格</h2></div><div class="form-grid"><label>分辨率<select name="resolution"><option value="1280x720">1280 × 720（默认）</option><option value="1920x1080">1920 × 1080</option></select></label><label>帧率<select name="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label><label>编码方式<select name="hardware"><option value="auto">自动硬件加速（推荐）</option><option value="software_fast">软件极速（文件较大）</option><option value="software">软件高质量（较慢）</option></select></label><label>原音音量<input name="original_volume" type="number" min="0" max="1" step=".05" value="0"></label><label>音乐音量<input name="music_volume" type="number" min="0" max="1" step=".05" value="1"></label></div><p class="field-help">自动模式在 Mac 使用 VideoToolbox，在 Windows 依次尝试 NVIDIA、Intel、AMD 硬件编码并自动回退。720p/30fps 通常最快。</p></section>
+            <section class="panel span-2"><div class="section-title"><h2>参与素材</h2></div><p id="selection-summary" class="field-help">扫描后默认使用全部视频和音乐。需要排除文件或设置分组时，在“素材”页展开对应列表。</p><label>贴图模板<select id="generation-sticker-template" name="sticker_template_id"><option value="">不添加贴图</option></select></label></section>
           </form>
         </section>
 
@@ -72,8 +71,9 @@
         </section>
 
         <section id="tasks" class="view" hidden>
-          <div class="page-heading"><div><p class="eyebrow">RENDER QUEUE</p><h1>任务与结果</h1><p>关闭网页不会停止后台队列。暂停会在当前成片完成后生效。</p></div><div class="button-row"><button id="pause-all" class="button">暂停全部</button><button id="start-all" class="button">开始全部</button><button id="stop-all" class="button">终止全部</button><button id="select-all-tasks" class="button">全选可删任务</button><button id="delete-selected-tasks" class="button">删除选中任务</button><button id="clear-all" class="button">清除全部记录</button><button id="download-deletion-records" class="button">导出删除记录</button><button id="refresh-tasks" class="button">刷新状态</button></div></div>
+          <div class="page-heading"><div><p class="eyebrow">RENDER QUEUE</p><h1>任务与结果</h1><p>一条视频就是一条任务。删除任务会清理缩略图，保留未审核的成品和素材。</p></div><div class="button-row"><button id="pause-all" class="button">暂停全部</button><button id="start-all" class="button">开始全部</button><button id="stop-all" class="button">终止全部</button><button id="approve-all-visible" class="button primary">一键审核</button><button id="select-all-tasks" class="button">全选任务</button><button id="delete-selected-tasks" class="button">删除选中任务</button><button id="clear-all" class="button">清空任务记录</button><button id="retry-failed" class="button">重试失败任务</button><button id="refresh-tasks" class="button">刷新状态</button></div></div>
           <div class="panel task-review-setting"><label>审核通过文件夹<span class="path-control"><input id="task-review-dir" placeholder="选择审核文件夹"><button class="button folder-picker" data-kind="review" type="button">选择文件夹</button></span></label><p class="field-help">通过审核后先校验归档副本，再删除制作目录成片；原始录屏在所有引用任务审核或移除后删除。失败时可重试清理。</p></div>
+          <div class="notice"><span id="cache-usage">剪辑缓存：正在读取…</span> <button id="clear-cache" class="button">一键清除缓存</button><p class="field-help">统计视频转换缓存、任务临时文件及预览图片。正在使用的缓存暂时保留；清除后需要时会重新生成。</p></div>
           <div id="task-summary" class="stats"><div class="stat"><b>—</b><span>等待批次</span></div></div><div id="batches" class="batch-list empty">尚无任务。先生成方案并确认开始渲染。</div>
         </section>
         <section id="stickers" class="view" hidden>

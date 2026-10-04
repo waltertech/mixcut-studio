@@ -1,19 +1,26 @@
 (() => {
   'use strict';
-  const state = { scan: { videos: [], music: [], errors: [] }, batch: null, batches: [], poller: null, scanPoller: null, scanSignature: '', scanRunning: false, libraryDirs: null, dirtyLibrary: new Set(), mediaCache: new Map(), keyframeObserver: null, batchSignature: '', batchLayoutSignature: '', serverVersion: '' };
+  const state = { scan: { videos: [], music: [], errors: [] }, batch: null, batches: [], poller: null, scanPoller: null, scanSignature: '', scanRunning: false, libraryDirs: null, dirtyLibrary: new Set(), mediaCache: new Map(), batchSignature: '', batchLayoutSignature: '', serverVersion: '', reviewJobs: new Map() };
   const selectedTasks = new Set();
+  const expandedTasks = new Set();
   const taskKey = (batchId, itemId) => `${batchId}:${itemId}`;
-  const taskSelection = (batch, item) => { const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = 'task-select'; checkbox.setAttribute('aria-label', `选择任务 ${item.index || item.id}`); const key = taskKey(batch.id,item.id); checkbox.checked = selectedTasks.has(key); checkbox.disabled = ['queued','running','pausing','stopping'].includes(batch.status) || ['running','validating'].includes(item.status); checkbox.addEventListener('change', () => checkbox.checked ? selectedTasks.add(key) : selectedTasks.delete(key)); return checkbox; };
+  const taskSelection = (batch, item) => { const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = 'task-select'; checkbox.setAttribute('aria-label', `选择任务 ${item.index || item.id}`); const key = taskKey(batch.id,item.id); checkbox.checked = selectedTasks.has(key); checkbox.addEventListener('change', () => { if (checkbox.checked) selectedTasks.add(key); else selectedTasks.delete(key); updateSelectionButtons(); }); return checkbox; };
   const $ = (s, root = document) => root.querySelector(s);
   const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+  const updateSelectionButtons = () => {
+    const planCount = (state.batch?.items || []).filter(item => selectedTasks.has(taskKey(state.batch.id, item.id))).length;
+    const taskCount = state.batches.reduce((total, batch) => total + (batch.items || []).filter(item => selectedTasks.has(taskKey(batch.id, item.id))).length, 0);
+    $('#delete-selected-plan').textContent = planCount ? `删除选中任务（${planCount}）` : '删除选中任务';
+    $('#delete-selected-tasks').textContent = taskCount ? `删除选中任务（${taskCount}）` : '删除选中任务';
+  };
   const fmt = (seconds) => { const raw = Number(seconds); if (!Number.isFinite(raw)) return '未知时长'; const total = Math.max(0, Math.round(raw)), h = Math.floor(total / 3600), m = Math.floor(total % 3600 / 60), s = total % 60; return (h ? `${h}:` : '') + `${String(m).padStart(h ? 2 : 1, '0')}:${String(s).padStart(2, '0')}`; };
   const safeClass = (value) => String(value || 'pending').toLowerCase().replace(/[^a-z0-9_-]/g, '');
   const toast = (message, isError = false) => { const el = $('#toast'); el.textContent = message; el.style.background = isError ? '#9c4035' : ''; el.classList.add('show'); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove('show'), 4200); };
-  const api = async (path, options = {}) => { let res; try { res = await fetch(path, { headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }, ...options }); } catch (_) { throw new Error('无法连接本地服务。请确认启动器仍在运行，然后刷新页面。'); } let data = null; try { data = await res.json(); } catch (_) {} if (!res.ok) throw new Error((data && (data.error || data.message || data.detail)) || `请求失败（${res.status}）`); return data; };
+  const api = async (path, options = {}) => { let res; try { res = await fetch(path, { headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }, ...options }); } catch (_) { throw new Error('无法连接本地服务。请确认启动器仍在运行，然后刷新页面。'); } let data = null; try { data = await res.json(); } catch (_) {} if (!res.ok) { if (res.status === 404 && data?.error === '接口不存在') throw new Error('本地后台仍是旧版进程。请关闭后台后重新打开应用。'); throw new Error((data && (data.error || data.message || data.detail)) || `请求失败（${res.status}）`); } return data; };
   const setServer = (online, message) => { const el = $('#server-state'); el.className = `server-state ${online ? 'online' : 'error'}`; el.lastChild.textContent = ` ${message}`; };
   const connectedLabel = () => `本地服务已连接${state.serverVersion ? ` · V${state.serverVersion}` : ''}`;
   const currentView = () => location.hash.slice(1) || 'assets';
-  const showView = () => { const view = currentView(); $$('.view').forEach(el => el.hidden = el.id !== view); $$('.nav a').forEach(el => el.classList.toggle('active', el.dataset.view === view)); if (view === 'tasks') refreshBatches(); else stopPolling(); };
+  const showView = () => { hideFrameOverlay(); const view = currentView(); $$('.view').forEach(el => el.hidden = el.id !== view); $$('.nav a').forEach(el => el.classList.toggle('active', el.dataset.view === view)); if (view === 'tasks') refreshBatches(); else stopPolling(); };
   const stopPolling = () => { if (state.poller) clearInterval(state.poller); state.poller = null; };
   const setupPolling = () => { stopPolling(); state.poller = setInterval(() => { if (currentView() === 'tasks') refreshBatches(true); }, 3000); };
   const renderErrors = (errors = []) => { const box = $('#scan-errors'); box.replaceChildren(); if (!errors.length) { box.hidden = true; return; } errors.forEach(error => { const line = document.createElement('div'); line.textContent = typeof error === 'string' ? error : (error.message || JSON.stringify(error)); box.append(line); }); box.hidden = false; };
@@ -25,25 +32,142 @@
   const clearScannedLibrary = (kind) => { state.dirtyLibrary.add(kind); state.scan[kind === 'video' ? 'videos' : 'music'] = []; renderAssets(); $('#scan-progress').textContent = `${kind === 'video' ? '视频' : '音乐'}路径已更改，请刷新该素材库。`; $('#plan-btn').disabled = true; };
   const persistPreference = async (key, value) => { if (!value) return; try { await api('/api/preferences', { method: 'POST', body: JSON.stringify({ [key]: value }) }); } catch (error) { toast(`保存目录失败：${error.message}`, true); } };
   const syncReviewDir = (value) => { $('#review-dir').value = value; $('#task-review-dir').value = value; };
+  const rejectItem = async (batch, item, button) => {
+    if (!confirm('审核不通过将删除这条成片和它用到的视频原素材，同时清理缩略图与剪辑缓存。音乐文件保留。确认不通过吗？')) return;
+    button.disabled = true;
+    button.textContent = '正在删除视频';
+    try {
+      const result = await api('/api/reject', {method:'POST', body:JSON.stringify({batch_id:batch.id, item_id:item.id, confirmation:'REJECT_VIDEO_AND_SOURCES'})});
+      toast(result.ok ? '审核不通过：成片与原视频已删除，音乐保留。' : `部分文件清理失败：${(result.errors || []).join('；')}`, !result.ok);
+      await refreshBatches();
+    } catch(error) { button.disabled=false; button.textContent='审核不通过'; toast(error.message,true); }
+  };
   const approveItem = async (batchId, itemId, button) => { const review_dir = $('#task-review-dir').value.trim() || $('#review-dir').value.trim(); if (!review_dir) { toast('请先选择审核通过文件夹。', true); return; } button.disabled = true; button.textContent = '正在归档'; try { await api('/api/approve', { method: 'POST', body: JSON.stringify({ batch_id: batchId, item_id: itemId, review_dir }) }); toast('已复制到审核通过文件夹。'); await refreshBatches(); } catch (error) { button.disabled = false; button.textContent = '通过审核'; const line = document.createElement('div'); line.className = 'error'; line.textContent = `归档失败：${error.message}`; button.parentElement?.append(line); toast(error.message, true); } };
+  const reviewCandidates = batch => (batch.items || []).filter(item => item.status === 'success' && (!item.thumbnails || item.thumbnails.status === 'ready') && !['approved','superseded','copying','rejecting','reject_failed','rejected'].includes(item.review?.status)).sort((a,b) => (Number(a.index) || 0) - (Number(b.index) || 0) || String(a.id).localeCompare(String(b.id)));
+  const reviewPolls = new Set();
+  const paintReviewJob = batchId => {
+    const card = $(`.batch[data-batch-id="${batchId}"]`), batch = state.batches.find(entry => entry.id === batchId);
+    if (!card || !batch) return;
+    const job = state.reviewJobs.get(batchId), button = $('.batch-approve-all', card);
+    if (button) button.disabled = job?.status === 'running' || !reviewCandidates(batch).length;
+    const note = $('.batch-review-state', card);
+    if (!note) return;
+    note.textContent = job?.status === 'running' ? `审核中 ${job.completed}/${job.total}，当前任务 ${job.current_item || '准备中'}` : job?.status === 'failed' ? `审核停在任务 ${job.failed_item}：${job.error}。修复后可再次点击。` : '';
+    note.className = `batch-review-state ${job?.status === 'failed' ? 'error' : 'field-help'}`;
+  };
+  const watchBatchReview = async batchId => {
+    if (reviewPolls.has(batchId)) return;
+    reviewPolls.add(batchId);
+    try {
+      while (true) {
+        const job = await api(`/api/batches/${encodeURIComponent(batchId)}/approve-all`);
+        state.reviewJobs.set(batchId, job);
+        state.batchSignature = '';
+        await refreshBatches();
+        paintReviewJob(batchId);
+        if (job.status !== 'running') {
+          toast(job.status === 'completed' ? `批次审核完成：${job.completed}/${job.total} 条` : `批次审核停在任务 ${job.failed_item || '未知'}：${job.error || '未知错误'}`, job.status !== 'completed');
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2500));
+      }
+    } catch (error) { toast(`无法获取批次审核状态：${error.message}`, true); }
+    finally { reviewPolls.delete(batchId); }
+  };
+  const approveBatch = async batch => {
+    const review_dir = $('#task-review-dir').value.trim() || $('#review-dir').value.trim();
+    if (!review_dir) return toast('请先选择审核通过文件夹。', true);
+    const card = $(`.batch[data-batch-id="${batch.id}"]`);
+    if ($$('.sticker-variant', card).some(select => select.value)) return toast('本批次已选择贴图模板，请先处理贴图任务。', true);
+    const candidates = reviewCandidates(batch);
+    if (!candidates.length) return toast('此批次没有可审核的已完成任务。', true);
+    const skipped = (batch.items || []).length - candidates.length;
+    if (!confirm(`将按任务序号依次审核 ${candidates.length} 条已完成视频${skipped ? `，跳过 ${skipped} 条未完成或已审核任务` : ''}。每条归档成功后会按现有规则清理制作目录成片及可安全删除的原素材；遇到错误即停止。确定继续吗？`)) return;
+    try {
+      const job = await api(`/api/batches/${encodeURIComponent(batch.id)}/approve-all`, {method:'POST', body:JSON.stringify({review_dir, item_ids:candidates.map(item => String(item.id))})});
+      state.reviewJobs.set(batch.id, job);
+      state.batchSignature = '';
+      await refreshBatches();
+      watchBatchReview(batch.id);
+    } catch (error) { toast(error.message, true); }
+  };
+  let globalReviewPolling = false;
+  const watchAllReview = async () => {
+    if (globalReviewPolling) return;
+    globalReviewPolling = true;
+    const button = $('#approve-all-visible');
+    try {
+      while (true) {
+        const job = await api('/api/tasks/approve-all');
+        if (job.status === 'idle') break;
+        button.disabled = job.status === 'running';
+        button.textContent = job.status === 'running' ? `审核中 ${job.completed}/${job.total}` : '一键审核';
+        await refreshBatches();
+        if (job.status !== 'running') {
+          toast(job.status === 'completed' ? `已审核 ${job.completed} 条任务。` : `审核停在任务 ${job.failed_item || '未知'}：${job.error || '未知错误'}`, job.status !== 'completed');
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 2500));
+      }
+    } catch (error) { toast(`无法获取审核状态：${error.message}`, true); }
+    finally { button.disabled = false; button.textContent = '一键审核'; globalReviewPolling = false; }
+  };
+  const approveAllVisible = async () => {
+    const review_dir = $('#task-review-dir').value.trim() || $('#review-dir').value.trim();
+    if (!review_dir) return toast('请先选择审核通过文件夹。', true);
+    if ($$('.sticker-variant').some(select => select.value)) return toast('有任务选了贴图模板，请先生成对应的贴图版本。', true);
+    const count = state.batches.reduce((total,batch) => total + reviewCandidates(batch).length, 0);
+    if (!count) return toast('没有待审核的已完成任务。');
+    if (!confirm(`将依次审核 ${count} 条已完成任务；审核成功的任务会从列表移除。确定继续吗？`)) return;
+    try { await api('/api/tasks/approve-all', {method:'POST', body:JSON.stringify({review_dir})}); watchAllReview(); }
+    catch (error) { toast(error.message, true); }
+  };
   const pickFolder = async (kind) => { const input = kind === 'review' ? $('#review-dir') : $(`#${kind}-dir`); if (!input) return; const buttons = $$('.folder-picker'); buttons.forEach(button => button.disabled = true); try { const data = await api('/api/pick-folder', { method: 'POST', body: JSON.stringify({ kind, current_path: input.value.trim() }) }); if (data.cancelled || !data.path) return; const changed = input.value.trim() !== data.path; input.value = data.path; if (kind === 'review') syncReviewDir(data.path); if ((kind === 'video' || kind === 'music') && changed) clearScannedLibrary(kind); if (kind === 'output' || kind === 'review') toast('已保存目录。'); } catch (error) { toast(error.message, true); } finally { buttons.forEach(button => button.disabled = false); } };
   const frameTime = (value) => { const seconds = Math.max(0, Number(value) || 0), minutes = Math.floor(seconds / 60), remainder = seconds % 60; return `${String(minutes).padStart(2, '0')}:${remainder.toFixed(3).padStart(6, '0')}`; };
   const frameUrl = (batch, item, index, size, version) => `/api/keyframe?batch=${encodeURIComponent(batch)}&item=${encodeURIComponent(item)}&index=${encodeURIComponent(index)}&size=${size}&v=${encodeURIComponent(version || '')}`;
-  const batchesSignature = (batches) => JSON.stringify((batches || []).map(batch => [batch.id, batch.updated_at, batch.status, batch.output_folder, ...(batch.items || []).map(item => [item.id, item.status, item.progress, item.result?.output_size, item.result?.output_mtime_ns, item.review?.status, item.review?.path, item.review?.error, item.review?.approved_at, item.error]) ]));
-  const batchesLayoutSignature = (batches) => JSON.stringify((batches || []).map(batch => [batch.id, batch.status, batch.error, batch.recovery_note, batch.folder_name, batch.output_folder, (batch.items || []).map(item => [item.id, item.index, item.kind, item.status, item.error, item.output_name, item.duration, item.result, item.review, item.cleanup])]));
+  const batchesSignature = (batches) => JSON.stringify((batches || []).map(batch => [batch.id, batch.updated_at, batch.status, batch.output_folder, ...(batch.items || []).map(item => [item.id, item.status, item.progress, item.result?.output_size, item.result?.output_mtime_ns, item.review?.status, item.review?.path, item.review?.error, item.review?.approved_at, item.error, item.thumbnails, item.render_stage, item.music_detection]) ]));
+  const batchesLayoutSignature = (batches) => JSON.stringify((batches || []).map(batch => [batch.id, batch.status, batch.error, batch.recovery_note, batch.folder_name, batch.output_folder, (batch.items || []).map(item => [item.id, item.index, item.kind, item.status, item.error, item.output_name, item.duration, item.result, item.review, item.cleanup, item.thumbnails])]));
   const taskScrollAnchor = () => { const rows = $$('.task-item[data-task-key]'); const row = rows.find(node => { const rect = node.getBoundingClientRect(); return rect.bottom > 100 && rect.top < innerHeight; }); return { key: row?.dataset.taskKey, top: row?.getBoundingClientRect().top, y: window.scrollY }; };
   const restoreTaskScroll = anchor => { if (!anchor || currentView() !== 'tasks') return; const row = $$('.task-item[data-task-key]').find(node => node.dataset.taskKey === anchor.key); if (row) window.scrollBy(0, row.getBoundingClientRect().top - anchor.top); else window.scrollTo(0, anchor.y); };
-  const updateTaskProgress = batches => { const rows = new Map($$('.task-item[data-task-key]').map(row => [row.dataset.taskKey, row])); batches.forEach(batch => (batch.items || []).forEach(item => { const label = rows.get(taskKey(batch.id, item.id))?.querySelector('.task-label'); if (!label) return; const pct = Number.isFinite(Number(item.progress)) ? ` · ${Math.round(Number(item.progress) * 100)}%` : ''; const next = `${item.output_name ? item.output_name + ' · ' : ''}${fmt(item.duration)}${pct}`; if (label.firstChild?.nodeType === Node.TEXT_NODE) label.firstChild.nodeValue = next; else label.textContent = next; })); };
+  const renderStep = item => ({video_segments:'正在分段渲染（完成片段可恢复）',video_recovery:'正在补救或替换损坏素材',assembling:'正在合成成片'})[item.render_stage] || '';
+  const updateTaskProgress = batches => { const rows = new Map($$('.task-item[data-task-key]').map(row => [row.dataset.taskKey, row])); batches.forEach(batch => (batch.items || []).forEach(item => { const label = rows.get(taskKey(batch.id, item.id))?.querySelector('.task-label'); if (!label) return; const pct = Number.isFinite(Number(item.progress)) ? ` · ${Math.round(Number(item.progress) * 100)}%` : ''; const next = `${item.output_name ? item.output_name + ' · ' : ''}${fmt(item.duration)}${pct}${item.status === 'running' && renderStep(item) ? ' · ' + renderStep(item) : ''}${item.status === 'running' && item.render_stage === 'silence_detection' ? ` · 正在进行音乐静音检测（${item.music_detection?.done || 0}/${item.music_detection?.total || 0} 首）` : ''}`; if (label.firstChild?.nodeType === Node.TEXT_NODE) label.firstChild.nodeValue = next; else label.textContent = next; })); };
   const hideFrameOverlay = () => { const overlay = $('#keyframe-overlay'); if (overlay) overlay.remove(); };
+  const setTaskExpanded = (row, expanded) => {
+    const key = row.dataset.taskKey;
+    row.classList.toggle('expanded', expanded);
+    if (expanded) {
+      expandedTasks.add(key);
+      const gallery = $('.keyframe-gallery', row);
+      if (gallery) loadGallery(gallery);
+    } else {
+      expandedTasks.delete(key);
+      $$('video', row).forEach(video => video.pause());
+      hideFrameOverlay();
+    }
+    const details = $('.task-details-toggle', row);
+    if (details) details.textContent = expanded ? '收起详情' : '查看与审核';
+  };
   const showFrameOverlay = (event, frame) => { hideFrameOverlay(); const overlay = document.createElement('div'); overlay.id = 'keyframe-overlay'; overlay.className = 'keyframe-overlay'; const image = document.createElement('img'); image.alt = `关键帧大图 ${frame.label}`; image.src = frame.large; const caption = document.createElement('span'); caption.textContent = `关键帧 · ${frame.label}`; overlay.append(image, caption); document.body.append(overlay); const x = Math.min((event.clientX || frame.button.getBoundingClientRect().right) + 14, innerWidth - overlay.offsetWidth - 10), y = Math.min((event.clientY || frame.button.getBoundingClientRect().bottom) + 14, innerHeight - overlay.offsetHeight - 10); overlay.style.left = `${Math.max(10, x)}px`; overlay.style.top = `${Math.max(10, y)}px`; };
   const addFrameButtons = (gallery, frames, start) => { const grid = $('.keyframe-grid', gallery), batch = gallery.dataset.batch, item = gallery.dataset.item, version = gallery.dataset.version; frames.slice(start).forEach(frame => { const button = document.createElement('button'); button.type = 'button'; button.className = 'keyframe'; const label = frameTime(frame.time); button.setAttribute('aria-label', `跳转到关键帧 ${label}`); const image = document.createElement('img'); image.loading = 'lazy'; image.alt = `关键帧 ${label}`; image.src = frameUrl(batch, item, frame.index, 'thumb', version); const time = document.createElement('time'); time.textContent = label; button.append(image, time); const descriptor = { button, label, large: frameUrl(batch, item, frame.index, 'large', version) }; button.addEventListener('pointerenter', event => showFrameOverlay(event, descriptor)); button.addEventListener('focus', event => showFrameOverlay(event, descriptor)); button.addEventListener('pointerleave', hideFrameOverlay); button.addEventListener('blur', hideFrameOverlay); button.addEventListener('click', () => { const video = gallery.closest('.task-item')?.querySelector('video'); if (video) seekFrame(video, frame.time); }); grid.append(button); }); };
   const seekFrame = (video, value) => { if (!video) return; const target = Number(value) || 0; if (video.readyState >= 1) { const paused = video.paused; video.currentTime = target; if (paused) video.pause(); return; } video.dataset.pendingSeek = String(target); video.preload = 'auto'; if (!video.dataset.waitingMetadata) { video.dataset.waitingMetadata = 'true'; video.addEventListener('loadedmetadata', () => { const latest = Number(video.dataset.pendingSeek); delete video.dataset.waitingMetadata; delete video.dataset.pendingSeek; if (Number.isFinite(latest)) { const paused = video.paused; video.currentTime = latest; if (paused) video.pause(); } }, { once: true }); } video.load(); };
   const renderGalleryFrames = (gallery, frames) => { hideFrameOverlay(); const grid = $('.keyframe-grid', gallery); grid.replaceChildren(); $('h5', gallery).textContent = `每30秒一张 · 共 ${frames.length} 张`; addFrameButtons(gallery, frames, 0); $('.keyframe-more', gallery)?.remove(); };
-  const loadGallery = async (gallery) => { if (gallery.dataset.loaded) return; gallery.dataset.loaded = 'loading'; try { const data = await api(`/api/keyframes?batch=${encodeURIComponent(gallery.dataset.batch)}&item=${encodeURIComponent(gallery.dataset.item)}`); const frames = data.frames || []; gallery.dataset.loaded = 'true'; gallery.dataset.version = data.version || ''; renderGalleryFrames(gallery, frames, false); } catch (error) { gallery.dataset.loaded = ''; const heading = $('h5', gallery); heading.textContent = `关键帧暂不可用：${error.message}`; const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'button keyframe-more'; retry.textContent = '重试加载关键帧'; retry.addEventListener('click', () => { retry.remove(); loadGallery(gallery); }); gallery.append(retry); } };
-  const observeGallery = (gallery) => { if (!state.keyframeObserver) state.keyframeObserver = new IntersectionObserver(entries => entries.forEach(entry => { if (entry.isIntersecting) { state.keyframeObserver.unobserve(entry.target); loadGallery(entry.target); } }), { rootMargin: '180px 0px' }); state.keyframeObserver.observe(gallery); };
+  const loadGallery = async (gallery) => { if (gallery.dataset.loaded === 'true' || gallery.dataset.loaded === 'loading') return; gallery.dataset.loaded = 'loading'; const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),30000); try { const data = await api(`/api/keyframes?batch=${encodeURIComponent(gallery.dataset.batch)}&item=${encodeURIComponent(gallery.dataset.item)}`,{signal:controller.signal}); const frames = data.frames || []; gallery.dataset.loaded = 'true'; gallery.dataset.version = data.version || ''; renderGalleryFrames(gallery, frames, false); } catch (error) { gallery.dataset.loaded = ''; const heading = $('h5', gallery); heading.textContent = `关键帧暂不可用：${error.message}`; const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'button keyframe-more'; retry.textContent = '重试加载关键帧'; retry.addEventListener('click', () => { retry.remove(); loadGallery(gallery); }); gallery.append(retry); } finally { clearTimeout(timer); } };
   document.addEventListener('keydown', event => { if (event.key === 'Escape') hideFrameOverlay(); });
   const captureCompletedMedia = () => $$('video[data-media-key]').forEach(video => { const gallery = video.parentElement?.querySelector('.keyframe-gallery'); if (gallery) state.mediaCache.set(video.dataset.mediaKey, { video, gallery, fingerprint: video.dataset.fingerprint || '' }); });
-  const hydrateGalleries = () => { $$('video[src*="/api/output?"]').forEach(video => { const url = new URL(video.src, location.href), batch = url.searchParams.get('batch'), item = url.searchParams.get('item'); if (!batch || !item) return; const record = (state.batches.find(entry => String(entry.id) === batch)?.items || []).find(entry => String(entry.id) === item) || {}; const key = `${batch}:${item}`, fingerprint = `${record.result?.output_size || ''}:${record.result?.output_mtime_ns || ''}`; const cached = state.mediaCache.get(key); if (cached && cached.fingerprint === fingerprint) { video.replaceWith(cached.video); cached.gallery.remove(); cached.video.parentElement?.append(cached.gallery); return; } video.dataset.mediaKey = key; video.dataset.fingerprint = fingerprint; if (video.parentElement?.querySelector('.keyframe-gallery')) return; const gallery = document.createElement('section'); gallery.className = 'keyframe-gallery'; gallery.dataset.batch = batch; gallery.dataset.item = item; gallery.dataset.fingerprint = fingerprint; const heading = document.createElement('h5'); heading.textContent = '关键帧 · 即将按需加载'; const grid = document.createElement('div'); grid.className = 'keyframe-grid'; gallery.append(heading, grid); video.parentElement?.append(gallery); observeGallery(gallery); }); };
+  const prepareTaskListRender = batches => {
+    captureCompletedMedia();
+    hideFrameOverlay();
+    const live = new Map(batches.flatMap(batch => (batch.items || []).map(item => [taskKey(batch.id,item.id),item])));
+    for (const [key,media] of state.mediaCache) {
+      const item=live.get(key);
+      if (!item || item.cleanup?.output_deleted || item.status !== 'success' || (item.thumbnails && item.thumbnails.status !== 'ready')) {
+        media.video.pause();
+        state.mediaCache.delete(key);
+      }
+    }
+    for (const key of expandedTasks) if (!live.has(key)) expandedTasks.delete(key);
+  };
+  const hydrateGalleries = () => { $$('video[src*="/api/output?"]').forEach(video => { const url = new URL(video.src, location.href), batch = url.searchParams.get('batch'), item = url.searchParams.get('item'); if (!batch || !item) return; const record = (state.batches.find(entry => String(entry.id) === batch)?.items || []).find(entry => String(entry.id) === item) || {}; if (record.thumbnails && record.thumbnails.status !== 'ready') return; const key = `${batch}:${item}`, fingerprint = `${record.result?.output_size || ''}:${record.result?.output_mtime_ns || ''}:${record.thumbnails?.version || ''}`; const cached = state.mediaCache.get(key); if (cached && cached.fingerprint === fingerprint) { video.replaceWith(cached.video); cached.gallery.remove(); cached.video.parentElement?.append(cached.gallery); if (cached.video.parentElement?.classList.contains('expanded')) loadGallery(cached.gallery); return; } if (cached) { cached.video.pause(); state.mediaCache.delete(key); } video.dataset.mediaKey = key; video.dataset.fingerprint = fingerprint; if (video.parentElement?.querySelector('.keyframe-gallery')) return; const gallery = document.createElement('section'); gallery.className = 'keyframe-gallery'; gallery.dataset.batch = batch; gallery.dataset.item = item; gallery.dataset.fingerprint = fingerprint; const heading = document.createElement('h5'); heading.textContent = '缩略图已准备好，展开后显示'; const grid = document.createElement('div'); grid.className = 'keyframe-grid'; gallery.append(heading, grid); video.parentElement?.append(gallery); if (video.parentElement?.classList.contains('expanded')) loadGallery(gallery); }); };
   function renderAssets() {
     const videos = state.scan.videos || [], music = state.scan.music || [];
     $('#video-count').textContent = `${videos.length} 条`; $('#music-count').textContent = `${music.length} 首`;
@@ -56,16 +180,13 @@
     renderPickers();
   }
   function renderPickers() {
-    const videoBox = $('#video-picker'), musicBox = $('#music-picker'); videoBox.replaceChildren(); musicBox.replaceChildren();
-    const selectedVideo = new Set($$('.video-card .asset-select:checked').map(el => el.dataset.id)); const selectedMusic = new Set($$('.music-card .asset-select:checked').map(el => el.dataset.id)); const groups = new Map($$('.group-input').map(el => [el.dataset.id, el.value]));
-    (state.scan.videos || []).forEach(asset => { const row = document.createElement('label'); row.className = 'pick-row'; const input = document.createElement('input'); input.type = 'checkbox'; input.checked = selectedVideo.has(asset.id); input.dataset.id = asset.id; input.addEventListener('change', syncAssetChoices); const name = document.createElement('span'); name.textContent = asset.name || asset.path; const group = document.createElement('span'); group.className = 'duration'; group.textContent = groups.get(asset.id) ? `组：${groups.get(asset.id)}` : fmt(asset.duration); row.append(input, name, group); videoBox.append(row); });
-    (state.scan.music || []).forEach(asset => { const row = document.createElement('label'); row.className = 'pick-row'; const input = document.createElement('input'); input.type = 'checkbox'; input.checked = selectedMusic.has(asset.id); input.dataset.id = asset.id; input.addEventListener('change', syncAssetChoices); const name = document.createElement('span'); name.textContent = asset.music_style ? `${asset.name || asset.path} · ${asset.music_style}` : (asset.name || asset.path); const duration = document.createElement('span'); duration.className = 'duration'; duration.textContent = fmt(asset.duration); row.append(input, name, duration); musicBox.append(row); });
-    videoBox.classList.toggle('empty', !state.scan.videos?.length); musicBox.classList.toggle('empty', !state.scan.music?.length); if (!state.scan.videos?.length) videoBox.textContent = '请先扫描视频。'; if (!state.scan.music?.length) musicBox.textContent = '请先扫描音乐。';
+    const selectedVideo = $$('.video-card .asset-select:checked').length;
+    const selectedMusic = $$('.music-card .asset-select:checked').length;
+    $('#selection-summary').textContent = `已选 ${selectedVideo}/${state.scan.videos?.length || 0} 条视频、${selectedMusic}/${state.scan.music?.length || 0} 首音乐。需要排除素材或调整视频分组时，到“素材”页展开列表。`;
   }
-  function syncAssetChoices() { const source = this; const selector = source.closest('#video-picker') ? '.video-card' : '.music-card'; const target = $(`${selector} .asset-select[data-id="${CSS.escape(source.dataset.id)}"]`); if (target) target.checked = source.checked; saveAssetPrefs(); renderPickers(); }
   function getConfig() {
     if (state.scanRunning || state.dirtyLibrary.size) throw new Error('请等待素材扫描完成，并刷新已更改路径的素材库。');
-    const form = $('#config-form'), values = Object.fromEntries(new FormData(form)); const num = ['count','min_source_duration_minutes','min_duration','max_duration','min_songs','max_songs','start_gap','segment_min','segment_max','fps','original_volume','music_volume']; num.forEach(key => values[key] = Number(values[key])); [values.width, values.height] = String(values.resolution || '1280x720').split('x').map(Number); delete values.resolution; if (String(values.seed || '').trim()) values.seed = Number(values.seed); else delete values.seed; values.allow_overlap = form.elements.allow_overlap.checked; values.within_group = values.within_group === 'true'; values.output_dir = $('#output-dir').value.trim(); values.video_ids = $$('.video-card .asset-select:checked').map(el => el.dataset.id); values.music_ids = $$('.music-card .asset-select:checked').map(el => el.dataset.id); values.first_song_ids = []; values.groups = Object.fromEntries($$('.group-input').map(el => [el.dataset.id, el.value.trim()]).filter(([, value]) => value));
+    const form = $('#config-form'), values = Object.fromEntries(new FormData(form)); const num = ['parallel_tasks','count','min_source_duration_minutes','min_duration','max_duration','min_songs','max_songs','start_gap','segment_min','segment_max','fps','video_bitrate_mbps','original_volume','music_volume']; num.forEach(key => values[key] = Number(values[key])); [values.width, values.height] = String(values.resolution || '1280x720').split('x').map(Number); delete values.resolution; if (String(values.seed || '').trim()) values.seed = Number(values.seed); else delete values.seed; values.allow_overlap = form.elements.allow_overlap.checked; values.within_group = values.within_group === 'true'; values.output_dir = $('#output-dir').value.trim(); values.video_ids = $$('.video-card .asset-select:checked').map(el => el.dataset.id); values.music_ids = $$('.music-card .asset-select:checked').map(el => el.dataset.id); values.first_song_ids = []; values.groups = Object.fromEntries($$('.group-input').map(el => [el.dataset.id, el.value.trim()]).filter(([, value]) => value));
     values.sticker_template_id = values.sticker_template_id || null; if (!values.video_ids.length) throw new Error('请至少选择一个视频素材。'); if (!values.music_ids.length) throw new Error('请至少选择一首音乐。'); if (!values.output_dir) throw new Error('请在素材页填写导出文件夹。'); if (values.min_duration > values.max_duration) throw new Error('最短时长不能大于最长时长。'); if (values.segment_min > values.segment_max) throw new Error('单段最短时长不能大于最长时长。'); return values;
   }
   function stat(label, value) { const box = document.createElement('div'); box.className = 'stat'; const strong = document.createElement('b'); strong.textContent = value; const span = document.createElement('span'); span.textContent = label; box.append(strong, span); return box; }
@@ -137,11 +258,20 @@
     root.append(track);
   }
   function renderPlan(batch) {
-    state.batch = batch; $('#plan-message').textContent = batch ? `批次 ${batch.folder_name || batch.id} 已生成。仅在核对后开始渲染。${batch.output_folder ? ` 输出目录：${batch.output_folder}` : ''}` : '尚未生成方案。'; $('#start-btn').disabled = !batch || !batch.items?.length || batch.status !== 'draft'; $('#manifest-btn').disabled = !batch; const stats = $('#plan-stats'), warnings = $('#plan-warnings'), list = $('#plan-items'); stats.replaceChildren(); warnings.replaceChildren(); list.replaceChildren(); if (!batch) return;
+    state.batch = batch; $('#plan-message').textContent = batch ? `当前方案共 ${batch.items?.length || 0} 条任务。核对后开始渲染。${batch.output_folder ? ` 输出目录：${batch.output_folder}` : ''}` : '尚未生成方案。'; $('#start-btn').disabled = !batch || !batch.items?.length || batch.status !== 'draft'; $('#manifest-btn').disabled = !batch; const stats = $('#plan-stats'), warnings = $('#plan-warnings'), list = $('#plan-items'); stats.replaceChildren(); warnings.replaceChildren(); list.replaceChildren(); if (!batch) { updateSelectionButtons(); return; }
     if(batch.config?.sticker_layers?.length){const note=document.createElement('div');note.textContent=`贴图模板：${batch.config.sticker_template?.name || '已保存模板'} · ${batch.config.sticker_layers.length}层（位置、大小和出现时间已固定到本批次）`;warnings.append(note);}
-    const s = batch.stats || {}; const statLabels = { max_overlap_ratio: '最高两两重合', source_usage: '素材使用', video_usage: '视频素材使用', music_usage: '音乐素材使用', unique_music_orders: '不同歌曲顺序', unique_video_plans: '不同视频方案', estimated_output_bytes: '预计输出大小', total_duration: '总成片时长' }; const names = new Map([...state.scan.videos || [], ...state.scan.music || []].map(asset => [asset.id, asset.name || asset.path || asset.id])); const usage = value => Object.entries(value || {}).slice(0, 3).map(([id, count]) => `${names.get(id) || String(id).slice(0, 10)} ×${count}`).join('；') || '—'; const formatted = (key, value) => key === 'max_overlap_ratio' && Number.isFinite(Number(value)) ? `${Math.round(Number(value) * 100)}%` : key === 'estimated_output_bytes' && Number.isFinite(Number(value)) ? `${(Number(value) / 1024 ** 3).toFixed(2)} GB` : key === 'total_duration' && Number.isFinite(Number(value)) ? fmt(value) : (key.includes('usage') && typeof value === 'object' ? usage(value) : (typeof value === 'object' ? JSON.stringify(value) : String(value))); stats.append(stat('计划条数', batch.items?.length ?? 0), stat('目标数量', batch.config?.count ?? '—')); Object.entries(s).filter(([key]) => !['duplicate_count', 'count'].includes(key)).forEach(([key, value]) => stats.append(stat(statLabels[key] || key.replaceAll('_', ' '), formatted(key, value))));
+    const s = batch.stats || {};
+    const numberOrDash = value => Number.isFinite(Number(value)) ? Number(value) : '—';
+    stats.append(stat('当前方案', batch.items?.length ?? 0), stat('原定数量', batch.config?.count ?? '—'), stat('并行剪辑', batch.config?.parallel_tasks || 1));
+    if (s.unique_music_orders !== undefined) stats.append(stat('不同歌曲顺序', numberOrDash(s.unique_music_orders)));
+    if (s.unique_video_plans !== undefined) stats.append(stat('不同视频方案', numberOrDash(s.unique_video_plans)));
+    if (s.segment_overlap_pairs !== undefined) stats.append(stat('片段重合对数', numberOrDash(s.segment_overlap_pairs)));
+    if (Number.isFinite(Number(s.max_overlap_ratio))) stats.append(stat('最高两两重合', `${Math.round(Number(s.max_overlap_ratio) * 100)}%`));
+    if (Number.isFinite(Number(s.estimated_output_bytes))) stats.append(stat('预计输出大小', `${(Number(s.estimated_output_bytes) / 1024 ** 3).toFixed(2)} GB`));
+    if (s.total_duration !== undefined) stats.append(stat('总成片时长', fmt(s.total_duration)));
     (batch.warnings || []).forEach(w => { const line = document.createElement('div'); line.textContent = typeof w === 'string' ? w : (w.message || JSON.stringify(w)); warnings.append(line); });
     const counts = planCounts(batch); (batch.items || []).forEach(item => { const card = document.createElement('article'); card.className = 'plan-item'; const head = document.createElement('div'); head.className = 'item-head'; const title = document.createElement('h3'); title.textContent = item.output_name || `成片 ${item.index ?? '—'}`; const duration = document.createElement('span'); duration.className = 'duration'; duration.textContent = fmt(item.duration); head.append(taskSelection(batch,item), title, duration); const tracks = document.createElement('div'); tracks.className = 'tracks'; appendVideoList(tracks,batch,item,counts); appendMusicOrder(tracks,batch,item,counts); card.append(head, tracks); list.append(card); });
+    updateSelectionButtons();
   }
   const stopScanPolling = () => { if (state.scanPoller) clearTimeout(state.scanPoller); state.scanPoller = null; };
   async function pollScan() { try { applyScanJob(await api('/api/scan/status?compact=1')); } catch (error) { stopScanPolling(); state.scanRunning = false; $('#scan-btn').disabled = false; $('#scan-btn').textContent = '扫描素材'; toast(error.message, true); } }
@@ -195,40 +325,52 @@
     } catch (error) { $('#scan-btn').disabled = false; toast(error.message === '接口不存在' ? '旧版后台仍在运行，请停止后台并重新打开 MixCut Studio。' : error.message, true); }
   }
   async function createPlan() { let config; try { config = getConfig(); } catch (error) { toast(error.message, true); return; } const btn = $('#plan-btn'); btn.disabled = true; btn.textContent = '正在规划…'; try { const data = await api('/api/plan', { method: 'POST', body: JSON.stringify({ config }) }); const planned = data.batch || data; state.batches = [planned, ...state.batches.filter(batch => batch.id !== planned.id)]; renderPlan(planned); location.hash = 'plan'; toast('方案生成完成，请核对每条歌曲与视频区间。'); } catch (error) { renderPlan(null); $('#plan-message').textContent = `无法生成方案：${error.message}`; location.hash = 'plan'; toast(error.message, true); } finally { btn.disabled = false; btn.textContent = '生成方案'; } }
-  async function batchAction(id, action) { try { const data = await api(`/api/batches/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: '{}' }); if (data.batch && state.batch?.id === id) renderPlan(data.batch); toast({start:'已加入渲染队列',pause:'将在当前成片完成后暂停',resume:'已继续队列',stop:'已停止队列',retry:'已安排重试'}[action] || '操作成功'); if (action === 'start') location.hash = 'tasks'; refreshBatches(); } catch (error) { toast(error.message, true); } }
-  async function itemAction(batchId, itemId, action) { try { await api(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}/${action}`, { method:'POST', body:'{}' }); toast({start:'已重新开始该条任务',stop:'已终止该条任务',delete:'已删除该条任务'}[action]); state.batchSignature=''; await refreshBatches(); } catch (error) { toast(error.message,true); } }
+  async function batchAction(id, action) { try { const data = await api(`/api/batches/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: '{}' }); if (action === 'start') renderPlan(null); else if (data.batch && state.batch?.id === id) renderPlan(data.batch); toast({start:'已加入渲染队列',pause:'将在执行中的成片完成后暂停',resume:'已继续队列',stop:'已停止队列',retry:'已安排重试'}[action] || '操作成功'); if (action === 'start') location.hash = 'tasks'; refreshBatches(); } catch (error) { toast(error.message, true); } }
+  async function itemAction(batchId, itemId, action) { try { const result = await api(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}/${action}`, { method:'POST', body:'{}' }); if (action === 'delete' && result.updated_batches) applyDeletedBatches(result.updated_batches); else { state.batchSignature=''; await refreshBatches(); } toast(result.preview_cleanup_errors?.length ? `任务已删除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : {start:'已重新开始该条任务',stop:'已终止该条任务',delete:'已删除任务；成品和素材保留，缩略图已清理'}[action], !!result.preview_cleanup_errors?.length); } catch (error) { toast(error.message,true); } }
   async function allBatches(action) { const candidates=state.batches.filter(batch=>action==='pause'?['queued','running'].includes(batch.status):(action==='stop'?['queued','running','pausing','paused'].includes(batch.status):['paused','stopped','draft'].includes(batch.status))); for(const batch of candidates){const next=action==='pause'?'pause':(action==='stop'?'stop':(batch.status==='paused'?'resume':'start'));try{await api(`/api/batches/${encodeURIComponent(batch.id)}/${next}`,{method:'POST',body:'{}'});}catch(error){toast(`批次 ${batch.id}：${error.message}`,true);}} state.batchSignature='';await refreshBatches(); }
-  function confirmRecordDeletion(items) {
-    const pending = items.filter(item => item.review?.status === 'approved' && item.cleanup?.source_cleanup_requested && !item.cleanup?.original_recordings_deleted).length;
-    if (!confirm(`将删除 ${items.length} 条任务记录，其中 ${pending} 条仍有原片清理待处理。导出视频和审核成片会保留，清理状态会写入删除记录。确定继续吗？`)) return false;
-    return prompt(`请再次确认：输入“删除记录”以清除这 ${items.length} 条任务。`) === '删除记录';
+  function applyDeletedBatches(updatedBatches) {
+    const byId = new Map(state.batches.map(batch => [batch.id, batch]));
+    Object.entries(updatedBatches).forEach(([id, batch]) => { if (batch) byId.set(id, batch); else byId.delete(id); });
+    state.batches = [...byId.values()].sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+    state.batchSignature = batchesSignature(state.batches);
+    state.batchLayoutSignature = batchesLayoutSignature(state.batches);
+    const anchor = currentView() === 'tasks' ? taskScrollAnchor() : null;
+    renderBatches(state.batches);
+    hydrateGalleries();
+    if (anchor) { restoreTaskScroll(anchor); requestAnimationFrame(() => restoreTaskScroll(anchor)); }
+    if (state.batch && Object.prototype.hasOwnProperty.call(updatedBatches, state.batch.id)) {
+      renderPlan(updatedBatches[state.batch.id]);
+    }
+    updateSelectionButtons();
   }
   async function deleteSelectedTasks(scope = 'tasks') {
     const batches = scope === 'plan' ? (state.batch ? [state.batch] : []) : state.batches;
     const selections = batches.map(batch => ({batch_id:batch.id,item_ids:(batch.items || []).filter(item => selectedTasks.has(taskKey(batch.id,item.id))).map(item => item.id)})).filter(entry => entry.item_ids.length);
     const items = batches.flatMap(batch => (batch.items || []).filter(item => selectedTasks.has(taskKey(batch.id,item.id))));
     if (!items.length) return toast('请先勾选任务。',true);
-    if (!confirmRecordDeletion(items)) return;
+    const button = $(scope === 'plan' ? '#delete-selected-plan' : '#delete-selected-tasks');
+    button.disabled = true; button.textContent = '删除中…';
     try {
-      const result = await api('/api/batches/delete-items',{method:'POST',body:JSON.stringify({selections,expected_count:items.length,confirmation:'DELETE_TASK_RECORDS'})});
-      selections.forEach(entry => entry.item_ids.forEach(id => selectedTasks.delete(taskKey(entry.batch_id,id)))); state.batchSignature=''; await refreshBatches();
-      if (state.batch) renderPlan(state.batches.find(batch => batch.id === state.batch.id) || null);
-      toast(`已删除 ${result.deleted_items} 条任务记录；文件已保留。`);
+      const result = await api('/api/tasks/forget',{method:'POST',body:JSON.stringify({selections})});
+      selections.forEach(entry => entry.item_ids.forEach(id => selectedTasks.delete(taskKey(entry.batch_id,id))));
+      if (result.updated_batches) applyDeletedBatches(result.updated_batches);
+      else { state.batchSignature=''; await refreshBatches(); if (state.batch) renderPlan(state.batches.find(batch => batch.id === state.batch.id) || null); }
+      if (scope === 'plan') $('#plan-message').textContent = `已删除 ${result.deleted_items} 条任务记录，当前方案剩余 ${state.batch?.items?.length || 0} 条。成品和素材保留，缩略图已清理。`;
+      toast(result.preview_cleanup_errors?.length ? `任务已删除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : `已删除 ${result.deleted_items} 条任务记录；成品和素材保留，缩略图已清理。`, !!result.preview_cleanup_errors?.length);
     } catch(error) { toast(error.message,true); }
+    finally { button.disabled = false; updateSelectionButtons(); }
   }
   function selectAllTasks(scope) {
     const batches = scope === 'plan' ? (state.batch ? [state.batch] : []) : state.batches;
-    batches.forEach(batch => { if (['queued','running','pausing','stopping'].includes(batch.status)) return; (batch.items || []).forEach(item => { if (!['running','validating'].includes(item.status)) selectedTasks.add(taskKey(batch.id,item.id)); }); });
+    batches.forEach(batch => (batch.items || []).forEach(item => selectedTasks.add(taskKey(batch.id,item.id))));
     if (scope === 'plan') renderPlan(state.batch); else renderBatches(state.batches);
+    updateSelectionButtons();
   }
   async function clearAllBatches() {
-    const items=state.batches.flatMap(batch => batch.items || []);
-    if (!state.batches.length) return toast('当前没有任务记录。');
-    if (!confirmRecordDeletion(items)) return;
     try {
-      const result=await api('/api/batches/clear',{method:'POST',body:JSON.stringify({expected_count:items.length,confirmation:'DELETE_TASK_RECORDS'})});
-      selectedTasks.clear();state.batchSignature='';await refreshBatches();renderPlan(null);
-      toast(`已清除 ${result.deleted_items} 条任务记录；导出与审核文件已保留。`);
+      const result=await api('/api/tasks/clear',{method:'POST',body:'{}'});
+      selectedTasks.clear();applyDeletedBatches(result.updated_batches);renderPlan(null);
+      toast(result.preview_cleanup_errors?.length ? `任务已清除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : `已清除 ${result.deleted_items} 条任务记录；成品和素材保留，缩略图已清理。`, !!result.preview_cleanup_errors?.length);
     } catch(error){toast(error.message,true);}
   }
   async function downloadDeletionRecords() {
@@ -240,10 +382,30 @@
       document.body.append(link); link.click(); link.remove(); setTimeout(()=>URL.revokeObjectURL(url),1000);
     } catch(error) { toast(error.message,true); }
   }
-  function renderBatches(batches) { const box = $('#batches'); box.replaceChildren(); if (!batches.length) { box.className = 'batch-list empty'; box.textContent = '尚无任务。先生成方案并确认开始渲染。'; $('#task-summary').replaceChildren(stat('等待批次', '—')); return; } box.className = 'batch-list'; const items = batches.flatMap(b => b.items || []); const counts = items.reduce((out, item) => { const k = safeClass(item.status); out[k] = (out[k] || 0) + 1; return out; }, {}); const summary = $('#task-summary'); summary.replaceChildren(stat('总条数', items.length), stat('完成', counts.completed || counts.success || 0), stat('处理中', (counts.running || 0) + (counts.processing || 0) + (counts.validating || 0)), stat('失败', counts.failed || counts.error || 0), stat('待处理', counts.pending || 0), stat('已取消', counts.cancelled || 0));
-    const statusLabels = { draft:'草稿', queued:'排队中', running:'渲染中', pausing:'等待当前条完成', paused:'已暂停', stopping:'正在停止', stopped:'已停止', completed:'已完成', failed:'失败', pending:'待处理', success:'已完成', processing:'处理中', error:'失败', cancelled:'已取消' }; batches.forEach(batch => { const card = document.createElement('article'); card.className = 'batch'; card.dataset.batchId = batch.id; const batchStatus = safeClass(batch.status); const head = document.createElement('div'); head.className = 'batch-head'; const title = document.createElement('h3'); title.textContent = `批次 ${batch.id}`; const status = document.createElement('span'); status.className = `status ${batchStatus}`; status.textContent = statusLabels[batchStatus] || batch.status || '未知状态'; head.append(title, status); if(batch.schedule_name){const tag=document.createElement('small');tag.textContent=`定时任务：${batch.schedule_name}`;head.append(tag);} const all = batch.items?.length || 0, done = (batch.items || []).filter(i => ['completed','success'].includes(String(i.status).toLowerCase())).length, failed = (batch.items || []).some(i => ['failed','error'].includes(safeClass(i.status))); const progress = document.createElement('div'); progress.className = 'progress'; const bar = document.createElement('i'); bar.style.width = `${all ? Math.round(done / all * 100) : 0}%`; progress.append(bar); const controls = document.createElement('div'); controls.className = 'batch-controls'; const allowed = { pause:['queued','running'], resume:['paused'], stop:['queued','running','pausing','paused'], retry:['failed','stopped','completed'] }; [['pause','暂停（当前条完成后）'],['resume','继续'],['stop','停止'],['retry','重试失败项']].forEach(([action, label]) => { const button = document.createElement('button'); button.className = 'button'; button.textContent = label; button.disabled = !allowed[action].includes(batchStatus) || (action === 'retry' && !failed); button.onclick = () => batchAction(batch.id, action); controls.append(button); }); const view = document.createElement('button'); view.className = 'button'; view.textContent = '查看方案'; view.onclick = () => { renderPlan(batch); location.hash = 'plan'; }; controls.append(view); const reveal = document.createElement('button'); reveal.className = 'button'; reveal.textContent = '在 Finder 中显示'; reveal.onclick = async () => { try { await api('/api/reveal', { method:'POST', body:JSON.stringify({ batch_id: batch.id }) }); } catch (e) { toast(e.message, true); } }; controls.append(reveal); if (batch.error || batch.recovery_note) { const note = document.createElement('div'); note.className = 'notice'; note.textContent = batch.error || batch.recovery_note; card.append(note); } const taskItems = document.createElement('div'); taskItems.className = 'task-items'; (batch.items || []).forEach(item => { const row = document.createElement('div'); row.className = 'task-item'; row.dataset.taskKey = taskKey(batch.id, item.id); const index = document.createElement('span'); index.textContent = String(item.index ?? '—').padStart(2, '0'); const label = document.createElement('span'); label.className = 'task-label'; const pct = Number.isFinite(Number(item.progress)) ? ` · ${Math.round(Number(item.progress) * 100)}%` : ''; label.textContent = `${item.output_name ? item.output_name + ' · ' : ''}${fmt(item.duration)}${pct}`; const itemStatus = document.createElement('span'); const itemState = safeClass(item.status); itemStatus.className = `status ${itemState}`; itemStatus.textContent = statusLabels[itemState] || item.status || '待处理'; row.append(taskSelection(batch,item),index,label,itemStatus); if (item.error) { const error = document.createElement('div'); error.className = 'error'; error.textContent = item.error; row.append(error); } if (['completed','success'].includes(String(item.status).toLowerCase()) && !item.cleanup?.output_deleted) { const video = document.createElement('video'); video.controls = true; video.preload = 'none'; video.src = `/api/output?batch=${encodeURIComponent(batch.id)}&item=${encodeURIComponent(item.id)}`; row.append(video); } taskItems.append(row); }); card.append(head, progress, controls, taskItems); box.append(card); });
+  function renderBatches(batches) { prepareTaskListRender(batches); const box = $('#batches'); box.replaceChildren(); if (!batches.length) { box.className = 'batch-list empty'; box.textContent = '尚无任务。先生成方案并确认开始渲染。'; $('#task-summary').replaceChildren(stat('等待批次', '—')); return; } box.className = 'batch-list'; const items = batches.flatMap(b => b.items || []); const counts = items.reduce((out, item) => { const k = safeClass(item.status); out[k] = (out[k] || 0) + 1; return out; }, {}); const summary = $('#task-summary'); summary.replaceChildren(stat('总条数', items.length), stat('完成', counts.completed || counts.success || 0), stat('处理中', (counts.running || 0) + (counts.processing || 0) + (counts.validating || 0)), stat('失败', counts.failed || counts.error || 0), stat('待处理', counts.pending || 0), stat('已取消', counts.cancelled || 0));
+    const statusLabels = { draft:'草稿', queued:'排队中', running:'渲染中', pausing:'等待当前条完成', paused:'已暂停', stalled_paused:'执行被卡住暂停', recovery_paused:'素材异常，待继续', stopping:'正在停止', stopped:'已停止', completed:'已完成', failed:'失败', pending:'待处理', success:'已完成', processing:'处理中', error:'失败', cancelled:'已取消' }; batches.forEach(batch => { const card = document.createElement('article'); card.className = 'batch'; card.dataset.batchId = batch.id; const batchStatus = safeClass(batch.status); const head = document.createElement('div'); head.className = 'batch-head'; const title = document.createElement('h3'); title.textContent = `批次 ${batch.id}`; const status = document.createElement('span'); status.className = `status ${batchStatus}`; status.textContent = statusLabels[batchStatus] || batch.status || '未知状态'; head.append(title, status); if(batch.schedule_name){const tag=document.createElement('small');tag.textContent=`定时任务：${batch.schedule_name}`;head.append(tag);} const all = batch.items?.length || 0, done = (batch.items || []).filter(i => ['completed','success'].includes(String(i.status).toLowerCase())).length, failed = (batch.items || []).some(i => ['failed','error'].includes(safeClass(i.status))); const progress = document.createElement('div'); progress.className = 'progress'; const bar = document.createElement('i'); bar.style.width = `${all ? Math.round(done / all * 100) : 0}%`; progress.append(bar); const controls = document.createElement('div'); controls.className = 'batch-controls'; const allowed = { pause:['queued','running'], resume:['paused'], stop:['queued','running','pausing','paused'], retry:['failed','stopped','completed'] }; [['pause','暂停（执行中任务完成后）'],['resume','继续'],['stop','停止'],['retry','重试失败项']].forEach(([action, label]) => { const button = document.createElement('button'); button.className = 'button'; button.textContent = label; button.disabled = !allowed[action].includes(batchStatus) || (action === 'retry' && !failed); button.onclick = () => batchAction(batch.id, action); controls.append(button); }); const view = document.createElement('button'); view.className = 'button'; view.textContent = '查看方案'; view.onclick = () => { renderPlan(batch); location.hash = 'plan'; }; controls.append(view); const reveal = document.createElement('button'); reveal.className = 'button'; reveal.textContent = '在 Finder 中显示'; reveal.onclick = async () => { try { await api('/api/reveal', { method:'POST', body:JSON.stringify({ batch_id: batch.id }) }); } catch (e) { toast(e.message, true); } }; controls.append(reveal);
+    const reviewJob = state.reviewJobs.get(batch.id);
+    const reviewAll = document.createElement('button'); reviewAll.className = 'button primary batch-approve-all'; reviewAll.type = 'button'; reviewAll.textContent = '一键审核'; reviewAll.disabled = reviewJob?.status === 'running' || !reviewCandidates(batch).length; reviewAll.onclick = () => approveBatch(batch); controls.append(reviewAll);
+    const reviewNote = document.createElement('span'); reviewNote.className = `batch-review-state ${reviewJob?.status === 'failed' ? 'error' : 'field-help'}`; reviewNote.textContent = reviewJob?.status === 'running' ? `审核中 ${reviewJob.completed}/${reviewJob.total}，当前任务 ${reviewJob.current_item || '准备中'}` : reviewJob?.status === 'failed' ? `审核停在任务 ${reviewJob.failed_item}：${reviewJob.error}。修复后可再次点击。` : ''; controls.append(reviewNote);
+    if (batch.error || batch.recovery_note) { const note = document.createElement('div'); note.className = 'notice'; note.textContent = batch.error || batch.recovery_note; card.append(note); } const taskItems = document.createElement('div'); taskItems.className = 'task-items'; (batch.items || []).forEach(item => { const row = document.createElement('div'); row.className = 'task-item'; row.dataset.taskKey = taskKey(batch.id, item.id); if (expandedTasks.has(row.dataset.taskKey)) row.classList.add('expanded'); const index = document.createElement('span'); index.textContent = String(item.index ?? '—').padStart(2, '0'); const label = document.createElement('span'); label.className = 'task-label'; const pct = Number.isFinite(Number(item.progress)) ? ` · ${Math.round(Number(item.progress) * 100)}%` : ''; label.textContent = `${item.output_name ? item.output_name + ' · ' : ''}${fmt(item.duration)}${pct}${item.status === 'running' && renderStep(item) ? ' · ' + renderStep(item) : ''}${item.status === 'running' && item.render_stage === 'silence_detection' ? ` · 正在进行音乐静音检测（${item.music_detection?.done || 0}/${item.music_detection?.total || 0} 首）` : ''}`; const itemStatus = document.createElement('span'); const itemState = safeClass(item.status); itemStatus.className = `status ${itemState}`; itemStatus.textContent = itemState === 'success' && item.review?.status !== 'approved' && item.thumbnails ? ({queued:'缩略图排队中',generating:'生成缩略图',ready:'可审核',failed:'缩略图失败'}[item.thumbnails.status] || '已完成') : (statusLabels[itemState] || item.status || '待处理'); row.append(taskSelection(batch,item),index,label,itemStatus); if (item.status === 'success' && item.result?.shortened_seconds > 0.1) { const note = document.createElement('p'); note.className='field-help duration-note'; note.textContent=`实际时长约 ${fmt(item.result.duration)}，比规划短约 ${fmt(item.result.shortened_seconds)}；已按可用视频或有效音乐时长完成成片。`; row.append(note); } if (item.status === 'success' && item.result?.recovery_warnings?.length) { const note=document.createElement('p');note.className='field-help recovery-note';note.textContent='制作中已自动处理异常素材：' + item.result.recovery_warnings.filter(text => text.includes('已自动') || text.includes('缩短')).join('；');row.append(note); } if (item.error) { const error = document.createElement('div'); error.className = 'error'; error.textContent = item.error; row.append(error); } if (['completed','success'].includes(String(item.status).toLowerCase()) && !item.cleanup?.output_deleted) { const video = document.createElement('video'); video.controls = true; video.preload = 'none'; video.src = `/api/output?batch=${encodeURIComponent(batch.id)}&item=${encodeURIComponent(item.id)}`; row.append(video); } taskItems.append(row); }); card.append(head, progress, controls, taskItems); box.append(card); });
+    hydrateGalleries();
+  }
+  async function refreshCache() {
+    try { const data = await api('/api/cache'); $('#cache-usage').textContent = `剪辑缓存：${(data.bytes / 1024 ** 3).toFixed(2)} GB · ${data.files} 个文件`; }
+    catch (error) { $('#cache-usage').textContent = `缓存读取失败：${error.message}`; }
+  }
+  async function clearCache() {
+    const button = $('#clear-cache'); button.disabled = true;
+    try { const data = await api('/api/cache/clear', {method:'POST',body:'{}'}); await refreshCache(); toast(data.errors.length ? `部分缓存未能删除：${data.errors[0]}` : data.active_tasks ? '已清除空闲缓存，正在使用的缓存暂时保留。' : '剪辑缓存已清除。', !!data.errors.length); }
+    catch (error) { toast(error.message,true); } finally { button.disabled = false; }
+  }
+  async function retryFailed() {
+    const button = $('#retry-failed'); button.disabled = true;
+    try { const data = await api('/api/tasks/retry-failed', {method:'POST',body:'{}'}); await refreshBatches(); toast(`已安排 ${data.retried} 条失败任务重试。${data.errors.join('；')}`, !!data.errors.length); }
+    catch (error) { toast(error.message,true); } finally { button.disabled = false; }
   }
   async function refreshBatches(silent = false) {
+    if (!silent) refreshCache();
     if (silent && $$('video').some(video => !video.paused && !video.ended)) return;
     let data;
     try { data = await api('/api/batches'); }
@@ -255,23 +417,21 @@
     const layoutSignature = batchesLayoutSignature(batches);
     const sameLayout = layoutSignature === state.batchLayoutSignature;
     const anchor = sameLayout ? null : taskScrollAnchor();
-    if (!sameLayout) captureCompletedMedia();
     state.batches = batches; state.batchSignature = signature; state.batchLayoutSignature = layoutSignature;
     if (sameLayout) updateTaskProgress(batches);
     else { renderBatches(batches); hydrateGalleries(); restoreTaskScroll(anchor); requestAnimationFrame(() => restoreTaskScroll(anchor)); }
     if (!state.poller) setupPolling();
   }
-  async function bootstrap() { try { const data = await api('/api/bootstrap'); if (data.api_protocol !== 3) throw new Error(`本地后台接口版本不兼容（当前 ${data.api_protocol ?? '未知'}，需要 3）。请先停止旧版后台再重新打开 MixCut Studio。`); state.serverVersion = data.version || ''; $('#video-dir').value = data.video_dir || ''; $('#music-dir').value = data.music_dir || ''; state.libraryDirs = {video: data.video_dir || '', music: data.music_dir || ''}; $('#output-dir').value = data.output_dir || ''; syncReviewDir(data.review_dir || ''); state.scan = data.scan || state.scan; state.batches = data.batches || []; state.batchSignature = batchesSignature(state.batches); state.batchLayoutSignature = batchesLayoutSignature(state.batches); renderAssets(); updateStickerSelectors(); renderErrors(state.scan.errors || []); renderBatches(state.batches); hydrateGalleries(); const draft = state.batches.find(batch => batch.status === 'draft'); if (draft) renderPlan(draft); if (data.scan_job && ['discovering','analyzing'].includes(data.scan_job.status)) applyScanJob(data.scan_job); setServer(true, data.ffmpeg_available === false ? `${connectedLabel()} · 未找到 FFmpeg` : connectedLabel()); document.dispatchEvent(new Event('mixcut-bootstrap')); } catch (error) { setServer(false, error.message); renderErrors([error.message]); } }
-  document.addEventListener('DOMContentLoaded', () => { window.addEventListener('hashchange', showView); $('#scan-btn').addEventListener('click', scan); $('#plan-btn').addEventListener('click', createPlan); $('#start-btn').addEventListener('click', () => state.batch && batchAction(state.batch.id, 'start')); $('#manifest-btn').addEventListener('click', () => { if (state.batch) window.open(`/api/manifest?batch=${encodeURIComponent(state.batch.id)}`, '_blank', 'noopener'); }); $('#refresh-tasks').addEventListener('click', () => refreshBatches()); $('#pause-all').addEventListener('click',()=>allBatches('pause')); $('#start-all').addEventListener('click',()=>allBatches('start')); $('#clear-all').addEventListener('click',clearAllBatches); $('#download-deletion-records').addEventListener('click',downloadDeletionRecords); $('#select-all-plan').addEventListener('click',()=>selectAllTasks('plan')); $('#delete-selected-plan').addEventListener('click',()=>deleteSelectedTasks('plan')); $('#select-all-tasks').addEventListener('click',()=>selectAllTasks('tasks')); $('#delete-selected-tasks').addEventListener('click',()=>deleteSelectedTasks('tasks')); $('#shutdown-btn').addEventListener('click', async () => { if (!confirm('确定停止本地后台服务吗？正在处理的任务会停止。')) return; try { await api('/api/shutdown', { method:'POST', body:'{}' }); } catch (error) { toast(error.message, true); return; } stopPolling(); setServer(false, '本地服务已停止'); toast('已请求停止后台服务。'); }); $('#config-form').addEventListener('change', event => { if (event.target.name === 'mode') { $$('.mode-multi').forEach(el => el.hidden = event.target.value !== 'multi'); $$('.mode-single').forEach(el => el.hidden = event.target.value !== 'single'); } if (event.target.name === 'music_mode') $$('.pool-settings').forEach(el => el.hidden = event.target.value !== 'pool'); }); $('#video-assets').addEventListener('change', event => { if (event.target.matches('.asset-select,.group-input')) { saveAssetPrefs(); renderPickers(); } }); $('#music-assets').addEventListener('change', event => { if (event.target.matches('.asset-select')) { saveAssetPrefs(); renderPickers(); } }); bootstrap().then(showView); });
+  async function bootstrap() { try { const data = await api('/api/bootstrap'); if (data.api_protocol !== 10) throw new Error(`本地后台接口版本不兼容（当前 ${data.api_protocol ?? '未知'}，需要 10）。请先停止旧版后台再重新打开 MixCut Studio。`); state.serverVersion = data.version || ''; $('#video-dir').value = data.video_dir || ''; $('#music-dir').value = data.music_dir || ''; state.libraryDirs = {video: data.video_dir || '', music: data.music_dir || ''}; $('#output-dir').value = data.output_dir || ''; syncReviewDir(data.review_dir || ''); state.scan = data.scan || state.scan; state.batches = data.batches || []; state.reviewJobs = new Map(Object.entries(data.review_jobs || {})); state.batchSignature = batchesSignature(state.batches); state.batchLayoutSignature = batchesLayoutSignature(state.batches); renderAssets(); updateStickerSelectors(); renderErrors(state.scan.errors || []); renderBatches(state.batches); refreshCache(); hydrateGalleries(); const draft = state.batches.find(batch => batch.status === 'draft'); if (draft) renderPlan(draft); if (data.scan_job && ['discovering','analyzing'].includes(data.scan_job.status)) applyScanJob(data.scan_job); setServer(true, data.ffmpeg_available === false ? `${connectedLabel()} · 未找到 FFmpeg` : connectedLabel()); Object.entries(data.review_jobs || {}).filter(([, job]) => job.status === 'running').forEach(([id]) => watchBatchReview(id)); if (data.global_review_job?.status === 'running') watchAllReview(); document.dispatchEvent(new Event('mixcut-bootstrap')); } catch (error) { setServer(false, error.message); renderErrors([error.message]); } }
+  document.addEventListener('DOMContentLoaded', () => { window.addEventListener('hashchange', showView); $('#scan-btn').addEventListener('click', scan); $('#plan-btn').addEventListener('click', createPlan); $('#start-btn').addEventListener('click', () => state.batch && batchAction(state.batch.id, 'start')); $('#manifest-btn').addEventListener('click', () => { if (state.batch) window.open(`/api/manifest?batch=${encodeURIComponent(state.batch.id)}`, '_blank', 'noopener'); }); $('#clear-cache').addEventListener('click', clearCache); $('#retry-failed').addEventListener('click', retryFailed); $('#refresh-tasks').addEventListener('click', () => refreshBatches()); $('#pause-all').addEventListener('click',()=>allBatches('pause')); $('#start-all').addEventListener('click',()=>allBatches('start')); $('#stop-all').addEventListener('click',()=>allBatches('stop')); $('#approve-all-visible').addEventListener('click',approveAllVisible); $('#clear-all').addEventListener('click',clearAllBatches); $('#select-all-plan').addEventListener('click',()=>selectAllTasks('plan')); $('#delete-selected-plan').addEventListener('click',()=>deleteSelectedTasks('plan')); $('#select-all-tasks').addEventListener('click',()=>selectAllTasks('tasks')); $('#delete-selected-tasks').addEventListener('click',()=>deleteSelectedTasks('tasks')); $('#shutdown-btn').addEventListener('click', async () => { if (!confirm('确定停止本地后台服务吗？正在处理的任务会停止。')) return; try { await api('/api/shutdown', { method:'POST', body:'{}' }); } catch (error) { toast(error.message, true); return; } stopPolling(); setServer(false, '本地服务已停止'); toast('已请求停止后台服务。'); }); $('#config-form').addEventListener('change', event => { if (event.target.name === 'mode') { $$('.mode-multi').forEach(el => el.hidden = event.target.value !== 'multi'); $$('.mode-single').forEach(el => el.hidden = event.target.value !== 'single'); } if (event.target.name === 'music_mode') $$('.pool-settings').forEach(el => el.hidden = event.target.value !== 'pool'); }); $('#video-assets').addEventListener('change', event => { if (event.target.matches('.asset-select,.group-input')) { saveAssetPrefs(); renderPickers(); } }); $('#music-assets').addEventListener('change', event => { if (event.target.matches('.asset-select')) { saveAssetPrefs(); renderPickers(); } }); bootstrap().then(showView); });
   document.addEventListener('DOMContentLoaded', () => { $$('.folder-picker').forEach(button => button.addEventListener('click', () => pickFolder(button.dataset.kind))); $('#output-dir').addEventListener('change', () => persistPreference('output_dir', $('#output-dir').value.trim())); ['review-dir', 'task-review-dir'].forEach(id => $(`#${id}`).addEventListener('change', () => { const value = $(`#${id}`).value.trim(); syncReviewDir(value); persistPreference('review_dir', value); })); [['video-dir','video'],['music-dir','music']].forEach(([id,kind]) => $(`#${id}`).addEventListener('change', () => { if ($(`#${id}`).value.trim() !== state.libraryDirs?.[kind]) clearScannedLibrary(kind); })); });
-  document.addEventListener('DOMContentLoaded', () => $('#stop-all').addEventListener('click',()=>allBatches('stop')));
   const polishTaskControls = () => $$('.batch').forEach(card => {
     const badge = $('.batch-head .status', card); if (badge?.textContent === 'validating') badge.textContent = '校验中';
     const batchId = $('.batch-head h3', card)?.textContent.replace('批次 ', ''); const batch = state.batches.find(item => String(item.id) === batchId);
     if (batch?.output_folder && !$('.output-location', card)) { const output = document.createElement('p'); output.className = 'output-location field-help'; output.textContent = `输出目录：${batch.output_folder}`; $('.batch-head', card).after(output); }
     const hasFailed = $$('.task-item .status', card).some(el => ['failed', 'error', '失败'].includes(safeClass(el.textContent)) || el.textContent === '失败'); const hasPending = $$('.task-item .status', card).some(el => el.textContent === '待处理'); const stateText = badge?.textContent;
     $$('.batch-controls .button', card).forEach(button => { if (button.textContent === '重试失败项' && hasFailed && stateText === '已暂停') button.disabled = false; if (button.textContent === '继续' && hasPending && stateText === '已停止') button.disabled = false; });
-    $$('.task-item', card).forEach((row,index) => { if ($('.item-controls',row)) return; const item=batch?.items?.[index]; if(!item)return; const controls=document.createElement('div');controls.className='item-controls'; if(['pending','running','validating'].includes(item.status)){const stop=document.createElement('button');stop.className='button';stop.textContent='终止该条';stop.onclick=()=>itemAction(batch.id,item.id,'stop');controls.append(stop);} if(['cancelled','failed'].includes(item.status)){const start=document.createElement('button');start.className='button';start.textContent='开始该条';start.onclick=()=>itemAction(batch.id,item.id,'start');controls.append(start);} if(!['running','validating'].includes(item.status)){const remove=document.createElement('button');remove.className='button';remove.textContent='删除该条';remove.onclick=()=>{if(confirm('只删除这条任务记录？'))itemAction(batch.id,item.id,'delete');};controls.append(remove);} row.append(controls); });
+    $$('.task-item', card).forEach((row,index) => { if ($('.item-controls',row)) return; const item=batch?.items?.[index]; if(!item)return; const controls=document.createElement('div');controls.className='item-controls'; if(['pending','running','validating'].includes(item.status)){const stop=document.createElement('button');stop.className='button';stop.textContent='终止该条';stop.onclick=()=>itemAction(batch.id,item.id,'stop');controls.append(stop);} if(['cancelled','failed','stalled_paused','recovery_paused'].includes(item.status)){const start=document.createElement('button');start.className='button';start.textContent=['failed','stalled_paused','recovery_paused'].includes(item.status)?'继续该任务':'开始该条';start.onclick=()=>itemAction(batch.id,item.id,'start');controls.append(start);} if(item.status==='success' && (!item.thumbnails || item.thumbnails.status==='ready')){const details=document.createElement('button');details.className='button';details.classList.add('task-details-toggle');details.textContent=row.classList.contains('expanded')?'收起详情':'查看与审核';details.onclick=()=>setTaskExpanded(row,!row.classList.contains('expanded'));controls.append(details);} const remove=document.createElement('button');remove.className='button';remove.textContent='删除任务';remove.onclick=()=>itemAction(batch.id,item.id,'delete');controls.append(remove);row.append(controls); });
   });
   new MutationObserver(polishTaskControls).observe($('#batches'), { childList: true, subtree: true });
   const polishOutputFolders = () => $$('.batch').forEach(card => { const batchId = $('.batch-head h3', card)?.textContent.replace('批次 ', ''); const batch = state.batches.find(item => String(item.id) === batchId); const output = $('.output-location', card); const text = batch && `批次 ${batch.folder_name || batch.id} · 输出目录：${batch.output_folder}`; if (output && text && output.textContent !== text) output.textContent = text; });
@@ -285,6 +445,17 @@
       const video = $('video', row);
       const item = (batch.items || [])[index];
       if (!item) return;
+      if (item.status !== 'success') return;
+      if (item.thumbnails && item.thumbnails.status !== 'ready' && !['approved','rejecting','reject_failed'].includes(item.review?.status)) {
+        const note = document.createElement('div'); note.className = 'review-action preview-status';
+        note.textContent = item.thumbnails.status === 'failed' ? `缩略图生成失败：${item.thumbnails.error || '请重试'}` : '视频已完成，缩略图准备中；全部就绪后可审核。';
+        if (item.thumbnails.status === 'failed') {
+          const retry = document.createElement('button'); retry.className = 'button'; retry.textContent = '重试生成缩略图';
+          retry.onclick = async () => { try { await api(`/api/batches/${batch.id}/items/${item.id}/prepare-previews`, {method:'POST',body:'{}'}); await refreshBatches(); } catch(error) { toast(error.message,true); } };
+          note.append(retry);
+        }
+        row.append(note); return;
+      }
       const action = document.createElement('div');
       action.className = 'review-action field-help';
       if (item.review?.status === 'approved') {
@@ -313,6 +484,9 @@
           retry.addEventListener('click', async () => { retry.disabled = true; try { await api(`/api/batches/${encodeURIComponent(batch.id)}/items/${encodeURIComponent(item.id)}/retry-cleanup`, {method:'POST',body:'{}'}); state.batchSignature=''; await refreshBatches(); toast('清理状态已更新。'); } catch(error) { retry.disabled = false; toast(error.message,true); } });
           action.append(retry);
         }
+      } else if (['rejecting','reject_failed'].includes(item.review?.status)) {
+        action.textContent = item.review?.status === 'rejecting' ? '正在清理审核不通过的视频' : `清理失败：${item.review.error || '请重试'}`;
+        if (item.review?.status === 'reject_failed') { const retry=document.createElement('button');retry.className='button';retry.textContent='重试不通过清理';retry.onclick=()=>rejectItem(batch,item,retry);action.append(retry); }
       } else if (item.review?.status === 'superseded') {
         action.textContent = `已由贴图版本替代：${item.review.replacement_batch_id || '审核版'}`;
         const sourceStates = Object.values(item.cleanup?.source_files || {});
@@ -325,7 +499,9 @@
         approve.disabled = item.review?.status === 'copying';
         approve.textContent = approve.disabled ? '正在归档' : '通过审核';
         approve.addEventListener('click', () => approveItem(batch.id,item.id,approve));
-        action.append(approve);
+        const collapse=document.createElement('button');collapse.className='button';collapse.type='button';collapse.textContent='收起';collapse.onclick=()=>setTaskExpanded(row,false);
+        const reject=document.createElement('button');reject.className='button danger';reject.type='button';reject.textContent='审核不通过';reject.disabled=approve.disabled;reject.onclick=()=>rejectItem(batch,item,reject);
+        const buttons=document.createElement('div');buttons.className='review-buttons';buttons.append(approve,collapse,reject);action.append(buttons);
         const variant = document.createElement('select'); variant.className = 'sticker-variant'; variant.setAttribute('aria-label','审核时追加的贴图模板'); variant.append(new Option('不追加贴图', '')); (state.stickers?.templates || []).forEach(template => variant.append(new Option(template.name, template.id))); const makeVariant = document.createElement('button'); makeVariant.className = 'button'; makeVariant.type = 'button'; makeVariant.textContent = '生成贴图版本'; makeVariant.addEventListener('click', async () => { if (!variant.value) return toast('请选择一个贴图模板。', true); makeVariant.disabled = true; try { const job = await api('/api/sticker-variants', { method:'POST', body:JSON.stringify({batch_id:batch.id,item_id:item.id,template_id:variant.value}) }); makeVariant.textContent = '贴图版本排队中'; const timer = setInterval(async () => { try { const status = await api(`/api/sticker-variants/${encodeURIComponent(job.job_id)}`); makeVariant.textContent = status.status === 'completed' ? '贴图版本已生成' : `生成中 ${Math.round((status.progress || 0) * 100)}%`; if (['completed','failed'].includes(status.status)) { clearInterval(timer); makeVariant.disabled = false; if (status.status === 'failed') toast(status.error || '贴图版本生成失败', true); await refreshBatches(); } } catch (_) { clearInterval(timer); makeVariant.disabled = false; } }, 3000); } catch (error) { makeVariant.disabled = false; toast(error.message,true); } }); const hint=document.createElement('p');hint.className='field-help';hint.textContent='审核贴图版后，会清理未审核的原成片及可安全删除的原素材。';makeVariant.disabled=!variant.value;variant.addEventListener('change',()=>{makeVariant.disabled=!variant.value;approve.disabled=!!variant.value || item.review?.status==='copying';approve.textContent=variant.value?'请先生成贴图版本':(approve.disabled?'正在归档':'通过审核');});action.append(hint, variant, makeVariant);
         if (item.review?.error) {
           const error = document.createElement('div'); error.className = 'review-error';
