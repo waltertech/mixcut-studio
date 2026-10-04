@@ -16,3 +16,5 @@
 #batches .task-item .preview-status{display:block!important;color:var(--muted)}
 
 #batches .task-item .duration-note{grid-column:3/-1;display:block;margin:0}
+
+#batches .task-item .duration-note,#batches .task-item .recovery-note{grid-column:3/-1;margin:0} .review-buttons{display:flex;gap:10px;flex-wrap:wrap}.button.danger{color:#bd4036;border-color:#e5aaa5}

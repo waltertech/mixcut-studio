@@ -122,7 +122,7 @@ def verify(release_version):
                 raise SystemExit('bundled FFmpeg was not detected')
             if data.get('version') != release_version:
                 raise SystemExit(f'embedded version mismatch: {data.get("version")}')
-            if data.get('api_protocol') != 9:
+            if data.get('api_protocol') != 10:
                 raise SystemExit('embedded API protocol mismatch')
             request = Request(f'http://127.0.0.1:{VERIFY_PORT}/api/tasks/forget',
                               data=b'{"selections":[]}', method='POST',

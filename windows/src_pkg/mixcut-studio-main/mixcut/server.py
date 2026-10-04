@@ -130,7 +130,7 @@ class Application:
     def bootstrap(self):
         library = self.store.get('library', {})
         preferences = self.store.get('preferences', {})
-        scan = library.get('scan', {'videos': [], 'music': [], 'errors': []})
+        scan = self.filter_rejected_scan(library.get('scan', {'videos': [], 'music': [], 'errors': []}))
         scan['music'] = [tag_music_style(song, library.get('music_dir')) for song in scan.get('music', [])]
         with self.review_job_lock:
             review_jobs = {batch_id: dict(job) for batch_id, job in self.review_jobs.items()}
@@ -322,9 +322,15 @@ class Application:
                 return
             batch = self.batch(batch_id)
             item = next((i for i in batch['items'] if str(i['id']) == str(item_id)), None)
-            if not item or item.get('dismissed') or item['status'] != 'success' or item.get('review', {}).get('status') in {'approved', 'superseded'}:
+            if not item or item.get('dismissed') or item['status'] != 'success' or item.get('review', {}).get('status') in {'rejecting', 'reject_failed', 'rejected'} or (item.get('review', {}).get('status') in {'approved', 'superseded'} and item.get('cleanup', {}).get('output_deleted')):
                 return
             version = self.keyframes._version(item['output_path'])
+            preview = item.get('thumbnails', {})
+            if preview.get('status') == 'ready' and preview.get('version') == version and self.keyframes.ready(version, preview.get('total', 0)):
+                return
+            old_version = preview.get('version')
+            if old_version and old_version != version:
+                self.keyframes.remove(old_version)
             self.store.update(batch_id, lambda b: next(i for i in b['items'] if str(i['id']) == str(item_id)).update(
                 thumbnails={'status': 'queued', 'version': version}))
             cancel = threading.Event()
@@ -380,7 +386,7 @@ class Application:
                 result = item.get('result', {})
                 if not result.get('output_size') or not result.get('output_mtime_ns'):
                     return
-                identity = f"{Path(item['output_path']).resolve()}:{result['output_size']}:{result['output_mtime_ns']}:keyframes-v2-30s"
+                identity = f"{Path(item['output_path']).resolve()}:{result['output_size']}:{result['output_mtime_ns']}:keyframes-v3-paired-30s"
                 version = hashlib.sha256(identity.encode()).hexdigest()[:24]
         self.keyframes.remove(version)
 
@@ -582,6 +588,15 @@ class Application:
             self.store.put(key, number)
         return folder
 
+    def allowed_videos(self, videos):
+        rejected = self.store.get('rejected-video-paths', {})
+        if not rejected:
+            return list(videos)
+        return [asset for asset in videos if os.path.abspath(asset['path']) not in rejected]
+
+    def filter_rejected_scan(self, scan):
+        return {**scan, 'videos': self.allowed_videos(scan.get('videos', []))}
+
     def scan(self, body):
         from . import media
         with self.scan_lock:
@@ -593,8 +608,8 @@ class Application:
             excluded += [str(batch_output_folder(batch)) for batch in self.store.batches()]
             excluded += [folder for batch in self.store.batches() for folder in batch.get('review_folders', {}).values()]
             result = media.scan(str(video_dir), str(music_dir), str(self.store.directory / 'cache'), exclude_dirs=excluded, quick_music=True)
-            self.store.put('library', {'video_dir': str(video_dir), 'music_dir': str(music_dir), 'scan': result})
-            return result
+            self.store.put('library', {'video_dir': str(video_dir), 'music_dir': str(music_dir), 'scan': self.filter_rejected_scan(result)})
+            return self.filter_rejected_scan(result)
 
     def scan_status(self, compact=False):
         with self.scan_state_lock:
@@ -629,6 +644,8 @@ class Application:
         with self.scan_state_lock:
             self.scan_job = job
 
+        excluded_video_paths = set(self.store.get('rejected-video-paths', {}))
+
         def progress(event):
             with self.scan_state_lock:
                 if event['phase'] == 'inventory':
@@ -636,7 +653,7 @@ class Application:
                     job['status'] = 'analyzing'
                 else:
                     job['processed'][event['kind']] += 1
-                    if event['asset']:
+                    if event['asset'] and (event['kind'] != 'video' or os.path.abspath(event['asset']['path']) not in excluded_video_paths):
                         key = 'videos' if event['kind'] == 'video' else 'music'
                         job['scan'][key].append(event['asset'])
 
@@ -650,9 +667,9 @@ class Application:
                                     exclude_dirs=excluded, kinds=kinds, previous=old.get('scan'),
                                     progress=progress, quick_music=True)
                 self.store.put('library', {'video_dir': str(video_dir), 'music_dir': str(music_dir),
-                                           'scan': result})
+                                           'scan': self.filter_rejected_scan(result)})
                 with self.scan_state_lock:
-                    job['scan'] = result
+                    job['scan'] = self.filter_rejected_scan(result)
                     job['status'] = 'completed'
             except Exception as exc:
                 with self.scan_state_lock:
@@ -709,7 +726,7 @@ class Application:
             if not 0 <= config[field] <= 2:
                 raise ValueError('音量须在 0～2 之间')
         library_record = self.store.get('library', {})
-        library = library_record.get('scan', {})
+        library = self.filter_rejected_scan(library_record.get('scan', {}))
         if not library.get('videos') or not library.get('music'):
             raise ValueError('请先扫描视频和音乐素材')
         config.setdefault('music_margin_seconds', 3.0)
@@ -948,6 +965,7 @@ class Application:
             current = item['segments'][index]
             videos = [asset for asset in batch['assets'] if asset['id'] in selected
                       and float(asset['duration']) > threshold and asset['id'] != current['asset_id']]
+            videos = self.allowed_videos(videos)
             if config.get('mode') == 'multi' and config.get('within_group'):
                 other = next((part for n, part in enumerate(item['segments']) if n != index), None)
                 group = config.get('groups', {}).get(other['asset_id']) if other else None
@@ -1068,7 +1086,8 @@ class Application:
         if batch is None:
             return None
         items = [item for item in batch.get('items', []) if not item.get('dismissed')
-                 and item.get('review', {}).get('status') not in {'approved', 'superseded'}]
+                 and not (item.get('review', {}).get('status') in {'approved', 'superseded'}
+                          and item.get('cleanup', {}).get('output_deleted'))]
         return {**batch, 'items': items} if items else None
 
     def visible_batches(self):
@@ -1362,6 +1381,9 @@ class Application:
             changed = False
             review_changed = False
             for item in batch['items']:
+                if item.get('review', {}).get('status') == 'rejecting':
+                    item['review'].update(status='reject_failed', error='上次清理中断，请点击重试不通过清理')
+                    review_changed = True
                 if item.get('review', {}).get('status') == 'approved':
                     archived = Path(item['review'].get('path', ''))
                     sidecar = archived.with_suffix('.txt')
@@ -1381,12 +1403,12 @@ class Application:
                     else:
                         item['review'].update(status='failed', error='上次归档中断，请再次点击通过审核以恢复')
                     review_changed = True
-                if (item['status'] == 'success' and item.get('review', {}).get('status') not in {'approved', 'superseded'}
+                if (item['status'] == 'success' and item.get('review', {}).get('status') not in {'approved', 'superseded', 'rejecting', 'reject_failed', 'rejected'}
                         and not item.get('cleanup', {}).get('output_deleted')
                         and not Path(item['output_path']).is_file()):
                     item.update(status='failed', error='已完成的输出文件已被移动或删除')
                     changed = True
-                elif (item['status'] == 'success' and item.get('review', {}).get('status') not in {'approved', 'superseded'}
+                elif (item['status'] == 'success' and item.get('review', {}).get('status') not in {'approved', 'superseded', 'rejecting', 'reject_failed', 'rejected'}
                       and not item.get('cleanup', {}).get('output_deleted')
                       and item.get('result', {}).get('output_mtime_ns')):
                     stat = Path(item['output_path']).stat()
@@ -1444,7 +1466,7 @@ class Application:
         self.start_preview_worker()
         for batch in self.visible_batches():
             for item in batch['items']:
-                if item['status'] == 'success' and item.get('review', {}).get('status') not in {'approved', 'superseded'}:
+                if item['status'] == 'success' and item.get('review', {}).get('status') not in {'approved', 'superseded', 'rejecting', 'reject_failed', 'rejected'}:
                     self.enqueue_previews(batch['id'], item['id'])
         self.worker = threading.Thread(target=self.run_queue, daemon=True, name='render-queue')
         self.worker.start()
@@ -1663,6 +1685,7 @@ class Application:
                 if batch['config'].get('video_ids') is not None:
                     selected = set(batch['config']['video_ids'])
                     candidates = {identity: asset for identity, asset in candidates.items() if identity in selected}
+                candidates = {asset['id']: asset for asset in self.allowed_videos(list(candidates.values()))}
                 usage = defaultdict(int)
                 occupied = []
                 for entry in self.batch(batch_id)['items']:
@@ -1689,6 +1712,8 @@ class Application:
                 def reserve_segment(segment):
                     accepted = [False]
                     def reserve(current):
+                        if str(Path(segment['path']).resolve()) in self.store.get('rejected-video-paths', {}):
+                            return
                         for other in current['items']:
                             if other['id'] == item['id'] or other.get('dismissed'):
                                 continue
@@ -1704,6 +1729,7 @@ class Application:
                     self.store.update(batch_id, reserve)
                     return accepted[0]
                 render_config.update(video_candidates=list(candidates.values()), video_usage=dict(usage),
+                                     video_source_allowed=lambda seg: os.path.abspath(seg['path']) not in self.store.get('rejected-video-paths', {}),
                                      occupied_video_segments=occupied,
                                      bad_video_sources=self.store.get('bad-video-sources', {}),
                                      record_bad_video=record_bad, checkpoint_ready=checkpoint_ready, reserve_video_segment=reserve_segment)
@@ -1874,9 +1900,9 @@ class Application:
             output = Path(item['output_path'])
             if output.is_file() and self.file_digest(output) != review['sha256']:
                 raise ValueError('制作目录中的同名文件已变化，暂不删除')
-            self.cleanup_task_cache(batch, item)
             output.unlink(missing_ok=True)
             output.with_suffix('.txt').unlink(missing_ok=True)
+            self.cleanup_task_cache(batch, item)
             shutil.rmtree(self.store.directory / 'work' / batch_id / item_id, ignore_errors=True)
             return self.store.update(batch_id, lambda current: current['items'][next(
                 n for n, entry in enumerate(current['items']) if entry['id'] == item_id)].setdefault('cleanup', {}).update(
@@ -2081,6 +2107,94 @@ class Application:
             self._cleanup_approved_sources()
             return self.batch(batch_id)
 
+    def reject(self, body):
+        """Reject media explicitly; ordinary record deletion remains independent."""
+        if body.get('confirmation') != 'REJECT_VIDEO_AND_SOURCES':
+            raise ValueError('请确认审核不通过会删除成片及原视频，音乐保留')
+        batch_id, item_id = str(body['batch_id']), str(body['item_id'])
+        with self.review_lock:
+            batch = self.batch(batch_id)
+            item = next((entry for entry in batch['items'] if entry['id'] == item_id), None)
+            if not item or item.get('status') != 'success':
+                raise ValueError('只有已完成的视频可以审核不通过')
+            if item.get('review', {}).get('status') in {'approved', 'superseded', 'copying'}:
+                raise ValueError('该任务已归档或正在归档')
+            if item.get('review', {}).get('status') == 'rejected':
+                return {'ok': True, **item.get('rejection', {})}
+            segments = list(item.get('segments', [])) + list(item.get('checkpoint_segments', []))
+            assets = list(item.get('video_assets', [])) + list(item.get('checkpoint_video_assets', []))
+            source_root = batch.get('config', {}).get('source_video_dir')
+            outputs = [(batch, item)]
+            origin = batch.get('sticker_origin', {})
+            if item.get('kind') == 'sticker_variant' and origin:
+                original_batch = self.store.get('batch:' + str(origin.get('batch_id')), {})
+                original = next((entry for entry in original_batch.get('items', [])
+                                 if entry['id'] == origin.get('item_id')), None)
+                if original:
+                    segments += original.get('segments', [])
+                    assets += original.get('video_assets', [])
+                    source_root = original_batch.get('config', {}).get('source_video_dir') or source_root
+                    if original.get('review', {}).get('status') not in {'approved', 'superseded'}:
+                        outputs.append((original_batch, original))
+            paths = {str(Path(seg['path']).resolve()): seg for seg in segments if seg.get('path')}
+            music_paths = {str(Path(song['path']).resolve()) for current in self.store.batches()
+                           for entry in current.get('items', []) for song in entry.get('music', [])}
+            music_paths.update(str(Path(song['path']).resolve()) for song in
+                               self.store.get('library', {}).get('scan', {}).get('music', []))
+            # Validate recorded ownership before doing any irreversible operation.
+            for path, seg in paths.items():
+                asset = next((a for a in assets if a['id'] == seg['asset_id']
+                              and str(Path(a['path']).resolve()) == path), None)
+                if (not asset or not source_root or Path(seg['path']).is_symlink()
+                        or not Path(path).is_relative_to(Path(source_root).resolve())):
+                    raise ValueError('无法确认待删除原视频属于此任务的视频素材目录')
+                if path in music_paths:
+                    raise ValueError('此视频文件同时被用作音乐，已保留；请先分离音频文件')
+            for current, entry in outputs:
+                output = Path(entry['output_path'])
+                folder = Path(current.get('output_folder') or current['config']['output_dir']).resolve()
+                if output.is_symlink() or not output.resolve().is_relative_to(folder) or str(output.resolve()) in music_paths:
+                    raise ValueError('待删除成片路径不属于此任务的输出目录或同时被用作音乐')
+            with self.store.lock:
+                rejected = self.store.get('rejected-video-paths', {})
+                for path in paths:
+                    rejected[path] = {'batch_id': batch_id, 'item_id': item_id, 'at': time.time()}
+                self.store.put('rejected-video-paths', rejected)
+                library = self.store.get('library', {})
+                if library.get('scan'):
+                    library['scan'] = self.filter_rejected_scan(library['scan'])
+                    self.store.put('library', library)
+                self.store.update(batch_id, lambda b: next(i for i in b['items'] if i['id'] == item_id).update(
+                    review={'status': 'rejecting'}, rejection={'source_paths': list(paths)}))
+            errors, removed = [], []
+            for path in paths:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                    removed.append(path)
+                except OSError as exc:
+                    errors.append(f'{path}: {exc}')
+            for current, entry in outputs:
+                try:
+                    self.cleanup_task_cache(current, entry)
+                    Path(entry['output_path']).unlink(missing_ok=True)
+                    Path(entry['output_path']).with_suffix('.txt').unlink(missing_ok=True)
+                    if entry['id'] != item_id or current['id'] != batch_id:
+                        self.store.update(current['id'], lambda b: next(i for i in b['items'] if i['id'] == entry['id']).update(
+                            dismissed=True, cancel_requested=True, status='cancelled'))
+                except (OSError, ValueError) as exc:
+                    errors.append(str(exc))
+            result = {'source_paths': list(paths), 'removed_sources': removed, 'errors': errors,
+                      'output_deleted': not Path(item['output_path']).exists()}
+            def finish(current):
+                target = next(i for i in current['items'] if i['id'] == item_id)
+                target.update(review={'status': 'reject_failed' if errors else 'rejected',
+                                      'error': '；'.join(errors) if errors else None}, rejection=result,
+                              dismissed=not errors)
+                target.setdefault('cleanup', {})['output_deleted'] = result['output_deleted']
+            self.store.update(batch_id, finish)
+            self.wake.set()
+            return {'ok': not errors, **result}
+
     def approve(self, body):
         batch_id, item_id = str(body['batch_id']), str(body['item_id'])
         # Serialize approvals, not rendering. Double clicks cannot copy the same item twice.
@@ -2091,6 +2205,8 @@ class Application:
                 raise ValueError('只能审核已成功生成的视频')
             item = batch['items'][index]
             previous = item.get('review', {})
+            if previous.get('status') in {'rejecting', 'reject_failed', 'rejected'}:
+                raise ValueError('该任务已审核不通过，请完成文件清理')
             if previous.get('status') != 'approved' and item.get('thumbnails'):
                 preview = item['thumbnails']
                 if not self.review_ready(item) or not self.keyframes.ready(preview.get('version'), preview.get('total', 0)):
@@ -2190,7 +2306,7 @@ class Application:
             batch = self.batch(batch_id)
             candidates = sorted((item for item in batch.get('items', [])
                                  if item.get('status') == 'success' and self.review_ready(item)
-                                 and item.get('review', {}).get('status') not in ('approved', 'superseded', 'copying')),
+                                 and item.get('review', {}).get('status') not in ('approved', 'superseded', 'copying', 'rejecting', 'reject_failed', 'rejected')),
                                  key=lambda item: (int(item.get('index') or 0), str(item['id'])))
             item_ids = [str(item['id']) for item in candidates]
             if not item_ids:
@@ -2238,7 +2354,7 @@ class Application:
                           for item in sorted(batch['items'], key=lambda entry: (int(entry.get('index') or 0),
                                                                                str(entry['id'])))
                           if item['status'] == 'success' and self.review_ready(item) and
-                          item.get('review', {}).get('status') not in {'approved', 'superseded', 'copying'}]
+                          item.get('review', {}).get('status') not in {'approved', 'superseded', 'copying', 'rejecting', 'reject_failed', 'rejected'}]
             if not candidates:
                 raise ValueError('没有待审核的已完成任务')
             job = {'status': 'running', 'total': len(candidates), 'completed': 0,
@@ -2346,6 +2462,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response(self.app.pick_folder(body))
                 if path == '/api/preferences':
                     return self.json_response(self.app.preferences(body))
+                if path == '/api/reject':
+                    return self.json_response(self.app.reject(body))
                 if path == '/api/approve':
                     return self.json_response(self.app.approve(body))
                 batch_review_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/approve-all', path)
@@ -2468,16 +2586,30 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send_file(target, content_type=asset.get('mime_type') if path == '/api/media' else None)
                 if path in ['/api/keyframes', '/api/keyframe']:
                     item = next(i for i in self.app.batch(query['batch'][0])['items'] if i['id'] == query['item'][0])
-                    if item.get('dismissed') or item.get('review', {}).get('status') in {'approved', 'superseded'}:
+                    if item.get('dismissed') or (item.get('review', {}).get('status') in {'approved', 'superseded'} and item.get('cleanup', {}).get('output_deleted')):
                         raise ValueError('该任务的缩略图已清理')
                     preview = item.get('thumbnails')
-                    if preview and self.app.review_ready(item) and not self.app.keyframes.ready(preview.get('version'), preview.get('total', 0)):
+                    cache_missing = False
+                    if preview and self.app.review_ready(item):
+                        if path == '/api/keyframes':
+                            cache_missing = not self.app.keyframes.ready(preview.get('version'), preview.get('total', 0))
+                        else:
+                            size = query.get('size', ['thumb'])[0]
+                            if size not in {'thumb', 'large'}:
+                                raise ValueError('无效的关键帧尺寸')
+                            index = int(query['index'][0])
+                            if index < 0 or index >= preview.get('total', 0):
+                                raise ValueError('关键帧编号超出范围')
+                            cache_missing = not (self.app.keyframes.root / preview['version'] / f'{index:06d}-{size}.jpg').is_file()
+                    if cache_missing:
                         self.app.enqueue_previews(query['batch'][0], query['item'][0])
                         raise ValueError('缩略图缓存已清除，正在重新准备')
                     if preview and not self.app.review_ready(item):
                         raise ValueError('缩略图正在准备，请稍后查看')
                 if path in ['/api/output', '/api/keyframes', '/api/keyframe']:
                     output = self.app.completed_output(query['batch'][0], query['item'][0])
+                    if path in {'/api/keyframes', '/api/keyframe'} and Path(item['output_path']).is_file():
+                        output = Path(item['output_path'])
                     with self.app.cached_preview():
                         if path == '/api/keyframes':
                             return self.json_response(self.app.keyframes.describe(output))

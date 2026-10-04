@@ -125,6 +125,9 @@ def prepare(item, config, work, callback=None):
             notify(version, entry)
 
     def allowed(seg):
+        source_allowed = config.get('video_source_allowed')
+        if source_allowed and not source_allowed(seg):
+            return False
         try:
             entry = bad.get(source_version(seg['path']), {})
         except OSError:
@@ -136,7 +139,8 @@ def prepare(item, config, work, callback=None):
         report('video_segments')
         target = root / f'{index:04d}.mov'
         saved = state['chunks'][index] if index < len(state['chunks']) else None
-        if saved and target.is_file():
+        source_allowed = config.get('video_source_allowed')
+        if saved and target.is_file() and (not source_allowed or source_allowed(saved['segment'])):
             try:
                 try:
                     current = source_version(saved['segment']['path'])

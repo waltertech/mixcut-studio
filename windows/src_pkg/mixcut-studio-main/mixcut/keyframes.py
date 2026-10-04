@@ -24,7 +24,7 @@ class KeyframeCache:
     def _version(self, path):
         path = Path(path).resolve(strict=True)
         stat = path.stat()
-        identity = f'{path}:{stat.st_size}:{stat.st_mtime_ns}:keyframes-v2-30s'
+        identity = f'{path}:{stat.st_size}:{stat.st_mtime_ns}:keyframes-v3-paired-30s'
         return hashlib.sha256(identity.encode()).hexdigest()[:24]
 
     def _lock(self, key):
@@ -66,7 +66,8 @@ class KeyframeCache:
         if not version or total < 1:
             return False
         directory = self.root / version
-        return all((directory / f'{index:06d}-thumb.jpg').is_file() for index in range(total))
+        return all((directory / f'{index:06d}-{size}.jpg').is_file()
+                   for index in range(total) for size in ('thumb', 'large'))
 
     def remove(self, version):
         if not version or len(version) != 24 or any(c not in '0123456789abcdef' for c in version):
@@ -92,10 +93,16 @@ class KeyframeCache:
             try:
                 with self.slots, (staging / 'ffmpeg.log').open('w') as log:
                     process = subprocess.Popen([
-                        'ffmpeg', '-nostdin', '-v', 'error', '-y', '-threads', '1', '-i', str(path),
-                        '-an', '-vf', "select='gte(t,selected_n*30)',scale=min(320\\,iw):-2",
-                        '-fps_mode', 'vfr', '-threads', '1', '-q:v', '3', '-start_number', '0',
-                        str(staging / '%06d-thumb.jpg')], stdout=subprocess.DEVNULL, stderr=log)
+                        'ffmpeg', '-nostdin', '-v', 'error', '-y', '-threads', '1',
+                        '-reinit_filter:v', '0', '-i', str(path), '-filter_complex_threads', '1',
+                        '-filter_complex',
+                        "[0:v:0]select='gte(t,selected_n*30)',split=2[small][big];"
+                        "[small]scale=min(320\\,iw):-2[thumb];[big]scale=min(960\\,iw):-2[large]",
+                        '-map', '[thumb]', '-an', '-fps_mode', 'vfr', '-threads', '1', '-q:v', '3',
+                        '-start_number', '0', str(staging / '%06d-thumb.jpg'),
+                        '-map', '[large]', '-an', '-fps_mode', 'vfr', '-threads', '1', '-q:v', '3',
+                        '-start_number', '0', str(staging / '%06d-large.jpg')],
+                        stdout=subprocess.DEVNULL, stderr=log)
                     started = time.monotonic()
                     while process.poll() is None:
                         if cancelled():
@@ -107,12 +114,15 @@ class KeyframeCache:
                     raise ValueError('缩略图生成失败：' + (staging / 'ffmpeg.log').read_text()[-500:])
                 if cancelled() or self._version(path) != version:
                     raise InterruptedError('任务已取消或视频已变化')
-                for index in range(data['total']):
-                    image = staging / f'{index:06d}-thumb.jpg'
-                    if not image.is_file() or not image.stat().st_size:
-                        raise ValueError('缩略图不完整，请重试')
-                for index in range(data['total']):
-                    image = staging / f'{index:06d}-thumb.jpg'
+                for size in ('thumb', 'large'):
+                    images = sorted(staging.glob(f'*-{size}.jpg'))
+                    if len(images) != data['total']:
+                        raise ValueError('缩略图采样数量不匹配，请重试')
+                    for index in range(data['total']):
+                        image = staging / f'{index:06d}-{size}.jpg'
+                        if not image.is_file() or not image.stat().st_size:
+                            raise ValueError('缩略图不完整，请重试')
+                for image in staging.glob('*.jpg'):
                     image.replace(directory / image.name)
                 return data
             finally:
