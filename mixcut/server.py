@@ -505,7 +505,10 @@ class Application:
                           sticker_template=template, sticker_layers=layers)
             styles = source_item.get('music_styles') or music_styles(source_item.get('music', []))
             filename = export_filename(styles, 1) if styles else source.name
-            item = {'id': uuid.uuid4().hex, 'index': 1, 'kind': 'sticker_variant',
+            from .tracklist import for_item
+            item = {'include_track_titles':source_item.get('include_track_titles', False),
+                    'played_music':for_item(source_item),
+                    'id': uuid.uuid4().hex, 'index': 1, 'kind': 'sticker_variant',
                     'duration': source_item['duration'], 'segments': [], 'music': [],
                     'music_source_folders': source_item.get('music_source_folders') or
                                             music_folders(source_item.get('music', [])),
@@ -707,6 +710,7 @@ class Application:
             raise ValueError('并行剪辑数量须为 1、2、3 或 4')
         config['parallel_tasks'] = int(concurrency)
         config['nonstop_music'] = str(config.get('nonstop_music', 'true')).lower() not in {'false', '0'}
+        config['include_track_titles'] = str(config.get('include_track_titles', 'false')).lower() == 'true'
         for field, default in [('width', 1280), ('height', 720), ('fps', 30)]:
             config[field] = int(config.get(field, default))
         if (config['width'], config['height']) not in [(1280, 720), (1920, 1080), (640, 360)]:
@@ -778,6 +782,7 @@ class Application:
             item['id'] = str(item.get('id') or index)
             item['index'] = index + index_offset
             item.update(status='pending', progress=0, error=None, attempts=0)
+            item.setdefault('include_track_titles', bool(config.get('include_track_titles', False)))
             item['music'] = [tag_music_style(song, music_root) for song in item.get('music', [])]
             item['music_source_folders'] = music_folders(item['music'])
             item['music_styles'] = music_styles(item['music'], music_root)
@@ -1663,6 +1668,7 @@ class Application:
                     recovered = {}
                 metadata = renderer.validate(str(output), recovered.get('duration', item['duration']))
                 metadata.update(recovery_warnings=recovered.get('recovery_warnings', []))
+                if 'played_music' in recovered: metadata['played_music'] = recovered['played_music']
                 if recovered.get('rendered_segments'):
                     self.store.update(batch_id, lambda b: b['items'][index].update(
                         segments=recovered['rendered_segments'], video_assets=item.get('checkpoint_video_assets', item.get('video_assets', [])),
@@ -1796,6 +1802,9 @@ class Application:
                                                        video_bitrate_mbps=render_config.get('video_bitrate_mbps', 0)))
                 else:
                     result = self.render_with_cache(batch_id, item, lambda: renderer.render(item, render_config, str(output), work_dir, progress))
+                if item.get('kind') == 'sticker_variant':
+                    from .tracklist import for_item
+                    result['played_music'] = for_item(item)
                 if result.get('rendered_segments'):
                     actual_segments = result['rendered_segments']
                     actual_assets = [candidates[identity] for identity in
@@ -1873,13 +1882,48 @@ class Application:
                 continue
             self.write_music_sidecar(item, item['output_path'], replace=True)
 
+    def set_track_titles(self, body):
+        enabled = body.get('enabled')
+        selections = body.get('selections')
+        if not isinstance(enabled, bool) or not isinstance(selections, list) or not selections or len(selections) > 500:
+            raise ValueError('请选择1～500条任务，并设置是否附带曲目曲名')
+        targets = []
+        seen = set()
+        with self.review_lock:
+            for selection in selections:
+                if not isinstance(selection, dict): raise ValueError('任务选择格式无效')
+                bid, iid = str(selection.get('batch_id', '')), str(selection.get('item_id', ''))
+                if (bid, iid) in seen: continue
+                seen.add((bid, iid))
+                batch = self.batch(bid)
+                item = next((i for i in batch['items'] if str(i['id']) == iid and not i.get('dismissed')), None)
+                if item is None: raise ValueError('任务不存在或已删除')
+                targets.append((bid, iid))
+            errors = []
+            for bid, iid in targets:
+                def change(batch):
+                    item = next(i for i in batch['items'] if str(i['id']) == iid)
+                    item['include_track_titles'] = enabled
+                batch = self.store.update(bid, change)
+                item = next(i for i in batch['items'] if str(i['id']) == iid)
+                if item['status'] == 'success':
+                    review = item.get('review', {})
+                    target = review.get('path') if review.get('status') == 'approved' else item.get('output_path')
+                    try:
+                        if not target or not Path(target).is_file():
+                            raise ValueError('成片已移动或删除，无法更新同名文档')
+                        self.write_music_sidecar(item, target, replace=True)
+                    except (OSError, ValueError) as exc:
+                        errors.append({'batch_id':bid, 'item_id':iid, 'error':str(exc)})
+            return {'ok':not errors, 'updated':len(targets), 'enabled':enabled, 'errors':errors}
+
     @staticmethod
     def write_music_sidecar(item, video_path, *, replace=False):
-        folders = item.get('music_source_folders') or music_folders(item.get('music', []))
-        if not folders:
+        from .tracklist import sidecar_content
+        content = sidecar_content(item)
+        if not content:
             return None
         sidecar = Path(video_path).with_suffix('.txt')
-        content = '\n'.join(folders) + '\n'
         if sidecar.exists() and not replace:
             if sidecar.is_file() and sidecar.read_text(encoding='utf-8') == content:
                 return sidecar
@@ -2527,6 +2571,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response(self.app.start_batch_review(batch_review_match[1], body))
                 if path == '/api/plan':
                     return self.json_response(self.app.create_plan(body))
+                if path == '/api/tasks/track-titles':
+                    return self.json_response(self.app.set_track_titles(body))
                 music_order_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/music-order', path)
                 if music_order_match:
                     return self.json_response(self.app.reorder_music(

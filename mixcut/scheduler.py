@@ -131,6 +131,7 @@ class Scheduler:
             if not math.isfinite(config[field]) or not 0 <= config[field] <= 2:
                 raise ValueError('音量须在0～2之间')
         config['nonstop_music'] = str(config.get('nonstop_music', 'true')).lower() not in {'false', '0'}
+        config['include_track_titles'] = str(config.get('include_track_titles', 'false')).lower() == 'true'
         config.setdefault('min_duration', 30)
         config.setdefault('max_duration', 450)
         config.setdefault('min_songs', 1)

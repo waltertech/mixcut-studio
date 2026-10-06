@@ -323,6 +323,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
                                                capture_output=True, text=True, timeout=120)
                         if remux.returncode: raise ValueError('截短成片失败：' + remux.stderr[-500:])
                         checked = validate(str(shortened), actual, progress_callback, work / 'validation-short.log')
+                        duration = min(duration, actual)
                         os.replace(shortened, temporary)
                     finally:
                         shortened.unlink(missing_ok=True)
@@ -332,7 +333,9 @@ def render(item, config, output_path, work_dir, progress_callback=None):
                     raise
             else:
                 raise
-        recovery_result = dict(checked, recovery_warnings=checkpoint_state['warnings'],
+        from .tracklist import played_music
+        actual_music = played_music(item, min(duration, float(checked.get('duration', duration))))
+        recovery_result = dict(checked, played_music=actual_music, recovery_warnings=checkpoint_state['warnings'],
                                rendered_segments=checkpoints.rendered_segments(checkpoint_state['chunks']))
         snapshot = work / 'render-result.json'
         snapshot.write_text(json.dumps(recovery_result, ensure_ascii=False), encoding='utf-8')
@@ -341,7 +344,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
         publish(temporary, output)
         checked.update(path=str(output), encoder=checkpoint_state['chunks'][0].get('encoder', chosen), assembly_encoder=chosen, elapsed_seconds=round(time.monotonic() - started, 3),
                        recovery_warnings=checkpoint_state['warnings'],
-                       rendered_segments=checkpoints.rendered_segments(checkpoint_state['chunks']))
+                       rendered_segments=checkpoints.rendered_segments(checkpoint_state['chunks']), played_music=actual_music)
         import shutil
         shutil.rmtree(work / 'checkpoints', ignore_errors=True)
         if progress_callback:
