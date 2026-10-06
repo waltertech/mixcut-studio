@@ -1421,19 +1421,22 @@ class Application:
 
     @staticmethod
     def reserve_review_bundle(root, item):
-        day = datetime.now().astimezone().strftime('%Y-%m-%d')
-        parent = Path(root) / day
+        from .naming import review_folder_name
+        parent = Path(root)
         parent.mkdir(parents=True, exist_ok=True)
+        # Number the whole chosen archive directory, independently of media names.
+        label = review_folder_name(parent.name, 1).split('-', 1)[1]
+        highest = max((int(match.group(1)) for entry in parent.iterdir()
+                       if entry.is_dir() and (match := re.fullmatch(r'(\d+)-' + re.escape(label), entry.name))), default=0)
         styles = item.get('music_styles') or music_styles(item.get('music', []))
-        for number in range(1, 10000):
-            name = Path(export_filename(styles, number)).stem
-            folder = parent / name
+        number = highest + 1
+        while True:
+            folder = parent / review_folder_name(parent.name, number)
             try:
                 folder.mkdir()
-                return folder, name
+                return folder, Path(export_filename(styles, number)).stem
             except FileExistsError:
-                continue
-        raise OSError('当天审核文件夹编号已用尽')
+                number += 1
 
     def recover(self):
         for batch in self.store.batches():

@@ -22,7 +22,7 @@ class RuntimeLocations(unittest.TestCase):
             self.assertEqual(Path('/tmp/custom-mixcut'), runtime.data_root())
 
     def test_version_comes_from_single_version_file(self):
-        self.assertEqual('1.5.5', runtime.app_version())
+        self.assertEqual('1.5.6', runtime.app_version())
 
     def test_client_protocol_matches_server(self):
         script = (Path(__file__).resolve().parent.parent / 'static' / 'app.js').read_text(encoding='utf-8')
