@@ -101,10 +101,10 @@ class ParallelQueueTests(unittest.TestCase):
                 ready.wait(timeout=5)
                 threading.Timer(.1,release.set).start()
                 self.app.forget_items([{'batch_id':'abc123','item_ids':['0']}]);self.app.prune_forgotten_items()
-                self.assertEqual(['1'],[i['id'] for i in self.app.batch('abc123')['items']])
+                self.assertEqual(['1'],[i['id'] for i in self.app._visible_batch(self.app.batch('abc123'))['items']])
             finally:release.set()
             future.result(timeout=5)
-        batch=self.app.batch('abc123');self.assertEqual('success',batch['items'][0]['status']);self.assertEqual('1',batch['items'][0]['id'])
+        batch=self.app._visible_batch(self.app.batch('abc123'));self.assertEqual('success',batch['items'][0]['status']);self.assertEqual('1',batch['items'][0]['id'])
 
     def test_parallel_config_rejects_invalid_values(self):
         for value in (0,5,1.5,True,'garbage'):

@@ -1157,7 +1157,7 @@ class Application:
         return [visible for batch in self.store.batches()
                 if (visible := self._visible_batch(batch)) is not None]
 
-    def _forget_records(self, selections, *, clear_history=False):
+    def _forget_records(self, selections, *, clear_history=False, preserve_files=False):
         """Forget task rows promptly; ongoing work is cancelled without touching media files."""
         if not isinstance(selections, list):
             raise ValueError('请选择要删除的任务')
@@ -1168,6 +1168,7 @@ class Application:
             changed = {}
             removed = 0
             preview_cleanup = []
+            preserved_sources = set()
             with self.store.lock, self.store.connection() as conn:
                 for entry in selections:
                     if not isinstance(entry, dict) or not isinstance(entry.get('item_ids'), list):
@@ -1189,6 +1190,10 @@ class Application:
                             retained.append(item)
                             continue
                         preview_cleanup.append((dict(batch), dict(item)))
+                        if preserve_files:
+                            preserved_sources.update(str(Path(part['path']).resolve()) for part in
+                                item.get('segments', []) + item.get('checkpoint_segments', [])
+                                if part.get('path'))
                         if not item.get('dismissed'):
                             removed += 1
                         if active:
@@ -1208,13 +1213,24 @@ class Application:
                     else:
                         conn.execute('DELETE FROM records WHERE id=?', ('batch:' + batch_id,))
                         changed[batch_id] = None
+                if preserved_sources:
+                    row = conn.execute('SELECT body FROM records WHERE id=?', ('preserved-task-sources',)).fetchone()
+                    preserved_sources.update(json.loads(row[0]) if row else [])
+                    conn.execute('INSERT OR REPLACE INTO records VALUES (?,?)',
+                                 ('preserved-task-sources', json.dumps(sorted(preserved_sources))))
                 if clear_history:
                     conn.execute("DELETE FROM records WHERE id LIKE 'deletion:%'")
         finally:
             if review_available:
                 self.review_lock.release()
         cleanup_errors = []
-        for batch, item in preview_cleanup:
+        if preserve_files:
+            with self.preview_lock:
+                for batch, item in preview_cleanup:
+                    cancel = self.preview_jobs.get((batch['id'], str(item['id'])))
+                    if cancel:
+                        cancel.set()
+        for batch, item in ([] if preserve_files else preview_cleanup):
             try:
                 self.delete_previews(batch, item)
                 self.remove_task_work(batch['id'], item['id'])
@@ -2157,7 +2173,10 @@ class Application:
                             seen.add(path)
         updates = defaultdict(dict)
         verified_archives = set()
+        preserved_sources = set(self.store.get('preserved-task-sources', []))
         for path_text, refs in references.items():
+            if path_text in preserved_sources:
+                continue
             def settled(item):
                 review = item.get('review', {}).get('status')
                 return review == 'approved' or (review == 'superseded'
@@ -2336,27 +2355,8 @@ class Application:
             move_to_trash(path)
 
     def forget_items(self, selections, *, clear_history=False):
-        if not isinstance(selections,list): raise ValueError('请选择要删除的任务')
-        # Serialize with approval. Keep records on trash failure so users can retry.
-        with self.review_lock:
-            targets=[]
-            for selection in selections:
-                if not isinstance(selection,dict) or not isinstance(selection.get('item_ids'),list): raise ValueError('任务选择格式无效')
-                batch=self.store.get('batch:'+str(selection.get('batch_id')), {})
-                wanted=set(map(str,selection['item_ids']))
-                targets.extend((batch,item) for item in batch.get('items',[]) if str(item['id']) in wanted)
-            for batch,item in targets:
-                if item['status']=='running':
-                    self.store.update(batch['id'],lambda b:next(i for i in b['items'] if i['id']==item['id']).update(cancel_requested=True))
-            deadline=time.monotonic()+10
-            for batch,item in targets:
-                while next((i for i in self.batch(batch['id'])['items'] if i['id']==item['id']),{}).get('status')=='running':
-                    if time.monotonic()>deadline: raise ValueError('任务正在终止，文件暂未移动，请稍后重试删除')
-                    time.sleep(.1)
-                self.delete_previews(batch,item)
-                self.remove_task_work(batch['id'],item['id'])
-                self.trash_task_output(batch,item)
-            return self._forget_records(selections,clear_history=clear_history)
+        """Remove records immediately; never recycle completed output or source files."""
+        return self._forget_records(selections, clear_history=clear_history, preserve_files=True)
 
     def approve(self, body):
         bid,iid=str(body['batch_id']),str(body['item_id'])
@@ -2379,6 +2379,12 @@ class Application:
                         'approved_at':datetime.now().astimezone().isoformat(timespec='seconds'),
                         'music_paths':str(source.with_suffix('.txt')) if source.with_suffix('.txt').exists() else None}
                 self.store.update(bid,lambda b:next(i for i in b['items'] if i['id']==iid).update(review=review, cleanup={'output_retained':True,'source_cleanup_requested':bool(item.get('segments'))}))
+            # A new explicit approval authorizes source cleanup again. Forgetting a
+            # record alone must not release a shared source to background deletion.
+            approved_paths = {str(Path(part['path']).resolve()) for part in item.get('segments', []) if part.get('path')}
+            preserved_sources = set(self.store.get('preserved-task-sources', []))
+            if approved_paths & preserved_sources:
+                self.store.put('preserved-task-sources', sorted(preserved_sources - approved_paths))
             self._cleanup_approved_output(bid,iid)
             self._cleanup_sticker_origin(bid,iid)
             self._cleanup_approved_sources()

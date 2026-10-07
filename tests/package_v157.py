@@ -30,7 +30,7 @@ def main():
    for _ in range(100):
     try:boot=api('/api/bootstrap');break
     except OSError:time.sleep(.1)
-   assert boot['version']=='1.5.7' and boot['api_protocol']==13
+   assert boot['version']=='1.5.8' and boot['api_protocol']==14
    batches=[]
    for mode in ['folder','pool']:
     config={'music_mode':mode,'count':1,'min_duration':4,'max_duration':4,'mode':'single','allow_overlap':True,
@@ -66,13 +66,14 @@ def main():
    assert Path(approved).with_suffix('.txt').read_text().count('曲目列表')==1
    api('/api/tasks/track-titles',{'enabled':False,'selections':[{'batch_id':bid,'item_id':iid}]})
    assert '曲目列表' not in Path(approved).with_suffix('.txt').read_text()
+   subprocess.run(['/Users/zhaoyue_macmini/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node','tests/ui_v158.cjs'],env=dict(env,MIXCUT_TASK_KEY=bid+':'+iid),check=True)
    result=api('/api/tasks/forget',{'selections':[{'batch_id':bid,'item_ids':[iid]}]})
-   assert result['deleted_items']==1 and not original.parent.exists()
+   assert result['deleted_items']==0 and original.is_file() and original.with_suffix('.txt').is_file()
    bid,iid=batches[0]
    result=api('/api/reject',{'batch_id':bid,'item_id':iid,'confirmation':'REJECT_VIDEO_AND_SOURCES'})
    assert result['ok']
    assert all(Path(song['path']).is_file() for song in songs),'music must remain'
-   print('V1.5.7 packaged acceptance: two real renders, dated numbered bundles, same inode retained on approval, document toggle, native recycle on deletion and rejection; original music preserved')
+   print('V1.5.8 packaged acceptance: two real renders, dated numbered bundles, same inode retained on approval, document toggle, record-only deletion and native recycle on rejection; original music preserved')
   finally:
    try:api('/api/shutdown',{})
    except Exception:pass

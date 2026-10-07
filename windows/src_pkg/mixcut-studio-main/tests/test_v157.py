@@ -35,26 +35,27 @@ class RetainedReviewTests(unittest.TestCase):
         target=self.root/'trash'/Path(path).name;target.parent.mkdir(exist_ok=True);Path(path).rename(target)
         return str(target)
 
-    def test_delete_approved_bundle_recycles_whole_folder_and_removes_row(self):
+    def test_delete_approved_bundle_preserves_all_files_and_removes_row(self):
         self.app.approve({'batch_id':'abc123','item_id':'1'})
-        (self.folder/'封面.txt').write_text('belongs to task')
-        with patch('mixcut.trash.move_to_trash',side_effect=self.recycle):
+        cover=self.folder/'封面.txt';cover.write_text('keep')
+        before={p.name:p.read_bytes() for p in self.folder.iterdir()}
+        with patch('mixcut.trash.move_to_trash',side_effect=AssertionError('no recycling')), patch.object(self.app,'delete_previews',side_effect=AssertionError('no cleanup')):
             result=self.app.forget_items([{'batch_id':'abc123','item_ids':['1']}])
-        self.assertEqual(1,result['deleted_items']);self.assertFalse(self.folder.exists())
-        self.assertTrue((self.root/'trash'/self.folder.name/'封面.txt').exists())
+        self.assertEqual(1,result['deleted_items'])
+        self.assertEqual(before,{p.name:p.read_bytes() for p in self.folder.iterdir()})
         self.assertIsNone(self.app.store.get('batch:abc123'))
 
-    def test_failure_preserves_record_and_all_files(self):
+    def test_delete_does_not_require_available_trash(self):
         with patch('mixcut.trash.move_to_trash',side_effect=OSError('disk unavailable')):
-            with self.assertRaises(OSError):self.app.forget_items([{'batch_id':'abc123','item_ids':['1']}])
-        self.assertTrue(self.video.exists());self.assertEqual(1,len(self.app.batch('abc123')['items']))
+            self.app.forget_items([{'batch_id':'abc123','item_ids':['1']}])
+        self.assertTrue(self.video.exists());self.assertIsNone(self.app.store.get('batch:abc123'))
 
-    def test_old_shared_folder_deletes_only_matching_video_and_txt(self):
+    def test_old_shared_folder_preserves_video_and_txt(self):
         self.item.pop('output_bundle');self.app.store.put('batch:abc123',self.batch)
         sibling=self.folder/'other.mp4';sibling.write_bytes(b'keep')
         self.video.with_suffix('.txt').write_text('doc')
-        with patch('mixcut.trash.move_to_trash',side_effect=self.recycle):self.app.forget_items([{'batch_id':'abc123','item_ids':['1']}])
-        self.assertTrue(sibling.exists());self.assertTrue(self.folder.exists());self.assertFalse(self.video.exists())
+        self.app.forget_all_items()
+        self.assertTrue(sibling.exists());self.assertTrue(self.video.exists());self.assertTrue(self.video.with_suffix('.txt').exists())
 
     def test_rejection_trashes_bundle_without_touching_music(self):
         with patch('mixcut.trash.move_to_trash',side_effect=self.recycle):
@@ -76,3 +77,41 @@ class RetainedReviewTests(unittest.TestCase):
             self.app.approve({'batch_id':'abc123','item_id':'1'});self.assertTrue(source.exists())
             self.app.approve({'batch_id':'abc123','item_id':'2'});self.assertFalse(source.exists())
         self.assertTrue(self.video.exists());self.assertTrue(output.exists())
+
+    def test_forgetting_unreviewed_task_preserves_sources_music_and_documents(self):
+        source=self.root/'raw.mp4';source.write_bytes(b'raw video')
+        music=self.root/'song.mp3';music.write_bytes(b'reusable music')
+        self.video.with_suffix('.txt').write_text('document')
+        self.item.update(segments=[{'asset_id':'raw','path':str(source),'start':0,'duration':3}],music=[{'path':str(music)}])
+        self.app.store.put('batch:abc123',self.batch)
+        snapshot={p:p.read_bytes() for p in [source,music,self.video,self.video.with_suffix('.txt')]}
+        result=self.app.forget_all_items()
+        self.assertEqual(1,result['deleted_items'])
+        self.assertEqual(snapshot,{p:p.read_bytes() for p in snapshot})
+
+    def test_running_delete_is_immediate_and_only_requests_cancellation(self):
+        self.item['status']='running';self.batch['status']='running'
+        self.app.store.put('batch:abc123',self.batch)
+        import time
+        started=time.monotonic()
+        result=self.app.forget_items([{'batch_id':'abc123','item_ids':['1']}])
+        self.assertLess(time.monotonic()-started,1)
+        self.assertIsNone(result['updated_batches']['abc123'])
+        internal=self.app.batch('abc123')['items'][0]
+        self.assertTrue(internal['cancel_requested']);self.assertTrue(internal['dismissed'])
+        self.assertTrue(self.video.exists())
+
+    def test_deleting_shared_pending_reference_does_not_trigger_background_source_deletion(self):
+        import copy
+        from mixcut.media import path_identity
+        directory=self.root/'originals';directory.mkdir();source=directory/'source.mp4';source.write_bytes(b'original')
+        st=source.stat();asset={'id':path_identity(source),'path':str(source),'size':st.st_size,'mtime_ns':st.st_mtime_ns,'identity_mode':'path'}
+        self.item.update(segments=[{'asset_id':asset['id'],'path':str(source),'start':0,'duration':3}],video_assets=[asset])
+        pending=copy.deepcopy(self.item);pending.update(id='2',status='pending')
+        self.batch['items'].append(pending);self.batch['config']['source_video_dir']=str(directory)
+        self.app.store.put('batch:abc123',self.batch)
+        self.app.approve({'batch_id':'abc123','item_id':'1'})
+        self.assertTrue(source.exists())
+        self.app.forget_items([{'batch_id':'abc123','item_ids':['2']}])
+        self.app._complete_approved_cleanup()
+        self.assertTrue(source.exists());self.assertTrue(self.video.exists())
