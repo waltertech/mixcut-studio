@@ -498,7 +498,8 @@ class Application:
                         (existing['status'] != 'completed' or Path(existing['items'][0]['output_path']).is_file())):
                     return {'job_id': existing['id'], **self.sticker_variant_status(existing['id'])}
             output_root = Path(source_batch['config']['output_dir'])
-            folder = self.reserve_output_folder(output_root)
+            day = output_root / datetime.now().astimezone().strftime('%Y-%m-%d')
+            folder, _ = self.reserve_review_bundle(day, {}, label=output_root.name)
             batch_id = uuid.uuid4().hex[:12]
             config = copy.deepcopy(source_batch['config'])
             config.update(count=1, sticker_template_id=template.get('id'),
@@ -514,7 +515,7 @@ class Application:
                                             music_folders(source_item.get('music', [])),
                     'source_asset': source_asset, 'status': 'pending', 'progress': 0, 'error': None, 'attempts': 0,
                     'music_styles': styles, 'output_name': filename,
-                    'output_path': str(folder / filename)}
+                    'output_bundle':str(folder), 'output_path': str(folder / filename)}
             origin = {'batch_id': source_batch_id, 'item_id': source_item_id, 'signature': signature,
                       'template_name': template['name'], 'replace_origin_on_approval': True}
             batch = {'id': batch_id, 'status': 'draft', 'created_at': time.time(), 'updated_at': time.time(),
@@ -777,7 +778,8 @@ class Application:
         else:
             folder_catalog = []
         items = result['items']
-        output_folder = self.reserve_output_folder(output)
+        output_folder = output / datetime.now().astimezone().strftime('%Y-%m-%d')
+        output_folder.mkdir(parents=True, exist_ok=True)
         for index, item in enumerate(items, 1):
             item['id'] = str(item.get('id') or index)
             item['index'] = index + index_offset
@@ -787,7 +789,9 @@ class Application:
             item['music_source_folders'] = music_folders(item['music'])
             item['music_styles'] = music_styles(item['music'], music_root)
             item['output_name'] = export_filename(item['music_styles'], item['index'])
-            item['output_path'] = str(output_folder / item['output_name'])
+            folder, _ = self.reserve_review_bundle(output_folder, item, label=output.name)
+            item['output_bundle'] = str(folder)
+            item['output_path'] = str(folder / item['output_name'])
         batch = {'id': batch_id, 'status': 'draft', 'created_at': time.time(),
                  'updated_at': time.time(), 'config': config, 'items': items,
                  'stats': result.get('stats', {}), 'warnings': result.get('warnings', []),
@@ -838,7 +842,7 @@ class Application:
         item['music_source_folders'] = music_folders(item['music'])
         item['music_styles'] = music_styles(item['music'], root)
         item['output_name'] = export_filename(item['music_styles'], item['index'])
-        item['output_path'] = str(Path(batch['output_folder']) / item['output_name'])
+        item['output_path'] = str(Path(item.get('output_bundle') or batch['output_folder']) / item['output_name'])
         self._update_plan_counts(batch)
 
     def reorder_music(self, batch_id, item_id, music_ids):
@@ -1153,7 +1157,7 @@ class Application:
         return [visible for batch in self.store.batches()
                 if (visible := self._visible_batch(batch)) is not None]
 
-    def forget_items(self, selections, *, clear_history=False):
+    def _forget_records(self, selections, *, clear_history=False):
         """Forget task rows promptly; ongoing work is cancelled without touching media files."""
         if not isinstance(selections, list):
             raise ValueError('请选择要删除的任务')
@@ -1242,7 +1246,7 @@ class Application:
                     for item in batch['items']:
                         cleanup = item.get('cleanup', {})
                         archived = item.get('review', {}).get('status') in {'approved', 'superseded'}
-                        settled = (archived and cleanup.get('output_deleted')
+                        settled = (archived and not item.get('review',{}).get('retained') and cleanup.get('output_deleted')
                                    and (not item.get('segments') or cleanup.get('original_recordings_deleted'))
                                    and (not batch.get('sticker_origin') or cleanup.get('origin_output_deleted'))
                                    and (batch['id'], item['id']) not in dependents)
@@ -1420,18 +1424,18 @@ class Application:
             raise OSError('可用磁盘空间少于 512 MB，请清理空间后继续')
 
     @staticmethod
-    def reserve_review_bundle(root, item):
+    def reserve_review_bundle(root, item, label=None):
         from .naming import review_folder_name
         parent = Path(root)
         parent.mkdir(parents=True, exist_ok=True)
         # Number the whole chosen archive directory, independently of media names.
-        label = review_folder_name(parent.name, 1).split('-', 1)[1]
+        label = review_folder_name(label or parent.name, 1).split('-', 1)[1]
         highest = max((int(match.group(1)) for entry in parent.iterdir()
                        if entry.is_dir() and (match := re.fullmatch(r'(\d+)-' + re.escape(label), entry.name))), default=0)
         styles = item.get('music_styles') or music_styles(item.get('music', []))
         number = highest + 1
         while True:
-            folder = parent / review_folder_name(parent.name, number)
+            folder = parent / review_folder_name(label, number)
             try:
                 folder.mkdir()
                 return folder, Path(export_filename(styles, number)).stem
@@ -1500,7 +1504,7 @@ class Application:
             for item in batch['items']:
                 if item.get('review', {}).get('status') != 'approved':
                     continue
-                if not item.get('cleanup', {}).get('output_deleted'):
+                if not item.get('cleanup', {}).get('output_deleted') and not item.get('cleanup', {}).get('output_retained'):
                     self._cleanup_approved_output(batch['id'], item['id'])
                 if (batch.get('sticker_origin', {}).get('replace_origin_on_approval')
                         and not item.get('cleanup', {}).get('origin_output_deleted')):
@@ -1511,7 +1515,7 @@ class Application:
         for batch in self.store.batches():
             for item in batch['items']:
                 if item.get('review', {}).get('status') == 'approved':
-                    if not item.get('cleanup', {}).get('output_deleted'):
+                    if not item.get('cleanup', {}).get('output_deleted') and not item.get('cleanup', {}).get('output_retained'):
                         self._cleanup_approved_output(batch['id'], item['id'])
                     if (batch.get('sticker_origin', {}).get('replace_origin_on_approval')
                             and not item.get('cleanup', {}).get('origin_output_deleted')):
@@ -1875,7 +1879,7 @@ class Application:
 
     def write_manifest(self, batch_id):
         batch = self.batch(batch_id)
-        directory = batch_output_folder(batch)
+        directory = self.store.directory / 'manifests' / batch_id
         directory.mkdir(parents=True, exist_ok=True)
         temporary = directory / '.manifest.json.tmp'
         temporary.write_text(json.dumps(batch, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -1996,6 +2000,12 @@ class Application:
         review = item.get('review', {})
         if review.get('status') != 'approved':
             return batch
+        if review.get('retained'):
+            try:
+                self.cleanup_task_cache(batch, item)
+                return self.store.update(batch_id, lambda b: next(i for i in b['items'] if i['id']==item_id).setdefault('cleanup',{}).update(output_retained=True,temporary_segments_deleted=True,output_error=None))
+            except (OSError, ValueError) as exc:
+                return self.store.update(batch_id, lambda b: next(i for i in b['items'] if i['id']==item_id).setdefault('cleanup',{}).update(output_error=str(exc)))
         archived = Path(review['path'])
         try:
             if not archived.is_file() or self.file_digest(archived) != review.get('sha256'):
@@ -2033,8 +2043,12 @@ class Application:
         if review.get('status') != 'approved':
             raise ValueError('关联任务尚未审核通过')
         archive = Path(review.get('path', ''))
-        if not archive.is_file() or not review.get('sha256') or self.file_digest(archive) != review['sha256']:
+        if not archive.is_file() or (not review.get('retained') and (not review.get('sha256') or self.file_digest(archive) != review['sha256'])):
             raise ValueError('关联任务的审核成片缺失或校验失败')
+        if review.get('retained'):
+            stat = archive.stat()
+            if stat.st_size != review.get('size') or (review.get('mtime_ns') and stat.st_mtime_ns != review['mtime_ns']):
+                raise ValueError('已保留成片发生变化，原素材暂不删除')
         return archive
 
     def _cleanup_sticker_origin(self, batch_id, item_id):
@@ -2058,6 +2072,8 @@ class Application:
             if source_item is None:
                 raise ValueError('原任务记录已删除，无法自动清理原成片和素材')
             source_review = source_item.get('review', {})
+            if source_review.get('status') == 'approved' and source_review.get('retained'):
+                return self.store.update(batch_id,lambda b:next(i for i in b['items'] if i['id']==item_id).setdefault('cleanup',{}).update(origin_output_deleted=True,origin_status='原视频已单独审核，保留原处',origin_error=None))
             if source_review.get('status') == 'approved':
                 # An independently approved original is a separate accepted deliverable.
                 if not source_item.get('cleanup', {}).get('output_deleted'):
@@ -2106,8 +2122,11 @@ class Application:
                     source_cleanup_requested=bool(original.get('segments')))
             self.store.update(source_batch['id'], mark_replaced)
             self.cleanup_task_cache(source_batch, source_item)
-            source_path.unlink(missing_ok=True)
-            source_path.with_suffix('.txt').unlink(missing_ok=True)
+            if item.get('review',{}).get('retained'):
+                self.trash_task_output(source_batch,source_item)
+            else:
+                source_path.unlink(missing_ok=True)
+                source_path.with_suffix('.txt').unlink(missing_ok=True)
             shutil.rmtree(self.store.directory / 'work' / source_batch['id'] / source_item['id'], ignore_errors=True)
             self.store.update(source_batch['id'], lambda current: next(
                 entry for entry in current['items'] if entry['id'] == source_item['id']
@@ -2200,7 +2219,7 @@ class Application:
             if item is None or item.get('review', {}).get('status') != 'approved':
                 raise ValueError('只有审核通过的任务可以重试清理')
             archive = Path(item['review'].get('path', ''))
-            if not archive.is_file() or self.file_digest(archive) != item['review'].get('sha256'):
+            if not archive.is_file() or (not item['review'].get('retained') and self.file_digest(archive) != item['review'].get('sha256')):
                 raise ValueError('审核成片缺失或校验失败，请先恢复审核文件')
             self.store.update(batch_id, lambda current: next(
                 entry for entry in current['items'] if str(entry['id']) == str(item_id)
@@ -2279,8 +2298,7 @@ class Application:
             for current, entry in outputs:
                 try:
                     self.cleanup_task_cache(current, entry)
-                    Path(entry['output_path']).unlink(missing_ok=True)
-                    Path(entry['output_path']).with_suffix('.txt').unlink(missing_ok=True)
+                    self.trash_task_output(current, entry)
                     if entry['id'] != item_id or current['id'] != batch_id:
                         self.store.update(current['id'], lambda b: next(i for i in b['items'] if i['id'] == entry['id']).update(
                             dismissed=True, cancel_requested=True, status='cancelled'))
@@ -2298,7 +2316,75 @@ class Application:
             self.wake.set()
             return {'ok': not errors, **result}
 
+    def trash_task_output(self, batch, item):
+        from .trash import move_to_trash
+        output = Path(item['output_path'])
+        bundle = item.get('output_bundle')
+        if bundle:
+            folder = Path(bundle)
+            root = Path(batch['config']['output_dir']).resolve()
+            if folder.is_symlink() or folder.resolve() == root or not folder.resolve().is_relative_to(root) or output.parent != folder:
+                raise ValueError('成品目录与任务记录不一致，文件已保留')
+            return move_to_trash(folder)
+        # Old batches share a directory: recycle only this task's known files.
+        paths = [output, output.with_suffix('.txt')]
+        reviewed = item.get('review', {}).get('path')
+        if reviewed:
+            paths.extend([Path(reviewed),Path(reviewed).with_suffix('.txt')])
+        for path in dict.fromkeys(paths):
+            if path.is_symlink(): raise ValueError('成品路径是链接，文件已保留')
+            move_to_trash(path)
+
+    def forget_items(self, selections, *, clear_history=False):
+        if not isinstance(selections,list): raise ValueError('请选择要删除的任务')
+        # Serialize with approval. Keep records on trash failure so users can retry.
+        with self.review_lock:
+            targets=[]
+            for selection in selections:
+                if not isinstance(selection,dict) or not isinstance(selection.get('item_ids'),list): raise ValueError('任务选择格式无效')
+                batch=self.store.get('batch:'+str(selection.get('batch_id')), {})
+                wanted=set(map(str,selection['item_ids']))
+                targets.extend((batch,item) for item in batch.get('items',[]) if str(item['id']) in wanted)
+            for batch,item in targets:
+                if item['status']=='running':
+                    self.store.update(batch['id'],lambda b:next(i for i in b['items'] if i['id']==item['id']).update(cancel_requested=True))
+            deadline=time.monotonic()+10
+            for batch,item in targets:
+                while next((i for i in self.batch(batch['id'])['items'] if i['id']==item['id']),{}).get('status')=='running':
+                    if time.monotonic()>deadline: raise ValueError('任务正在终止，文件暂未移动，请稍后重试删除')
+                    time.sleep(.1)
+                self.delete_previews(batch,item)
+                self.remove_task_work(batch['id'],item['id'])
+                self.trash_task_output(batch,item)
+            return self._forget_records(selections,clear_history=clear_history)
+
     def approve(self, body):
+        bid,iid=str(body['batch_id']),str(body['item_id'])
+        with self.review_lock,self.sticker_lock:
+            batch=self.batch(bid)
+            item=next((i for i in batch['items'] if i['id']==iid),None)
+            if not item or item.get('status')!='success': raise ValueError('只能审核已成功生成的视频')
+            previous=item.get('review',{})
+            if previous.get('status') in {'rejecting','reject_failed','rejected','superseded'}: raise ValueError('该任务无法审核通过')
+            if item.get('thumbnails') and previous.get('status')!='approved':
+                if not self.review_ready(item) or not self.keyframes.ready(item['thumbnails'].get('version'),item['thumbnails'].get('total',0)):
+                    raise ValueError('缩略图尚未准备好，请等待或重试生成后审核')
+            source=self.completed_output(bid,iid)
+            stat=source.stat();expected=item.get('result',{})
+            if previous.get('status')!='approved' and expected.get('output_mtime_ns') and (stat.st_size!=expected.get('output_size') or stat.st_mtime_ns!=expected['output_mtime_ns']):
+                raise ValueError('成片已被修改，请检查文件')
+            self.write_music_sidecar(item,source,replace=True)
+            if previous.get('status')!='approved':
+                review={'status':'approved','path':str(source),'retained':True,'size':stat.st_size,'mtime_ns':stat.st_mtime_ns,
+                        'approved_at':datetime.now().astimezone().isoformat(timespec='seconds'),
+                        'music_paths':str(source.with_suffix('.txt')) if source.with_suffix('.txt').exists() else None}
+                self.store.update(bid,lambda b:next(i for i in b['items'] if i['id']==iid).update(review=review, cleanup={'output_retained':True,'source_cleanup_requested':bool(item.get('segments'))}))
+            self._cleanup_approved_output(bid,iid)
+            self._cleanup_sticker_origin(bid,iid)
+            self._cleanup_approved_sources()
+            return self.batch(bid)
+
+    def _approve_legacy(self, body):
         batch_id, item_id = str(body['batch_id']), str(body['item_id'])
         # Serialize approvals, not rendering. Double clicks cannot copy the same item twice.
         with self.review_lock, self.sticker_lock:
@@ -2401,7 +2487,7 @@ class Application:
     def start_batch_review(self, batch_id, body):
         review_dir = str(body.get('review_dir', '')).strip()
         if not review_dir:
-            raise ValueError('请先设置审核通过文件夹')
+            review_dir = self.bootstrap()['output_dir']
         with self.review_lock, self.review_job_lock:
             existing = self.review_jobs.get(batch_id)
             if existing and existing['status'] == 'running':
@@ -2446,7 +2532,7 @@ class Application:
     def start_review_all(self, body):
         review_dir = str(body.get('review_dir', '')).strip()
         if not review_dir:
-            raise ValueError('请先设置审核通过文件夹')
+            review_dir = self.bootstrap()['output_dir']
         with self.review_job_lock:
             if self.global_review_job['status'] == 'running':
                 return dict(self.global_review_job)

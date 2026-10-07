@@ -34,16 +34,16 @@
   const persistPreference = async (key, value) => { if (!value) return; try { await api('/api/preferences', { method: 'POST', body: JSON.stringify({ [key]: value }) }); } catch (error) { toast(`保存目录失败：${error.message}`, true); } };
   const syncReviewDir = (value) => { $('#review-dir').value = value; $('#task-review-dir').value = value; };
   const rejectItem = async (batch, item, button) => {
-    if (!confirm('审核不通过将删除这条成片和它用到的视频原素材，同时清理缩略图与剪辑缓存。音乐文件保留。确认不通过吗？')) return;
+    if (!confirm('审核不通过会将成品文件夹移至废纸篓，删除和它用到的视频原素材，同时清理缩略图与剪辑缓存。音乐文件保留。确认不通过吗？')) return;
     button.disabled = true;
     button.textContent = '正在删除视频';
     try {
       const result = await api('/api/reject', {method:'POST', body:JSON.stringify({batch_id:batch.id, item_id:item.id, confirmation:'REJECT_VIDEO_AND_SOURCES'})});
-      toast(result.ok ? '审核不通过：成片与原视频已删除，音乐保留。' : `部分文件清理失败：${(result.errors || []).join('；')}`, !result.ok);
+      toast(result.ok ? '审核不通过：成品已移至废纸篓，原视频已删除，音乐保留。' : `部分文件清理失败：${(result.errors || []).join('；')}`, !result.ok);
       await refreshBatches();
     } catch(error) { button.disabled=false; button.textContent='审核不通过'; toast(error.message,true); }
   };
-  const approveItem = async (batchId, itemId, button) => { const review_dir = $('#task-review-dir').value.trim() || $('#review-dir').value.trim(); if (!review_dir) { toast('请先选择审核通过文件夹。', true); return; } button.disabled = true; button.textContent = '正在归档'; try { await api('/api/approve', { method: 'POST', body: JSON.stringify({ batch_id: batchId, item_id: itemId, review_dir }) }); toast('已复制到审核通过文件夹。'); await refreshBatches(); } catch (error) { button.disabled = false; button.textContent = '通过审核'; const line = document.createElement('div'); line.className = 'error'; line.textContent = `归档失败：${error.message}`; button.parentElement?.append(line); toast(error.message, true); } };
+  const approveItem = async (batchId, itemId, button) => { const review_dir = $('#output-dir').value.trim();  button.disabled = true; button.textContent = '正在审核'; try { await api('/api/approve', { method: 'POST', body: JSON.stringify({ batch_id: batchId, item_id: itemId, review_dir }) }); toast('已通过审核，成片保留原处。'); await refreshBatches(); } catch (error) { button.disabled = false; button.textContent = '通过审核'; const line = document.createElement('div'); line.className = 'error'; line.textContent = `审核失败：${error.message}`; button.parentElement?.append(line); toast(error.message, true); } };
   const reviewCandidates = batch => (batch.items || []).filter(item => item.status === 'success' && (!item.thumbnails || item.thumbnails.status === 'ready') && !['approved','superseded','copying','rejecting','reject_failed','rejected'].includes(item.review?.status)).sort((a,b) => (Number(a.index) || 0) - (Number(b.index) || 0) || String(a.id).localeCompare(String(b.id)));
   const reviewPolls = new Set();
   const paintReviewJob = batchId => {
@@ -76,14 +76,14 @@
     finally { reviewPolls.delete(batchId); }
   };
   const approveBatch = async batch => {
-    const review_dir = $('#task-review-dir').value.trim() || $('#review-dir').value.trim();
-    if (!review_dir) return toast('请先选择审核通过文件夹。', true);
+    const review_dir = $('#output-dir').value.trim();
+
     const card = $(`.batch[data-batch-id="${batch.id}"]`);
     if ($$('.sticker-variant', card).some(select => select.value)) return toast('本批次已选择贴图模板，请先处理贴图任务。', true);
     const candidates = reviewCandidates(batch);
     if (!candidates.length) return toast('此批次没有可审核的已完成任务。', true);
     const skipped = (batch.items || []).length - candidates.length;
-    if (!confirm(`将按任务序号依次审核 ${candidates.length} 条已完成视频${skipped ? `，跳过 ${skipped} 条未完成或已审核任务` : ''}。每条归档成功后会按现有规则清理制作目录成片及可安全删除的原素材；遇到错误即停止。确定继续吗？`)) return;
+    if (!confirm(`将按任务序号依次审核 ${candidates.length} 条已完成视频${skipped ? `，跳过 ${skipped} 条未完成或已审核任务` : ''}。每条审核通过后成片保留原处，并清理缓存及可安全删除的原视频素材；遇到错误即停止。确定继续吗？`)) return;
     try {
       const job = await api(`/api/batches/${encodeURIComponent(batch.id)}/approve-all`, {method:'POST', body:JSON.stringify({review_dir, item_ids:candidates.map(item => String(item.id))})});
       state.reviewJobs.set(batch.id, job);
@@ -114,8 +114,8 @@
     finally { button.disabled = false; button.textContent = '一键审核'; globalReviewPolling = false; }
   };
   const approveAllVisible = async () => {
-    const review_dir = $('#task-review-dir').value.trim() || $('#review-dir').value.trim();
-    if (!review_dir) return toast('请先选择审核通过文件夹。', true);
+    const review_dir = $('#output-dir').value.trim();
+
     if ($$('.sticker-variant').some(select => select.value)) return toast('有任务选了贴图模板，请先生成对应的贴图版本。', true);
     const count = state.batches.reduce((total,batch) => total + reviewCandidates(batch).length, 0);
     if (!count) return toast('没有待审核的已完成任务。');
@@ -359,7 +359,7 @@
   }
   async function createPlan() { let config; try { config = getConfig(); } catch (error) { toast(error.message, true); return; } const btn = $('#plan-btn'); btn.disabled = true; btn.textContent = '正在规划…'; try { const data = await api('/api/plan', { method: 'POST', body: JSON.stringify({ config }) }); const planned = data.batch || data; state.batches = [planned, ...state.batches.filter(batch => batch.id !== planned.id)]; renderPlan(planned); location.hash = 'plan'; toast('方案生成完成，请核对每条歌曲与视频区间。'); } catch (error) { renderPlan(null); $('#plan-message').textContent = `无法生成方案：${error.message}`; location.hash = 'plan'; toast(error.message, true); } finally { btn.disabled = false; btn.textContent = '生成方案'; } }
   async function batchAction(id, action) { try { const data = await api(`/api/batches/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: '{}' }); if (action === 'start') renderPlan(null); else if (data.batch && state.batch?.id === id) renderPlan(data.batch); toast({start:'已加入渲染队列',pause:'将在执行中的成片完成后暂停',resume:'已继续队列',stop:'已停止队列',retry:'已安排重试'}[action] || '操作成功'); if (action === 'start') location.hash = 'tasks'; refreshBatches(); } catch (error) { toast(error.message, true); } }
-  async function itemAction(batchId, itemId, action) { try { const result = await api(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}/${action}`, { method:'POST', body:'{}' }); if (action === 'delete' && result.updated_batches) applyDeletedBatches(result.updated_batches); else { state.batchSignature=''; await refreshBatches(); } toast(result.preview_cleanup_errors?.length ? `任务已删除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : {start:'已重新开始该条任务',stop:'已终止该条任务',delete:'已删除任务；成品和素材保留，缩略图已清理'}[action], !!result.preview_cleanup_errors?.length); } catch (error) { toast(error.message,true); } }
+  async function itemAction(batchId, itemId, action) { try { const result = await api(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}/${action}`, { method:'POST', body:'{}' }); if (action === 'delete' && result.updated_batches) applyDeletedBatches(result.updated_batches); else { state.batchSignature=''; await refreshBatches(); } toast(result.preview_cleanup_errors?.length ? `任务已删除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : {start:'已重新开始该条任务',stop:'已终止该条任务',delete:'已删除任务；成品已移至废纸篓，原素材保留，缩略图已清理'}[action], !!result.preview_cleanup_errors?.length); } catch (error) { toast(error.message,true); } }
   async function allBatches(action) { const candidates=state.batches.filter(batch=>action==='pause'?['queued','running'].includes(batch.status):(action==='stop'?['queued','running','pausing','paused'].includes(batch.status):['paused','stopped','draft'].includes(batch.status))); for(const batch of candidates){const next=action==='pause'?'pause':(action==='stop'?'stop':(batch.status==='paused'?'resume':'start'));try{await api(`/api/batches/${encodeURIComponent(batch.id)}/${next}`,{method:'POST',body:'{}'});}catch(error){toast(`批次 ${batch.id}：${error.message}`,true);}} state.batchSignature='';await refreshBatches(); }
   function applyDeletedBatches(updatedBatches) {
     const byId = new Map(state.batches.map(batch => [batch.id, batch]));
@@ -389,7 +389,9 @@
     const label=document.createElement('label');label.className='track-title-option';
     const checkbox=document.createElement('input');checkbox.type='checkbox';checkbox.checked=!!item.include_track_titles;checkbox.setAttribute('aria-label',`任务 ${item.index || item.id} 附带曲目曲名`);
     checkbox.addEventListener('change',async()=>{ const previous=!!item.include_track_titles;checkbox.disabled=true;try{await setTrackTitles([{batch_id:batch.id,item_id:item.id}],checkbox.checked);}catch(error){checkbox.checked=previous;toast(error.message,true);}finally{checkbox.disabled=false;} });
-    label.append(checkbox,document.createTextNode('附带曲目曲名'));return label;
+    label.append(checkbox,document.createTextNode('附带曲目曲名'));
+    if(item.status==='success'){const open=document.createElement('button');open.type='button';open.className='button';open.textContent='打开成品文件夹';open.onclick=async event=>{event.preventDefault();try{await api('/api/reveal',{method:'POST',body:JSON.stringify({batch_id:batch.id,item_id:item.id,review:item.review?.status==='approved'})});}catch(error){toast(error.message,true);}};label.append(open);}
+    return label;
   }
   async function setSelectedTrackTitles(scope,enabled) {
     const batches=scope==='plan'?(state.batch?[state.batch]:[]):state.batches;
@@ -410,8 +412,8 @@
       selections.forEach(entry => entry.item_ids.forEach(id => selectedTasks.delete(taskKey(entry.batch_id,id))));
       if (result.updated_batches) applyDeletedBatches(result.updated_batches);
       else { state.batchSignature=''; await refreshBatches(); if (state.batch) renderPlan(state.batches.find(batch => batch.id === state.batch.id) || null); }
-      if (scope === 'plan') $('#plan-message').textContent = `已删除 ${result.deleted_items} 条任务记录，当前方案剩余 ${state.batch?.items?.length || 0} 条。成品和素材保留，缩略图已清理。`;
-      toast(result.preview_cleanup_errors?.length ? `任务已删除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : `已删除 ${result.deleted_items} 条任务记录；成品和素材保留，缩略图已清理。`, !!result.preview_cleanup_errors?.length);
+      if (scope === 'plan') $('#plan-message').textContent = `已删除 ${result.deleted_items} 条任务记录，当前方案剩余 ${state.batch?.items?.length || 0} 条。成品已移至废纸篓，原素材保留，缩略图已清理。`;
+      toast(result.preview_cleanup_errors?.length ? `任务已删除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : `已删除 ${result.deleted_items} 条任务记录；成品已移至废纸篓，原素材保留，缩略图已清理。`, !!result.preview_cleanup_errors?.length);
     } catch(error) { toast(error.message,true); }
     finally { button.disabled = false; updateSelectionButtons(); }
   }
@@ -425,7 +427,7 @@
     try {
       const result=await api('/api/tasks/clear',{method:'POST',body:'{}'});
       selectedTasks.clear();applyDeletedBatches(result.updated_batches);renderPlan(null);
-      toast(result.preview_cleanup_errors?.length ? `任务已清除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : `已清除 ${result.deleted_items} 条任务记录；成品和素材保留，缩略图已清理。`, !!result.preview_cleanup_errors?.length);
+      toast(result.preview_cleanup_errors?.length ? `任务已清除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : `已清除 ${result.deleted_items} 条任务记录；成品已移至废纸篓，原素材保留，缩略图已清理。`, !!result.preview_cleanup_errors?.length);
     } catch(error){toast(error.message,true);}
   }
   async function downloadDeletionRecords() {
@@ -477,7 +479,7 @@
     else { renderBatches(batches); hydrateGalleries(); restoreTaskScroll(anchor); requestAnimationFrame(() => restoreTaskScroll(anchor)); }
     if (!state.poller) setupPolling();
   }
-  async function bootstrap() { try { const data = await api('/api/bootstrap'); if (data.api_protocol !== 12) throw new Error(`本地后台接口版本不兼容（当前 ${data.api_protocol ?? '未知'}，需要 12）。请先停止旧版后台再重新打开 MixCut Studio。`); state.serverVersion = data.version || ''; $('#video-dir').value = data.video_dir || ''; $('#music-dir').value = data.music_dir || ''; state.libraryDirs = {video: data.video_dir || '', music: data.music_dir || ''}; $('#output-dir').value = data.output_dir || ''; syncReviewDir(data.review_dir || ''); state.scan = data.scan || state.scan; state.batches = data.batches || []; state.reviewJobs = new Map(Object.entries(data.review_jobs || {})); state.batchSignature = batchesSignature(state.batches); state.batchLayoutSignature = batchesLayoutSignature(state.batches); renderAssets(); updateStickerSelectors(); renderErrors(state.scan.errors || []); renderBatches(state.batches); refreshCache(); hydrateGalleries(); const draft = state.batches.find(batch => batch.status === 'draft'); if (draft) renderPlan(draft); if (data.scan_job && ['discovering','analyzing'].includes(data.scan_job.status)) applyScanJob(data.scan_job); setServer(true, data.ffmpeg_available === false ? `${connectedLabel()} · 未找到 FFmpeg` : connectedLabel()); Object.entries(data.review_jobs || {}).filter(([, job]) => job.status === 'running').forEach(([id]) => watchBatchReview(id)); if (data.global_review_job?.status === 'running') watchAllReview(); document.dispatchEvent(new Event('mixcut-bootstrap')); } catch (error) { setServer(false, error.message); renderErrors([error.message]); } }
+  async function bootstrap() { try { const data = await api('/api/bootstrap'); if (data.api_protocol !== 13) throw new Error(`本地后台接口版本不兼容（当前 ${data.api_protocol ?? '未知'}，需要 13）。请先停止旧版后台再重新打开 MixCut Studio。`); state.serverVersion = data.version || ''; $('#video-dir').value = data.video_dir || ''; $('#music-dir').value = data.music_dir || ''; state.libraryDirs = {video: data.video_dir || '', music: data.music_dir || ''}; $('#output-dir').value = data.output_dir || ''; syncReviewDir(data.review_dir || ''); state.scan = data.scan || state.scan; state.batches = data.batches || []; state.reviewJobs = new Map(Object.entries(data.review_jobs || {})); state.batchSignature = batchesSignature(state.batches); state.batchLayoutSignature = batchesLayoutSignature(state.batches); renderAssets(); updateStickerSelectors(); renderErrors(state.scan.errors || []); renderBatches(state.batches); refreshCache(); hydrateGalleries(); const draft = state.batches.find(batch => batch.status === 'draft'); if (draft) renderPlan(draft); if (data.scan_job && ['discovering','analyzing'].includes(data.scan_job.status)) applyScanJob(data.scan_job); setServer(true, data.ffmpeg_available === false ? `${connectedLabel()} · 未找到 FFmpeg` : connectedLabel()); Object.entries(data.review_jobs || {}).filter(([, job]) => job.status === 'running').forEach(([id]) => watchBatchReview(id)); if (data.global_review_job?.status === 'running') watchAllReview(); document.dispatchEvent(new Event('mixcut-bootstrap')); } catch (error) { setServer(false, error.message); renderErrors([error.message]); } }
   document.addEventListener('DOMContentLoaded', () => { window.addEventListener('hashchange', showView); for(const scope of ['plan','tasks']) for(const action of ['enable','disable']) $(`#track-titles-${action}-${scope}`).addEventListener('click',()=>setSelectedTrackTitles(scope,action==='enable')); $('#scan-btn').addEventListener('click', scan); $('#plan-btn').addEventListener('click', createPlan); $('#start-btn').addEventListener('click', () => state.batch && batchAction(state.batch.id, 'start')); $('#manifest-btn').addEventListener('click', () => { if (state.batch) window.open(`/api/manifest?batch=${encodeURIComponent(state.batch.id)}`, '_blank', 'noopener'); }); $('#clear-cache').addEventListener('click', clearCache); $('#retry-failed').addEventListener('click', retryFailed); $('#refresh-tasks').addEventListener('click', () => refreshBatches()); $('#pause-all').addEventListener('click',()=>allBatches('pause')); $('#start-all').addEventListener('click',()=>allBatches('start')); $('#stop-all').addEventListener('click',()=>allBatches('stop')); $('#approve-all-visible').addEventListener('click',approveAllVisible); $('#clear-all').addEventListener('click',clearAllBatches); $('#select-all-plan').addEventListener('click',()=>selectAllTasks('plan')); $('#delete-selected-plan').addEventListener('click',()=>deleteSelectedTasks('plan')); $('#select-all-tasks').addEventListener('click',()=>selectAllTasks('tasks')); $('#delete-selected-tasks').addEventListener('click',()=>deleteSelectedTasks('tasks')); $('#shutdown-btn').addEventListener('click', async () => { if (!confirm('确定停止本地后台服务吗？正在处理的任务会停止。')) return; try { await api('/api/shutdown', { method:'POST', body:'{}' }); } catch (error) { toast(error.message, true); return; } stopPolling(); setServer(false, '本地服务已停止'); toast('已请求停止后台服务。'); }); $('#config-form').addEventListener('change', event => { if (event.target.name === 'mode') { $$('.mode-multi').forEach(el => el.hidden = event.target.value !== 'multi'); $$('.mode-single').forEach(el => el.hidden = event.target.value !== 'single'); } if (event.target.name === 'music_mode') { $$('.pool-settings').forEach(el => el.hidden = event.target.value !== 'pool'); $('#folder-mode-help').hidden = event.target.value !== 'folder'; renderPickers(); } }); $('#video-assets').addEventListener('change', event => { if (event.target.matches('.asset-select,.group-input')) { saveAssetPrefs(); renderPickers(); } }); $('#music-assets').addEventListener('change', event => { if (event.target.matches('.asset-select')) { saveAssetPrefs(); renderPickers(); } }); bootstrap().then(showView); });
   document.addEventListener('DOMContentLoaded', () => { $$('.folder-picker').forEach(button => button.addEventListener('click', () => pickFolder(button.dataset.kind))); $('#output-dir').addEventListener('change', () => persistPreference('output_dir', $('#output-dir').value.trim())); ['review-dir', 'task-review-dir'].forEach(id => $(`#${id}`).addEventListener('change', () => { const value = $(`#${id}`).value.trim(); syncReviewDir(value); persistPreference('review_dir', value); })); [['video-dir','video'],['music-dir','music']].forEach(([id,kind]) => $(`#${id}`).addEventListener('change', () => { if ($(`#${id}`).value.trim() !== state.libraryDirs?.[kind]) clearScannedLibrary(kind); })); });
   const polishTaskControls = () => $$('.batch').forEach(card => {
@@ -515,7 +517,7 @@
       action.className = 'review-action field-help';
       if (item.review?.status === 'approved') {
         action.classList.add('review-approved');
-        action.textContent = `已通过审核：${item.review.path || '已归档'}`;
+        action.textContent = `已通过审核，保留原处：${item.review.path || '已归档'}`;
         const reveal = document.createElement('button');
         reveal.className = 'button'; reveal.type = 'button';
         reveal.textContent = '在 Finder 中显示审核文件';
@@ -526,7 +528,7 @@
         action.append(document.createElement('br'),reveal);
         const cleanup = document.createElement('p'); cleanup.className = 'field-help';
         const sourceStates = Object.values(item.cleanup?.source_files || {});
-        cleanup.textContent = `制作目录成品：${item.cleanup?.output_deleted ? '已删除' : (item.cleanup?.output_error || '待确认')} · 原始视频：${sourceStates.length ? sourceStates.join('；') : '无待删源片段记录'}`;
+        cleanup.textContent = `制作目录成品：${item.cleanup?.output_retained ? '保留原处' : item.cleanup?.output_deleted ? '已删除' : (item.cleanup?.output_error || '待确认')} · 原始视频：${sourceStates.length ? sourceStates.join('；') : '无待删源片段记录'}`;
         const origin = batch.sticker_origin;
         const original = item.kind === 'sticker_variant' && origin ? (state.batches.find(entry => entry.id === origin.batch_id)?.items || []).find(entry => entry.id === origin.item_id) : null;
         if (item.kind === 'sticker_variant') {
@@ -534,8 +536,8 @@
           if (original?.segments?.length) cleanup.textContent += ` · 原素材：${Object.values(original.cleanup?.source_files || {}).join('；') || '待清理'}`;
         }
         action.append(cleanup);
-        if (!item.cleanup?.output_deleted || (item.segments?.length && !item.cleanup?.original_recordings_deleted) || (item.kind === 'sticker_variant' && (!item.cleanup?.origin_output_deleted || (original?.segments?.length && !original.cleanup?.original_recordings_deleted)))) {
-          const retry = document.createElement('button'); retry.className = 'button'; retry.type = 'button'; retry.textContent = '重试清理原片与制作成片';
+        if ((!item.cleanup?.output_deleted && !item.cleanup?.output_retained) || (item.segments?.length && !item.cleanup?.original_recordings_deleted) || (item.kind === 'sticker_variant' && (!item.cleanup?.origin_output_deleted || (original?.segments?.length && !original.cleanup?.original_recordings_deleted)))) {
+          const retry = document.createElement('button'); retry.className = 'button'; retry.type = 'button'; retry.textContent = '重试清理缓存与原素材';
           retry.addEventListener('click', async () => { retry.disabled = true; try { await api(`/api/batches/${encodeURIComponent(batch.id)}/items/${encodeURIComponent(item.id)}/retry-cleanup`, {method:'POST',body:'{}'}); state.batchSignature=''; await refreshBatches(); toast('清理状态已更新。'); } catch(error) { retry.disabled = false; toast(error.message,true); } });
           action.append(retry);
         }
@@ -552,15 +554,15 @@
         const approve = document.createElement('button');
         approve.className = 'button primary'; approve.type = 'button';
         approve.disabled = item.review?.status === 'copying';
-        approve.textContent = approve.disabled ? '正在归档' : '通过审核';
+        approve.textContent = approve.disabled ? '正在审核' : '通过审核';
         approve.addEventListener('click', () => approveItem(batch.id,item.id,approve));
         const collapse=document.createElement('button');collapse.className='button';collapse.type='button';collapse.textContent='收起';collapse.onclick=()=>setTaskExpanded(row,false);
         const reject=document.createElement('button');reject.className='button danger';reject.type='button';reject.textContent='审核不通过';reject.disabled=approve.disabled;reject.onclick=()=>rejectItem(batch,item,reject);
         const buttons=document.createElement('div');buttons.className='review-buttons';buttons.append(approve,collapse,reject);action.append(buttons);
-        const variant = document.createElement('select'); variant.className = 'sticker-variant'; variant.setAttribute('aria-label','审核时追加的贴图模板'); variant.append(new Option('不追加贴图', '')); (state.stickers?.templates || []).forEach(template => variant.append(new Option(template.name, template.id))); const makeVariant = document.createElement('button'); makeVariant.className = 'button'; makeVariant.type = 'button'; makeVariant.textContent = '生成贴图版本'; makeVariant.addEventListener('click', async () => { if (!variant.value) return toast('请选择一个贴图模板。', true); makeVariant.disabled = true; try { const job = await api('/api/sticker-variants', { method:'POST', body:JSON.stringify({batch_id:batch.id,item_id:item.id,template_id:variant.value}) }); makeVariant.textContent = '贴图版本排队中'; const timer = setInterval(async () => { try { const status = await api(`/api/sticker-variants/${encodeURIComponent(job.job_id)}`); makeVariant.textContent = status.status === 'completed' ? '贴图版本已生成' : `生成中 ${Math.round((status.progress || 0) * 100)}%`; if (['completed','failed'].includes(status.status)) { clearInterval(timer); makeVariant.disabled = false; if (status.status === 'failed') toast(status.error || '贴图版本生成失败', true); await refreshBatches(); } } catch (_) { clearInterval(timer); makeVariant.disabled = false; } }, 3000); } catch (error) { makeVariant.disabled = false; toast(error.message,true); } }); const hint=document.createElement('p');hint.className='field-help';hint.textContent='审核贴图版后，会清理未审核的原成片及可安全删除的原素材。';makeVariant.disabled=!variant.value;variant.addEventListener('change',()=>{makeVariant.disabled=!variant.value;approve.disabled=!!variant.value || item.review?.status==='copying';approve.textContent=variant.value?'请先生成贴图版本':(approve.disabled?'正在归档':'通过审核');});action.append(hint, variant, makeVariant);
+        const variant = document.createElement('select'); variant.className = 'sticker-variant'; variant.setAttribute('aria-label','审核时追加的贴图模板'); variant.append(new Option('不追加贴图', '')); (state.stickers?.templates || []).forEach(template => variant.append(new Option(template.name, template.id))); const makeVariant = document.createElement('button'); makeVariant.className = 'button'; makeVariant.type = 'button'; makeVariant.textContent = '生成贴图版本'; makeVariant.addEventListener('click', async () => { if (!variant.value) return toast('请选择一个贴图模板。', true); makeVariant.disabled = true; try { const job = await api('/api/sticker-variants', { method:'POST', body:JSON.stringify({batch_id:batch.id,item_id:item.id,template_id:variant.value}) }); makeVariant.textContent = '贴图版本排队中'; const timer = setInterval(async () => { try { const status = await api(`/api/sticker-variants/${encodeURIComponent(job.job_id)}`); makeVariant.textContent = status.status === 'completed' ? '贴图版本已生成' : `生成中 ${Math.round((status.progress || 0) * 100)}%`; if (['completed','failed'].includes(status.status)) { clearInterval(timer); makeVariant.disabled = false; if (status.status === 'failed') toast(status.error || '贴图版本生成失败', true); await refreshBatches(); } } catch (_) { clearInterval(timer); makeVariant.disabled = false; } }, 3000); } catch (error) { makeVariant.disabled = false; toast(error.message,true); } }); const hint=document.createElement('p');hint.className='field-help';hint.textContent='审核贴图版后，会清理未审核的原成片及可安全删除的原素材。';makeVariant.disabled=!variant.value;variant.addEventListener('change',()=>{makeVariant.disabled=!variant.value;approve.disabled=!!variant.value || item.review?.status==='copying';approve.textContent=variant.value?'请先生成贴图版本':(approve.disabled?'正在审核':'通过审核');});action.append(hint, variant, makeVariant);
         if (item.review?.error) {
           const error = document.createElement('div'); error.className = 'review-error';
-          error.textContent = `归档失败：${item.review.error}`; action.append(error);
+          error.textContent = `审核失败：${item.review.error}`; action.append(error);
         }
       }
       if (video) { const directSticker = document.createElement('button'); directSticker.className = 'button direct-sticker'; directSticker.type = 'button'; directSticker.textContent = '在视频上添加贴图'; directSticker.addEventListener('click', () => openVideoStickerEditor(batch, item, video)); action.append(document.createElement('br'), directSticker); video.before(action); }

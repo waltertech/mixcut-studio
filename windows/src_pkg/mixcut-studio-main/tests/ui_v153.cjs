@@ -17,7 +17,7 @@ const fs=require('fs'),path=require('path'),assert=require('assert');
   if(!p.startsWith('/api/')) {
    const file=p==='/'?'index.html':path.basename(p);return route.fulfill({status:200,contentType:file.endsWith('.js')?'application/javascript':file.endsWith('.css')?'text/css':'text/html',body:fs.readFileSync(path.join(process.cwd(),'static',file))});
   }
-  if(p==='/api/bootstrap') return fulfill(route,{api_protocol:12,version:'1.5.6',review_dir:'/tmp/reviewed',scan:{videos:[],music:[],errors:[]},batches:[batch],sticker_catalog:{assets:[],templates:[]},ffmpeg_available:true});
+  if(p==='/api/bootstrap') return fulfill(route,{api_protocol:13,version:'1.5.7',review_dir:'/tmp/reviewed',scan:{videos:[],music:[],errors:[]},batches:[batch],sticker_catalog:{assets:[],templates:[]},ffmpeg_available:true});
   if(p==='/api/batches')return fulfill(route,{batches:batch.items.length?[batch]:[]});
   if(p==='/api/keyframes'){frameRequests++;return fulfill(route,{version:'paired-v3',total:3,frames:[0,30,60].map((time,index)=>({time,index}))});}
   if(p==='/api/keyframe')return route.fulfill({status:200,contentType:'image/png',body:tiny});

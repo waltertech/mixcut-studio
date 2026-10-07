@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from mixcut import planner
 from mixcut.server import Application, Handler, ThreadingHTTPServer
@@ -147,8 +148,10 @@ class PlanEditingTests(unittest.TestCase):
         self.assertEqual(ids[::-1], [song['id'] for song in changed['items'][0]['music']])
 
 
-class ApprovalCleanupTests(unittest.TestCase):
+class LegacyArchiveCleanupTests(unittest.TestCase):
     def setUp(self):
+        legacy=patch.object(Application, "approve", Application._approve_legacy)
+        legacy.start();self.addCleanup(legacy.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.app = Application(self.root / 'state')

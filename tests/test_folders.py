@@ -65,10 +65,10 @@ class FolderTests(unittest.TestCase):
         result = self.app.create_plan({'config': {'count': 1, 'output_dir': str(self.root / 'custom'),
                                                 'music_mode': 'fixed'}})
         directory = Path(result['output_folder'])
-        self.assertRegex(directory.name, r'^\d{4}-\d{2}-\d{2}_001$')
-        self.assertEqual(directory / '001.mp4', Path(result['items'][0]['output_path']))
+        self.assertRegex(directory.name, r'^\d{4}-\d{2}-\d{2}$')
+        self.assertEqual(directory / '001-custom' / '001.mp4', Path(result['items'][0]['output_path']))
         self.app.write_manifest(result['id'])
-        self.assertTrue((directory / 'manifest.json').is_file())
+        self.assertTrue((self.app.store.directory / 'manifests' / result['id'] / 'manifest.json').is_file())
         self.assertEqual(directory, batch_output_folder(result))
         legacy = {'id': 'oldbatch', 'config': {'output_dir': str(self.root)}}
         self.assertEqual(self.root / 'oldbatch', batch_output_folder(legacy))

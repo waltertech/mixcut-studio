@@ -46,12 +46,12 @@ class PreviewLifecycleTests(unittest.TestCase):
         self.assertFalse(self.app.review_ready(self.app.batch('abc123')['items'][0]))
         with self.assertRaises(ValueError):self.app.start_review_all({'review_dir':str(self.root/'approved')})
 
-    def test_deleting_record_removes_small_and_large_images_but_keeps_video(self):
+    def test_deleting_task_removes_images_and_recycles_video(self):
         b=save(self.app,self.root);item=b['items'][0];version=self.app.keyframes._version(item['output_path'])
         directory=self.app.keyframes.root/version;directory.mkdir()
         for name in ('000000-thumb.jpg','000000-large.jpg','index.json'):(directory/name).write_bytes(b'image')
         self.app.forget_items([{'batch_id':'abc123','item_ids':['one']}])
-        self.assertFalse(directory.exists());self.assertTrue(Path(item['output_path']).is_file())
+        self.assertFalse(directory.exists());self.assertFalse(Path(item['output_path']).is_file())
 
     def test_deletion_cancels_generation_and_prevents_recreation(self):
         save(self.app,self.root);started=threading.Event()
@@ -96,7 +96,7 @@ class ActualThumbnailTests(unittest.TestCase):
                     for index in range(3):self.assertTrue(app.keyframes.image(video,index).is_file())
                 version=data['version'];app.keyframes.image(video,0,'large')
                 app.approve({'batch_id':'abc123','item_id':'one','review_dir':str(root/'approved')})
-                self.assertFalse((app.keyframes.root/version).exists());self.assertFalse(video.exists())
+                self.assertFalse((app.keyframes.root/version).exists());self.assertTrue(video.exists())
                 approved=app.batch('abc123')['items'][0]['review']['path'];self.assertTrue(Path(approved).is_file())
             finally:
                 app.closing.set();app.preview_worker.join(timeout=5)

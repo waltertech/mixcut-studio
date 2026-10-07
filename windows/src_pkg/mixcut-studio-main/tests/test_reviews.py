@@ -11,8 +11,10 @@ from unittest.mock import patch
 from mixcut.server import Application
 
 
-class ReviewTests(unittest.TestCase):
+class LegacyArchiveReviewTests(unittest.TestCase):
     def setUp(self):
+        legacy=patch.object(Application, "approve", Application._approve_legacy)
+        legacy.start();self.addCleanup(legacy.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
         self.app = Application(self.root / 'state')
