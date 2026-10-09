@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from recycle_fixture import install_recycle_fixture
 from mixcut.server import Application
 
 
@@ -10,6 +11,7 @@ class RetainedReviewTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name).resolve();self.app=Application(self.root/'state')
+        install_recycle_fixture(self,self.root)
         self.addCleanup(self.app.closing.set)
         self.output=self.root/'1007 aidj';self.folder=self.output/'2026-10-07'/'001-1007 aidj';self.folder.mkdir(parents=True)
         self.video=self.folder/'成片.mp4';self.video.write_bytes(b'video');st=self.video.stat()

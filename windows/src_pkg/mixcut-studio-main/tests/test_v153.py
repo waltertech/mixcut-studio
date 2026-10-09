@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+from recycle_fixture import install_recycle_fixture
 from mixcut.server import Application
 from mixcut.keyframes import KeyframeCache
 
@@ -15,6 +16,7 @@ class RejectTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
+        install_recycle_fixture(self,self.root)
         self.app = Application(self.root/'state')
         sources = self.root/'sources'; sources.mkdir()
         self.source = sources/'source.mp4'; self.source.write_bytes(b'video')
@@ -50,11 +52,7 @@ class RejectTests(unittest.TestCase):
         self.assertTrue(self.reject()['ok'])
 
     def test_cleanup_failure_keeps_task_and_can_retry(self):
-        original = Path.unlink
-        def denied(path, *args, **kwargs):
-            if path == self.source:raise PermissionError('fixture denied')
-            return original(path,*args,**kwargs)
-        with patch.object(Path,'unlink',denied): result=self.reject()
+        with patch('mixcut.server.move_to_trash',side_effect=PermissionError('fixture denied')): result=self.reject()
         self.assertFalse(result['ok']);self.assertTrue(self.source.exists());self.assertTrue(self.music.exists())
         self.assertEqual('reject_failed',self.app.visible_batches()[0]['items'][0]['review']['status'])
         self.assertTrue(self.reject()['ok']);self.assertFalse(self.source.exists())

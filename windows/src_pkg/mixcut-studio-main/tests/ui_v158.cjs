@@ -6,5 +6,5 @@ const {chromium}=require('playwright');const assert=require('assert');
  await task.locator('.item-controls').getByRole('button',{name:'删除任务',exact:true}).click();
  await task.waitFor({state:'detached'});
  assert.ok((await page.locator('#toast').textContent()).includes('所有文件保留不变'));assert.deepEqual(errors,[]);
- console.log('V1.5.8 packaged browser: delete task button removes row and reports files retained; no page errors');
+ console.log('V1.5.9 packaged browser: delete task button removes row and reports files retained; no page errors');
 }finally{await browser.close();}})().catch(e=>{console.error(e);process.exit(1)});

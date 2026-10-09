@@ -12,7 +12,7 @@ from pathlib import Path
 
 APP_NAME = 'MixCutStudio'
 DATA_ENV_VAR = 'MIXCUT_DATA_DIR'
-API_PROTOCOL = 14
+API_PROTOCOL = 15
 
 
 def frozen() -> bool:

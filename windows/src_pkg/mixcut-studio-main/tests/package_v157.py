@@ -30,7 +30,7 @@ def main():
    for _ in range(100):
     try:boot=api('/api/bootstrap');break
     except OSError:time.sleep(.1)
-   assert boot['version']=='1.5.8' and boot['api_protocol']==14
+   assert boot['version']=='1.5.9' and boot['api_protocol']==15
    batches=[]
    for mode in ['folder','pool']:
     config={'music_mode':mode,'count':1,'min_duration':4,'max_duration':4,'mode':'single','allow_overlap':True,
@@ -69,11 +69,28 @@ def main():
    subprocess.run(['/Users/zhaoyue_macmini/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node','tests/ui_v158.cjs'],env=dict(env,MIXCUT_TASK_KEY=bid+':'+iid),check=True)
    result=api('/api/tasks/forget',{'selections':[{'batch_id':bid,'item_ids':[iid]}]})
    assert result['deleted_items']==0 and original.is_file() and original.with_suffix('.txt').is_file()
+   assert v.exists(), 'delete record must preserve shared original'
    bid,iid=batches[0]
    result=api('/api/reject',{'batch_id':bid,'item_id':iid,'confirmation':'REJECT_VIDEO_AND_SOURCES'})
    assert result['ok']
+   assert not v.exists(), 'rejection must recycle source'
+   # A separately rendered source demonstrates approval recycling, not just rejection.
+   v2=videos/'approval-source.mp4';ff('-f','lavfi','-i','testsrc2=s=640x360:r=24:d=8','-c:v','libx264',str(v2))
+   api('/api/scan',{'video_dir':str(videos),'music_dir':str(music)})
+   batch=api('/api/plan',{'config':config});bid=batch['id'];iid=batch['items'][0]['id']
+   api(f'/api/batches/{bid}/start',{})
+   for _ in range(300):
+    current=api('/api/batches');current=current.get('batches',[]) if isinstance(current,dict) else current
+    item=next(b for b in current if b['id']==bid)['items'][0]
+    if item['status']=='failed':raise AssertionError(item.get('error'))
+    if item['status']=='success' and item.get('thumbnails',{}).get('status')=='ready':break
+    time.sleep(.1)
+   else:raise AssertionError('approval source render timeout')
+   api('/api/approve',{'batch_id':bid,'item_id':iid})
+   assert not v2.exists(), 'approval must recycle original'
+   assert Path(item['output_path']).is_file(), 'approval retains export'
    assert all(Path(song['path']).is_file() for song in songs),'music must remain'
-   print('V1.5.8 packaged acceptance: two real renders, dated numbered bundles, same inode retained on approval, document toggle, record-only deletion and native recycle on rejection; original music preserved')
+   print('V1.5.9 packaged acceptance: three real renders, dated numbered bundles, same inode retained on approval, document toggle, record-only deletion and native source recycle on approval and rejection; original music preserved')
   finally:
    try:api('/api/shutdown',{})
    except Exception:pass

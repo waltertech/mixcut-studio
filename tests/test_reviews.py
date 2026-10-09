@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from recycle_fixture import install_recycle_fixture
 from mixcut.server import Application
 
 
@@ -17,6 +18,7 @@ class LegacyArchiveReviewTests(unittest.TestCase):
         legacy.start();self.addCleanup(legacy.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
+        install_recycle_fixture(self,self.root)
         self.app = Application(self.root / 'state')
         self.export = self.root / 'exports' / '2026-09-22_001'
         self.export.mkdir(parents=True)

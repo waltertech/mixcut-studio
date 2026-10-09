@@ -185,7 +185,8 @@ class LegacySourceCleanupTests(unittest.TestCase):
                                       'scan': {'videos': [source_asset], 'music': []}})
             app.store.put('batch:old', {'id': 'old', 'created_at': 1, 'updated_at': 1,
                 'status': 'completed', 'config': {}, 'items': [item]})
-            app._cleanup_approved_sources()
+            with patch('mixcut.server.move_to_trash',side_effect=lambda path: Path(path).rename(root/'recycled.ts')):
+                app._cleanup_approved_sources()
             self.assertFalse(source.exists())
             self.assertTrue(app.batch('old')['items'][0]['cleanup']['original_recordings_deleted'])
 

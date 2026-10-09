@@ -32,6 +32,7 @@ from .fsutil import flush_to_disk, publish
 from .keyframes import KeyframeCache
 from .lockfile import LockUnavailable, acquire as acquire_lock, release as release_lock
 from .naming import export_filename, music_folders, music_styles, tag_music_style
+from .trash import move_to_trash
 from .runtime import API_PROTOCOL, activate_bundled_tools, app_version, data_root, resource_root
 
 # ROOT keeps holding read-only resources so existing callers stay valid; DATA is the
@@ -2214,9 +2215,9 @@ class Application:
                         raise ValueError('无法确认源文件属于已扫描的视频目录；请重新扫描原目录后重试清理')
                     if path.exists():
                         media.verify_asset(asset)
-                        path.unlink()
-                    status = '已删除'
-                except (OSError, ValueError, StopIteration) as exc:
+                        move_to_trash(path)
+                    status = '已移入废纸篓'
+                except (OSError, ValueError, StopIteration, subprocess.TimeoutExpired) as exc:
                     status = f'删除失败：{exc}'
             for batch, item, _ in requested:
                 updates[batch['id']].setdefault(item['id'], {})[path_text] = status
@@ -2228,7 +2229,7 @@ class Application:
                     cleanup = item.setdefault('cleanup', {})
                     cleanup.setdefault('source_files', {}).update(by_item[item['id']])
                     cleanup['original_recordings_deleted'] = bool(cleanup['source_files']) and all(
-                        value == '已删除' for value in cleanup['source_files'].values())
+                        value in {'已删除', '已移入废纸篓'} for value in cleanup['source_files'].values())
             self.store.update(batch_id, change)
 
     def retry_approved_cleanup(self, batch_id, item_id):
@@ -2310,9 +2311,9 @@ class Application:
             errors, removed = [], []
             for path in paths:
                 try:
-                    Path(path).unlink(missing_ok=True)
+                    move_to_trash(path)
                     removed.append(path)
-                except OSError as exc:
+                except (OSError, subprocess.TimeoutExpired) as exc:
                     errors.append(f'{path}: {exc}')
             for current, entry in outputs:
                 try:
