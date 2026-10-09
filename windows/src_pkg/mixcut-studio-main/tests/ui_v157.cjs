@@ -8,5 +8,5 @@ const {chromium}=require('playwright');const assert=require('assert');
  await page.getByRole('button',{name:'通过审核',exact:true}).first().click();
  await page.getByText('已通过审核，保留原处：',{exact:false}).first().waitFor();
  assert.equal(await page.locator('#toast').textContent(),'已通过审核，成片保留原处。');
- assert.deepEqual(errors,[]);console.log('V1.5.9 packaged browser approval: hidden archive settings, per-task folder button, retained approval passed');
+ assert.deepEqual(errors,[]);console.log('V1.6.0 packaged browser approval: hidden archive settings, per-task folder button, retained approval passed');
 }finally{await browser.close();}})().catch(e=>{console.error(e);process.exit(1)});

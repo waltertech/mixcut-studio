@@ -1,0 +1,24 @@
+const {chromium}=require('playwright');const assert=require('assert');
+(async()=>{const browser=await chromium.launch({headless:true,executablePath:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});const page=await browser.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));try{
+ await page.goto(process.env.MIXCUT_TEST_URL+'/#plan');await page.getByText('本地服务已连接',{exact:false}).first().waitFor();
+ const details=page.locator('#plan-items details').first();await details.locator('summary').click();
+ await details.locator('.music-order li').first().waitFor();assert.equal(await details.evaluate(e=>e.open),true);
+ assert.ok((await details.locator('.music-name').first().textContent()).startsWith('01'));
+ await details.locator('.music-order li').first().locator('button[title="下移"]').click();
+ await page.waitForFunction(()=>document.querySelector('#plan-items details .music-name')?.textContent.startsWith('02'));
+ assert.equal(await details.evaluate(e=>e.open),true);
+ const transfer=await page.evaluateHandle(()=>new DataTransfer());
+ await details.locator('.music-order li').first().dispatchEvent('dragstart',{dataTransfer:transfer});
+ await details.locator('.music-order li').nth(1).dispatchEvent('dragover',{dataTransfer:transfer});
+ await details.locator('.music-order li').nth(1).dispatchEvent('drop',{dataTransfer:transfer});
+ await page.waitForFunction(()=>document.querySelector('#plan-items details .music-name')?.textContent.startsWith('01'));
+ assert.equal(await details.evaluate(e=>e.open),true);
+ await page.getByRole('button',{name:'重新排列音乐',exact:true}).first().click();
+ await page.waitForFunction(()=>document.querySelector('#toast')?.textContent.includes('当前文件夹内重新排列'));
+ assert.equal(await details.evaluate(e=>e.open),true);
+ assert.ok((await details.locator('.music-name').first().textContent()).startsWith('01'));
+ assert.ok((await details.locator('.music-name').nth(1).textContent()).startsWith('02'));
+ await details.locator('summary').click();assert.equal(await details.evaluate(e=>e.open),false);
+ await page.locator('#select-all-plan').click();assert.equal(await details.evaluate(e=>e.open),false);
+ assert.deepEqual(errors,[]);console.log('V1.6.0 packaged UI: arrow reorder, drag/drop reorder and reshuffle retain expanded songs; explicit collapse stays closed; manual anchor edits accepted');
+}finally{await browser.close();}})().catch(e=>{console.error(e);process.exit(1)});

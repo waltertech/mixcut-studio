@@ -17,7 +17,7 @@ def main():
   for folder in ['风格一','风格二']:
    (music/folder).mkdir()
    for n in range(2):
-    a=music/folder/f'曲目 {n+1}.m4a';ff('-f','lavfi','-i',f'sine=f={440+n*100}:duration=3','-c:a','aac',str(a));songs.append(media._asset(a,'music',quick_music=True))
+    a=music/folder/f'{n+1:02d} 曲目.m4a';ff('-f','lavfi','-i',f'sine=f={440+n*100}:duration=3','-c:a','aac',str(a));songs.append(media._asset(a,'music',quick_music=True))
   va=media._asset(v,'video');state=root/'state';store=Store(state)
   store.put('library',{'video_dir':str(videos),'music_dir':str(music),'scan':{'videos':[va],'music':songs,'errors':[]}})
   with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
@@ -30,13 +30,17 @@ def main():
    for _ in range(100):
     try:boot=api('/api/bootstrap');break
     except OSError:time.sleep(.1)
-   assert boot['version']=='1.5.9' and boot['api_protocol']==15
+   assert boot['version']=='1.6.0' and boot['api_protocol']==16
    batches=[]
    for mode in ['folder','pool']:
     config={'music_mode':mode,'count':1,'min_duration':4,'max_duration':4,'mode':'single','allow_overlap':True,
             'min_songs':2,'max_songs':2,'width':640,'height':360,'fps':24,'hardware':'software_fast',
             'include_track_titles':True,'output_dir':str(root/'exports'),'nonstop_music':True,'seed':7}
     batch=api('/api/plan',{'config':config});bid=batch['id'];iid=batch['items'][0]['id'];assert batch['items'][0]['include_track_titles']
+    if mode=='folder':
+     assert [Path(song['path']).name[:2] for song in batch['items'][0]['music'][:2]]==['01','02']
+     env=dict(os.environ,MIXCUT_TEST_URL=base,NODE_PATH='/Users/zhaoyue_macmini/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules')
+     subprocess.run(['/Users/zhaoyue_macmini/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node','tests/ui_v160.cjs'],env=env,check=True)
     api(f'/api/batches/{bid}/start',{})
     for _ in range(300):
      records=api('/api/batches'); records=records.get('batches',[]) if isinstance(records,dict) else records
@@ -90,7 +94,7 @@ def main():
    assert not v2.exists(), 'approval must recycle original'
    assert Path(item['output_path']).is_file(), 'approval retains export'
    assert all(Path(song['path']).is_file() for song in songs),'music must remain'
-   print('V1.5.9 packaged acceptance: three real renders, dated numbered bundles, same inode retained on approval, document toggle, record-only deletion and native source recycle on approval and rejection; original music preserved')
+   print('V1.6.0 packaged acceptance: three real renders, dated numbered bundles, same inode retained on approval, document toggle, record-only deletion and native source recycle on approval and rejection; original music preserved')
   finally:
    try:api('/api/shutdown',{})
    except Exception:pass

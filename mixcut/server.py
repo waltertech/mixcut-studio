@@ -994,6 +994,8 @@ class Application:
                     from . import foldermusic
                     blocked = set(batch.get('failed_music_ids', []))
                     grouped = foldermusic.groups([a for a in batch['assets'] if str(a.get('mime_type', '')).startswith('audio/') and a['id'] not in blocked], config.get('music_root'))
+                    if index < 2 and len(foldermusic.opening_tracks(grouped.get(item['music_folder'], []))) == 2:
+                        raise ValueError('前两首自动固定为01、02；需要手动调整请拖动歌曲或使用上下箭头')
                     candidates = [song for song in grouped.get(item['music_folder'], []) if song['id'] != item['music'][index]['id']]
                     if not candidates:
                         raise ValueError('该文件夹没有其他可替换歌曲')

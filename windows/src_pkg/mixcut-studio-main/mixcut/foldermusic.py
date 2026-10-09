@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import math
 import os
+import re
 from pathlib import Path
 
 MAX_PLAYS = 4096
@@ -55,6 +56,17 @@ def shuffled_round(songs, rng, last_id=None):
     return order
 
 
+def opening_tracks(songs):
+    """Filename 01/02 anchors apply only to the first round, never manual edits."""
+    anchors = {}
+    for song in sorted(songs, key=lambda entry: str(entry.get('path', entry.get('name', ''))).casefold()):
+        name = Path(song.get('path') or song.get('name', '')).stem
+        match = re.match(r'^\s*0([12])(?!\d)', name)
+        if match:
+            anchors.setdefault(int(match[1]), song)
+    return [anchors[number] for number in (1, 2) if number in anchors]
+
+
 def allocate(songs, target, config, rng):
     """Store whole shuffled rounds, while the renderer consumes only the audible prefix."""
     target = float(target)
@@ -66,7 +78,14 @@ def allocate(songs, target, config, rng):
     goal = target + min(margin, target * .005)
     result, total = [], 0.
     while total < goal:
-        order = shuffled_round(songs, rng, result[-1]['id'] if result else None)
+        if not result:
+            anchors = opening_tracks(songs)
+            anchored_ids = {song['id'] for song in anchors}
+            remaining = [song for song in songs if song['id'] not in anchored_ids]
+            rng.shuffle(remaining)
+            order = anchors + remaining
+        else:
+            order = shuffled_round(songs, rng, result[-1]['id'])
         if len(result) + len(order) > MAX_PLAYS:
             raise ValueError('音乐循环次数过多，请增加有效歌曲或缩短视频时长')
         result.extend(copy.deepcopy(order))
@@ -76,6 +95,11 @@ def allocate(songs, target, config, rng):
 
 def describe(item):
     songs = item.get('music', [])
+    anchors = opening_tracks(songs)
+    missing = [number for number in ('01', '02') if not any(
+        re.match(r'^\s*' + number + r'(?!\d)', Path(song.get('path') or song.get('name', '')).stem)
+        for song in anchors)]
+    item['music_order_warning'] = ('未找到编号 ' + '、'.join(missing) + ' 的歌曲，无法完整固定前两首。') if missing else ''
     item['music_unique_count'] = len({song['id'] for song in songs})
     item['music_play_count'] = len(songs)
     size = max(1, int(item.get('music_folder_song_count', item['music_unique_count'])))
