@@ -88,7 +88,7 @@ class RealNonstopTests(unittest.TestCase):
             self.assertEqual('ready',current['thumbnails']['status'])
             app.approve({'batch_id':batch['id'],'item_id':'one','review_dir':str(root/'approved')})
             self.assertEqual(before,hashlib.sha256(song.read_bytes()).hexdigest())
-            self.assertEqual(1,len(list((root/'approved').rglob('*.mp4'))))
+            self.assertTrue(output.exists())
             app.closing.set();app.preview_worker.join(timeout=3)
 
     def test_mp3_m4a_flac_edge_seek_and_original_preservation(self):

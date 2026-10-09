@@ -109,6 +109,8 @@ class MusicEdges:
     def prepare(self, item, cancelled=lambda: False, progress=lambda done,total: None):
         prepared = copy.deepcopy(item)
         songs = prepared['music']
+        if prepared.get('music_folder'):
+            return self._prepare_folder(prepared, cancelled, progress)
         for number, song in enumerate(songs):
             progress(number, len(songs))
             try:
@@ -126,4 +128,44 @@ class MusicEdges:
         if target <= .1: raise ValueError('没有可制作成片的有效音乐')
         prepared.update(planned_duration=planned, duration=target,
                         nonstop={'available_duration': available, 'crossfades': fades})
+        return prepared
+
+    def _prepare_folder(self, prepared, cancelled, progress):
+        # Process only the audible prefix. Repeated plays reuse one detection per file.
+        from . import foldermusic
+        from .renderer import MusicInputError
+        import random
+        planned = float(prepared.get('planned_duration', prepared['duration']))
+        playlist = list(prepared['music'])
+        unique = list({song['id']: song for song in playlist}.values())
+        detected, played, lengths, fades = {}, [], [], []
+        available = 0.
+        position = 0
+        rng = random.Random()
+        while available < planned + .05:
+            if cancelled(): raise InterruptedError('任务已取消')
+            if position >= len(playlist):
+                if len(playlist) + len(unique) > foldermusic.MAX_PLAYS:
+                    break
+                playlist.extend(foldermusic.shuffled_round(unique, rng, playlist[-1]['id']))
+            if position >= foldermusic.MAX_PLAYS: break
+            song = copy.deepcopy(playlist[position]); position += 1
+            if song['id'] not in detected:
+                progress(len(detected), len(unique))
+                try:
+                    detected[song['id']] = self.detect(song, cancelled)
+                except (OSError, ValueError) as exc:
+                    raise MusicInputError(str(exc) + '：' + song.get('name', song['path']), [song['id']]) from exc
+            song['nonstop_edges'] = detected[song['id']]
+            length = float(song['nonstop_edges']['effective_duration'])
+            if lengths:
+                fade = min(.5, lengths[-1]/2, length/2)
+                fades.append(fade); available -= fade
+            played.append(song); lengths.append(length); available += length
+        progress(len(detected), len(detected))
+        target = min(planned, max(0., available - .05))
+        if target <= .1: raise ValueError('文件夹没有可制作成片的有效音乐')
+        prepared.update(music=played, planned_duration=planned, duration=target,
+                        nonstop={'available_duration': available, 'crossfades': fades})
+        foldermusic.describe(prepared)
         return prepared

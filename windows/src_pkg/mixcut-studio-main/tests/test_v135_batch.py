@@ -9,8 +9,10 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from mixcut import planner
+from recycle_fixture import install_recycle_fixture
 from mixcut.server import Application, Handler, ThreadingHTTPServer
 
 
@@ -76,6 +78,7 @@ class PlanEditingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        install_recycle_fixture(self,self.root)
         self.app = Application(self.root / 'state')
         self.videos = [asset(f'v{i}', 40) for i in range(4)]
         self.songs = [asset(f'm{i}', 12) for i in range(8)]
@@ -147,10 +150,13 @@ class PlanEditingTests(unittest.TestCase):
         self.assertEqual(ids[::-1], [song['id'] for song in changed['items'][0]['music']])
 
 
-class ApprovalCleanupTests(unittest.TestCase):
+class LegacyArchiveCleanupTests(unittest.TestCase):
     def setUp(self):
+        legacy=patch.object(Application, "approve", Application._approve_legacy)
+        legacy.start();self.addCleanup(legacy.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        install_recycle_fixture(self,self.root)
         self.app = Application(self.root / 'state')
         self.video_dir = self.root / 'videos'
         self.video_dir.mkdir()

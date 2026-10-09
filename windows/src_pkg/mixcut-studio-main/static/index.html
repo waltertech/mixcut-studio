@@ -32,8 +32,8 @@
           <form id="paths-form" class="panel paths-grid">
             <label>视频文件夹<span class="path-control"><input id="video-dir" name="video_dir" required placeholder="/Users/…/视频素材"><button class="button folder-picker" data-kind="video" type="button">选择文件夹</button></span></label>
             <label>音乐文件夹<span class="path-control"><input id="music-dir" name="music_dir" required placeholder="/Users/…/音乐素材"><button class="button folder-picker" data-kind="music" type="button">选择文件夹</button></span></label>
-            <label>导出文件夹<span class="path-control"><input id="output-dir" name="output_dir" required placeholder="/Users/…/导出"><button class="button folder-picker" data-kind="output" type="button">选择文件夹</button></span></label>
-            <label>审核通过文件夹<span class="path-control"><input id="review-dir" name="review_dir" placeholder="/Users/…/审核通过"><button class="button folder-picker" data-kind="review" type="button">选择文件夹</button></span></label>
+            <label>成品保存文件夹<span class="path-control"><input id="output-dir" name="output_dir" required placeholder="/Users/…/导出"><button class="button folder-picker" data-kind="output" type="button">选择文件夹</button></span></label>
+            <label hidden>旧版审核目录（不再使用）<span class="path-control"><input id="review-dir" name="review_dir" placeholder="/Users/…/审核通过"><button class="button folder-picker" data-kind="review" type="button">选择文件夹</button></span></label>
             <p class="field-help">路径由本机服务验证；视频或音乐目录变更后请重新扫描。导出会按 <strong>YYYY-MM-DD_001</strong> 建立当日递增子文件夹。</p>
           </form>
           <div id="scan-errors" class="error-list" hidden></div>
@@ -57,22 +57,24 @@
               <div class="form-grid mode-single"><label>起点最小间隔（秒）<input name="start_gap" type="number" min="0" value="30"></label><label class="switch-label"><input name="allow_overlap" type="checkbox" checked><span>无空闲视频区间时允许下一轮复用</span></label></div>
             </section>
             <section class="panel span-2"><div class="section-title"><h2>歌曲分配规则</h2></div>
-              <div class="choice-row"><label class="choice"><input type="radio" name="music_mode" value="fixed"><span><strong>固定歌曲集合</strong><small>每条都用所选歌曲，只改变顺序</small></span></label><label class="choice"><input type="radio" name="music_mode" value="pool" checked><span><strong>候选池组合</strong><small>每条选不同子集，再改变顺序</small></span></label></div>
+              <div class="choice-row"><label class="choice"><input type="radio" name="music_mode" value="folder"><span><strong>单文件夹音乐</strong><small>每条只用一个子文件夹，随机排列并循环补足时长</small></span></label><label class="choice"><input type="radio" name="music_mode" value="fixed"><span><strong>固定歌曲集合</strong><small>每条都用所选歌曲，只改变顺序</small></span></label><label class="choice"><input type="radio" name="music_mode" value="pool" checked><span><strong>全路径音乐随机</strong><small>每条选不同子集，再改变顺序</small></span></label></div>
+              <p id="folder-mode-help" class="field-help" hidden>整组优先使用不同子文件夹，用完后再随机轮转。包括子文件夹内的全部有效音频及更深层目录；根目录直接放置的歌曲不参与。此模式不限制歌曲首数。</p>
               <div class="form-grid pool-settings"><label>每条最少歌曲数<input name="min_songs" type="number" min="1" value="3"></label><label>每条最多歌曲数<input name="max_songs" type="number" min="1" value="20"></label></div>
               <p class="field-help">整批优先分配未用歌曲；需要覆盖成片时长才进入下一轮。选定歌曲后再随机播放顺序，任意歌曲都可排第一。</p>
             </section>
+            <section class="panel span-2"><label class="track-title-option"><input type="checkbox" name="include_track_titles">附带曲目曲名</label><p class="field-help">在成片同名的原曲路径文档中，按实际播放顺序增加编号曲目表。可在方案或任务中单独调整。</p></section>
             <section class="panel span-2"><div class="section-title"><h2>参与素材</h2></div><p id="selection-summary" class="field-help">扫描后默认使用全部视频和音乐。需要排除文件或设置分组时，在“素材”页展开对应列表。</p><label>贴图模板<select id="generation-sticker-template" name="sticker_template_id"><option value="">不添加贴图</option></select></label></section>
           </form>
         </section>
 
         <section id="plan" class="view" hidden>
-          <div class="page-heading"><div><p class="eyebrow">BATCH BLUEPRINT</p><h1>方案预览</h1><p id="plan-subtitle">生成方案后，逐条核对歌曲顺序和视频区间。</p></div><div class="button-row"><button id="select-all-plan" class="button">全选当前方案</button><button id="delete-selected-plan" class="button">删除选中任务</button><button id="manifest-btn" class="button" disabled>下载清单</button><button id="start-btn" class="button primary" disabled>确认并开始渲染</button></div></div>
+          <div class="page-heading"><div><p class="eyebrow">BATCH BLUEPRINT</p><h1>方案预览</h1><p id="plan-subtitle">生成方案后，逐条核对歌曲顺序和视频区间。</p></div><div class="button-row"><button id="select-all-plan" class="button">全选当前方案</button><button id="delete-selected-plan" class="button">删除选中任务</button><button id="track-titles-enable-plan" class="button" disabled>选中任务附带曲名</button><button id="track-titles-disable-plan" class="button" disabled>取消选中任务曲名</button><button id="manifest-btn" class="button" disabled>下载清单</button><button id="start-btn" class="button primary" disabled>确认并开始渲染</button></div></div>
           <div id="plan-message" class="notice">尚未生成方案。</div><div id="plan-stats" class="stats"></div><div id="plan-warnings" class="warning-list"></div><div id="plan-items" class="plan-list"></div>
         </section>
 
         <section id="tasks" class="view" hidden>
-          <div class="page-heading"><div><p class="eyebrow">RENDER QUEUE</p><h1>任务与结果</h1><p>一条视频就是一条任务。删除任务会清理缩略图，保留未审核的成品和素材。</p></div><div class="button-row"><button id="pause-all" class="button">暂停全部</button><button id="start-all" class="button">开始全部</button><button id="stop-all" class="button">终止全部</button><button id="approve-all-visible" class="button primary">一键审核</button><button id="select-all-tasks" class="button">全选任务</button><button id="delete-selected-tasks" class="button">删除选中任务</button><button id="clear-all" class="button">清空任务记录</button><button id="retry-failed" class="button">重试失败任务</button><button id="refresh-tasks" class="button">刷新状态</button></div></div>
-          <div class="panel task-review-setting"><label>审核通过文件夹<span class="path-control"><input id="task-review-dir" placeholder="选择审核文件夹"><button class="button folder-picker" data-kind="review" type="button">选择文件夹</button></span></label><p class="field-help">通过审核后先校验归档副本，再删除制作目录成片；原始录屏在所有引用任务审核或移除后删除。失败时可重试清理。</p></div>
+          <div class="page-heading"><div><p class="eyebrow">RENDER QUEUE</p><h1>任务与结果</h1><p>一条视频就是一条任务。审核通过保留成品；审核不通过将成品与原视频移至废纸篓。删除任务只移除记录，所有文件保留。原音乐始终保留。</p></div><div class="button-row"><button id="pause-all" class="button">暂停全部</button><button id="start-all" class="button">开始全部</button><button id="stop-all" class="button">终止全部</button><button id="approve-all-visible" class="button primary">一键审核</button><button id="select-all-tasks" class="button">全选任务</button><button id="delete-selected-tasks" class="button">删除选中任务</button><button id="track-titles-enable-tasks" class="button" disabled>选中任务附带曲名</button><button id="track-titles-disable-tasks" class="button" disabled>取消选中任务曲名</button><button id="clear-all" class="button">删除全部任务</button><button id="retry-failed" class="button">重试失败任务</button><button id="refresh-tasks" class="button">刷新状态</button></div></div>
+          <div class="panel task-review-setting" hidden><label hidden>旧版审核目录（不再使用）<span class="path-control"><input id="task-review-dir" placeholder="选择审核文件夹"><button class="button folder-picker" data-kind="review" type="button">选择文件夹</button></span></label><p class="field-help">通过审核后先校验归档副本，再删除制作目录成片；原始录屏在所有引用任务审核或移除后删除。失败时可重试清理。</p></div>
           <div class="notice"><span id="cache-usage">剪辑缓存：正在读取…</span> <button id="clear-cache" class="button">一键清除缓存</button><p class="field-help">统计视频转换缓存、任务临时文件及预览图片。正在使用的缓存暂时保留；清除后需要时会重新生成。</p></div>
           <div id="task-summary" class="stats"><div class="stat"><b>—</b><span>等待批次</span></div></div><div id="batches" class="batch-list empty">尚无任务。先生成方案并确认开始渲染。</div>
         </section>

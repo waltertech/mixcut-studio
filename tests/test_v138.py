@@ -125,7 +125,7 @@ class EditingAndDeletionTests(unittest.TestCase):
         output = Path(self.batch['items'][0]['output_path'])
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b'output')
-        result = self.app.forget_items([{'batch_id': self.batch['id'], 'item_ids': ['one']}])
+        result = self.app._forget_records([{'batch_id': self.batch['id'], 'item_ids': ['one']}])
         self.assertEqual(1, result['deleted_items'])
         self.assertIsNone(result['updated_batches'][self.batch['id']])
         self.assertEqual([], self.app.store.batches())
@@ -138,7 +138,7 @@ class EditingAndDeletionTests(unittest.TestCase):
         second.update(id='two', index=2)
         self.app.store.update(self.batch['id'], lambda batch: batch.update(
             status='running', items=[batch['items'][0], second]))
-        result = self.app.forget_items([{'batch_id': self.batch['id'], 'item_ids': ['one']}])
+        result = self.app._forget_records([{'batch_id': self.batch['id'], 'item_ids': ['one']}])
         self.assertEqual(['two'], [item['id'] for item in result['updated_batches'][self.batch['id']]['items']])
         self.assertEqual(['two'], [item['id'] for item in self.app.visible_batches()[0]['items']])
         self.assertTrue(self.app.batch(self.batch['id'])['items'][0]['cancel_requested'])
@@ -185,7 +185,8 @@ class LegacySourceCleanupTests(unittest.TestCase):
                                       'scan': {'videos': [source_asset], 'music': []}})
             app.store.put('batch:old', {'id': 'old', 'created_at': 1, 'updated_at': 1,
                 'status': 'completed', 'config': {}, 'items': [item]})
-            app._cleanup_approved_sources()
+            with patch('mixcut.server.move_to_trash',side_effect=lambda path: Path(path).rename(root/'recycled.ts')):
+                app._cleanup_approved_sources()
             self.assertFalse(source.exists())
             self.assertTrue(app.batch('old')['items'][0]['cleanup']['original_recordings_deleted'])
 

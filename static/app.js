@@ -3,6 +3,7 @@
   const state = { scan: { videos: [], music: [], errors: [] }, batch: null, batches: [], poller: null, scanPoller: null, scanSignature: '', scanRunning: false, libraryDirs: null, dirtyLibrary: new Set(), mediaCache: new Map(), batchSignature: '', batchLayoutSignature: '', serverVersion: '', reviewJobs: new Map() };
   const selectedTasks = new Set();
   const expandedTasks = new Set();
+  const expandedMusicOrders = new Set();
   const taskKey = (batchId, itemId) => `${batchId}:${itemId}`;
   const taskSelection = (batch, item) => { const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.className = 'task-select'; checkbox.setAttribute('aria-label', `选择任务 ${item.index || item.id}`); const key = taskKey(batch.id,item.id); checkbox.checked = selectedTasks.has(key); checkbox.addEventListener('change', () => { if (checkbox.checked) selectedTasks.add(key); else selectedTasks.delete(key); updateSelectionButtons(); }); return checkbox; };
   const $ = (s, root = document) => root.querySelector(s);
@@ -12,6 +13,7 @@
     const taskCount = state.batches.reduce((total, batch) => total + (batch.items || []).filter(item => selectedTasks.has(taskKey(batch.id, item.id))).length, 0);
     $('#delete-selected-plan').textContent = planCount ? `删除选中任务（${planCount}）` : '删除选中任务';
     $('#delete-selected-tasks').textContent = taskCount ? `删除选中任务（${taskCount}）` : '删除选中任务';
+    for (const scope of ['plan','tasks']) for (const action of ['enable','disable']) { const button=$(`#track-titles-${action}-${scope}`); if(button) button.disabled=!(scope==='plan'?planCount:taskCount); }
   };
   const fmt = (seconds) => { const raw = Number(seconds); if (!Number.isFinite(raw)) return '未知时长'; const total = Math.max(0, Math.round(raw)), h = Math.floor(total / 3600), m = Math.floor(total % 3600 / 60), s = total % 60; return (h ? `${h}:` : '') + `${String(m).padStart(h ? 2 : 1, '0')}:${String(s).padStart(2, '0')}`; };
   const safeClass = (value) => String(value || 'pending').toLowerCase().replace(/[^a-z0-9_-]/g, '');
@@ -33,16 +35,16 @@
   const persistPreference = async (key, value) => { if (!value) return; try { await api('/api/preferences', { method: 'POST', body: JSON.stringify({ [key]: value }) }); } catch (error) { toast(`保存目录失败：${error.message}`, true); } };
   const syncReviewDir = (value) => { $('#review-dir').value = value; $('#task-review-dir').value = value; };
   const rejectItem = async (batch, item, button) => {
-    if (!confirm('审核不通过将删除这条成片和它用到的视频原素材，同时清理缩略图与剪辑缓存。音乐文件保留。确认不通过吗？')) return;
+    if (!confirm('审核不通过会将成品文件夹移至废纸篓，同时将它用到的视频原素材移至废纸篓，同时清理缩略图与剪辑缓存。音乐文件保留。确认不通过吗？')) return;
     button.disabled = true;
     button.textContent = '正在删除视频';
     try {
       const result = await api('/api/reject', {method:'POST', body:JSON.stringify({batch_id:batch.id, item_id:item.id, confirmation:'REJECT_VIDEO_AND_SOURCES'})});
-      toast(result.ok ? '审核不通过：成片与原视频已删除，音乐保留。' : `部分文件清理失败：${(result.errors || []).join('；')}`, !result.ok);
+      toast(result.ok ? '审核不通过：成品已移至废纸篓，原视频已移至废纸篓，音乐保留。' : `部分文件清理失败：${(result.errors || []).join('；')}`, !result.ok);
       await refreshBatches();
     } catch(error) { button.disabled=false; button.textContent='审核不通过'; toast(error.message,true); }
   };
-  const approveItem = async (batchId, itemId, button) => { const review_dir = $('#task-review-dir').value.trim() || $('#review-dir').value.trim(); if (!review_dir) { toast('请先选择审核通过文件夹。', true); return; } button.disabled = true; button.textContent = '正在归档'; try { await api('/api/approve', { method: 'POST', body: JSON.stringify({ batch_id: batchId, item_id: itemId, review_dir }) }); toast('已复制到审核通过文件夹。'); await refreshBatches(); } catch (error) { button.disabled = false; button.textContent = '通过审核'; const line = document.createElement('div'); line.className = 'error'; line.textContent = `归档失败：${error.message}`; button.parentElement?.append(line); toast(error.message, true); } };
+  const approveItem = async (batchId, itemId, button) => { const review_dir = $('#output-dir').value.trim();  button.disabled = true; button.textContent = '正在审核'; try { await api('/api/approve', { method: 'POST', body: JSON.stringify({ batch_id: batchId, item_id: itemId, review_dir }) }); toast('已通过审核，成片保留原处。'); await refreshBatches(); } catch (error) { button.disabled = false; button.textContent = '通过审核'; const line = document.createElement('div'); line.className = 'error'; line.textContent = `审核失败：${error.message}`; button.parentElement?.append(line); toast(error.message, true); } };
   const reviewCandidates = batch => (batch.items || []).filter(item => item.status === 'success' && (!item.thumbnails || item.thumbnails.status === 'ready') && !['approved','superseded','copying','rejecting','reject_failed','rejected'].includes(item.review?.status)).sort((a,b) => (Number(a.index) || 0) - (Number(b.index) || 0) || String(a.id).localeCompare(String(b.id)));
   const reviewPolls = new Set();
   const paintReviewJob = batchId => {
@@ -75,14 +77,14 @@
     finally { reviewPolls.delete(batchId); }
   };
   const approveBatch = async batch => {
-    const review_dir = $('#task-review-dir').value.trim() || $('#review-dir').value.trim();
-    if (!review_dir) return toast('请先选择审核通过文件夹。', true);
+    const review_dir = $('#output-dir').value.trim();
+
     const card = $(`.batch[data-batch-id="${batch.id}"]`);
     if ($$('.sticker-variant', card).some(select => select.value)) return toast('本批次已选择贴图模板，请先处理贴图任务。', true);
     const candidates = reviewCandidates(batch);
     if (!candidates.length) return toast('此批次没有可审核的已完成任务。', true);
     const skipped = (batch.items || []).length - candidates.length;
-    if (!confirm(`将按任务序号依次审核 ${candidates.length} 条已完成视频${skipped ? `，跳过 ${skipped} 条未完成或已审核任务` : ''}。每条归档成功后会按现有规则清理制作目录成片及可安全删除的原素材；遇到错误即停止。确定继续吗？`)) return;
+    if (!confirm(`将按任务序号依次审核 ${candidates.length} 条已完成视频${skipped ? `，跳过 ${skipped} 条未完成或已审核任务` : ''}。每条审核通过后成片保留原处，并清理缓存及可安全删除的原视频素材；遇到错误即停止。确定继续吗？`)) return;
     try {
       const job = await api(`/api/batches/${encodeURIComponent(batch.id)}/approve-all`, {method:'POST', body:JSON.stringify({review_dir, item_ids:candidates.map(item => String(item.id))})});
       state.reviewJobs.set(batch.id, job);
@@ -113,8 +115,8 @@
     finally { button.disabled = false; button.textContent = '一键审核'; globalReviewPolling = false; }
   };
   const approveAllVisible = async () => {
-    const review_dir = $('#task-review-dir').value.trim() || $('#review-dir').value.trim();
-    if (!review_dir) return toast('请先选择审核通过文件夹。', true);
+    const review_dir = $('#output-dir').value.trim();
+
     if ($$('.sticker-variant').some(select => select.value)) return toast('有任务选了贴图模板，请先生成对应的贴图版本。', true);
     const count = state.batches.reduce((total,batch) => total + reviewCandidates(batch).length, 0);
     if (!count) return toast('没有待审核的已完成任务。');
@@ -125,8 +127,8 @@
   const pickFolder = async (kind) => { const input = kind === 'review' ? $('#review-dir') : $(`#${kind}-dir`); if (!input) return; const buttons = $$('.folder-picker'); buttons.forEach(button => button.disabled = true); try { const data = await api('/api/pick-folder', { method: 'POST', body: JSON.stringify({ kind, current_path: input.value.trim() }) }); if (data.cancelled || !data.path) return; const changed = input.value.trim() !== data.path; input.value = data.path; if (kind === 'review') syncReviewDir(data.path); if ((kind === 'video' || kind === 'music') && changed) clearScannedLibrary(kind); if (kind === 'output' || kind === 'review') toast('已保存目录。'); } catch (error) { toast(error.message, true); } finally { buttons.forEach(button => button.disabled = false); } };
   const frameTime = (value) => { const seconds = Math.max(0, Number(value) || 0), minutes = Math.floor(seconds / 60), remainder = seconds % 60; return `${String(minutes).padStart(2, '0')}:${remainder.toFixed(3).padStart(6, '0')}`; };
   const frameUrl = (batch, item, index, size, version) => `/api/keyframe?batch=${encodeURIComponent(batch)}&item=${encodeURIComponent(item)}&index=${encodeURIComponent(index)}&size=${size}&v=${encodeURIComponent(version || '')}`;
-  const batchesSignature = (batches) => JSON.stringify((batches || []).map(batch => [batch.id, batch.updated_at, batch.status, batch.output_folder, ...(batch.items || []).map(item => [item.id, item.status, item.progress, item.result?.output_size, item.result?.output_mtime_ns, item.review?.status, item.review?.path, item.review?.error, item.review?.approved_at, item.error, item.thumbnails, item.render_stage, item.music_detection]) ]));
-  const batchesLayoutSignature = (batches) => JSON.stringify((batches || []).map(batch => [batch.id, batch.status, batch.error, batch.recovery_note, batch.folder_name, batch.output_folder, (batch.items || []).map(item => [item.id, item.index, item.kind, item.status, item.error, item.output_name, item.duration, item.result, item.review, item.cleanup, item.thumbnails])]));
+  const batchesSignature = (batches) => JSON.stringify((batches || []).map(batch => [batch.id, batch.updated_at, batch.status, batch.output_folder, ...(batch.items || []).map(item => [item.id, item.include_track_titles, item.status, item.progress, item.result?.output_size, item.result?.output_mtime_ns, item.review?.status, item.review?.path, item.review?.error, item.review?.approved_at, item.error, item.thumbnails, item.render_stage, item.music_detection]) ]));
+  const batchesLayoutSignature = (batches) => JSON.stringify((batches || []).map(batch => [batch.id, batch.status, batch.error, batch.recovery_note, batch.folder_name, batch.output_folder, (batch.items || []).map(item => [item.id, item.include_track_titles, item.index, item.kind, item.status, item.error, item.output_name, item.duration, item.result, item.review, item.cleanup, item.thumbnails])]));
   const taskScrollAnchor = () => { const rows = $$('.task-item[data-task-key]'); const row = rows.find(node => { const rect = node.getBoundingClientRect(); return rect.bottom > 100 && rect.top < innerHeight; }); return { key: row?.dataset.taskKey, top: row?.getBoundingClientRect().top, y: window.scrollY }; };
   const restoreTaskScroll = anchor => { if (!anchor || currentView() !== 'tasks') return; const row = $$('.task-item[data-task-key]').find(node => node.dataset.taskKey === anchor.key); if (row) window.scrollBy(0, row.getBoundingClientRect().top - anchor.top); else window.scrollTo(0, anchor.y); };
   const renderStep = item => ({video_segments:'正在分段渲染（完成片段可恢复）',video_recovery:'正在补救或替换损坏素材',assembling:'正在合成成片'})[item.render_stage] || '';
@@ -182,11 +184,15 @@
   function renderPickers() {
     const selectedVideo = $$('.video-card .asset-select:checked').length;
     const selectedMusic = $$('.music-card .asset-select:checked').length;
+    const folderMode = $('#config-form').elements.music_mode.value === 'folder';
+    const root = (state.libraryDirs.music || '').replace(/\/$/,'') + '/';
+    const folders = new Set((state.scan.music || []).map(song => song.path || '').filter(path => path.startsWith(root) && path.slice(root.length).includes('/')).map(path => path.slice(root.length).split('/')[0]));
+    if (folderMode) { $('#selection-summary').textContent = `已选 ${selectedVideo} 条视频 · ${folders.size} 个音乐子文件夹。单文件夹模式使用文件夹内全部有效音乐，不受逐首勾选限制。`; return; }
     $('#selection-summary').textContent = `已选 ${selectedVideo}/${state.scan.videos?.length || 0} 条视频、${selectedMusic}/${state.scan.music?.length || 0} 首音乐。需要排除素材或调整视频分组时，到“素材”页展开列表。`;
   }
   function getConfig() {
     if (state.scanRunning || state.dirtyLibrary.size) throw new Error('请等待素材扫描完成，并刷新已更改路径的素材库。');
-    const form = $('#config-form'), values = Object.fromEntries(new FormData(form)); const num = ['parallel_tasks','count','min_source_duration_minutes','min_duration','max_duration','min_songs','max_songs','start_gap','segment_min','segment_max','fps','video_bitrate_mbps','original_volume','music_volume']; num.forEach(key => values[key] = Number(values[key])); [values.width, values.height] = String(values.resolution || '1280x720').split('x').map(Number); delete values.resolution; if (String(values.seed || '').trim()) values.seed = Number(values.seed); else delete values.seed; values.allow_overlap = form.elements.allow_overlap.checked; values.within_group = values.within_group === 'true'; values.output_dir = $('#output-dir').value.trim(); values.video_ids = $$('.video-card .asset-select:checked').map(el => el.dataset.id); values.music_ids = $$('.music-card .asset-select:checked').map(el => el.dataset.id); values.first_song_ids = []; values.groups = Object.fromEntries($$('.group-input').map(el => [el.dataset.id, el.value.trim()]).filter(([, value]) => value));
+    const form = $('#config-form'), values = Object.fromEntries(new FormData(form)); const num = ['parallel_tasks','count','min_source_duration_minutes','min_duration','max_duration','min_songs','max_songs','start_gap','segment_min','segment_max','fps','video_bitrate_mbps','original_volume','music_volume']; num.forEach(key => values[key] = Number(values[key])); [values.width, values.height] = String(values.resolution || '1280x720').split('x').map(Number); delete values.resolution; if (String(values.seed || '').trim()) values.seed = Number(values.seed); else delete values.seed; values.allow_overlap = form.elements.allow_overlap.checked; values.include_track_titles = form.elements.include_track_titles.checked; values.within_group = values.within_group === 'true'; values.output_dir = $('#output-dir').value.trim(); values.video_ids = $$('.video-card .asset-select:checked').map(el => el.dataset.id); values.music_ids = $$('.music-card .asset-select:checked').map(el => el.dataset.id); if (values.music_mode === 'folder') values.music_ids = (state.scan.music || []).map(song => song.id); values.first_song_ids = []; values.groups = Object.fromEntries($$('.group-input').map(el => [el.dataset.id, el.value.trim()]).filter(([, value]) => value));
     values.sticker_template_id = values.sticker_template_id || null; if (!values.video_ids.length) throw new Error('请至少选择一个视频素材。'); if (!values.music_ids.length) throw new Error('请至少选择一首音乐。'); if (!values.output_dir) throw new Error('请在素材页填写导出文件夹。'); if (values.min_duration > values.max_duration) throw new Error('最短时长不能大于最长时长。'); if (values.segment_min > values.segment_max) throw new Error('单段最短时长不能大于最长时长。'); return values;
   }
   function stat(label, value) { const box = document.createElement('div'); box.className = 'stat'; const strong = document.createElement('b'); strong.textContent = value; const span = document.createElement('span'); span.textContent = label; box.append(strong, span); return box; }
@@ -221,21 +227,45 @@
     track.append(title,list); root.append(track);
   }
   async function saveMusicOrder(batch, item, musicIds) { try { const updated = await api(`/api/batches/${encodeURIComponent(batch.id)}/items/${encodeURIComponent(item.id)}/music-order`, { method:'POST', body:JSON.stringify({music_ids:musicIds}) }); state.batches = state.batches.map(entry => entry.id === updated.id ? updated : entry); renderPlan(updated); toast('歌曲顺序已保存，将按此顺序渲染。'); } catch (error) { renderPlan(batch); toast(error.message, true); } }
-  function appendMusicOrder(root, batch, item, counts) {
+  function appendMusicOrder(root, batch, item, counts, detailOnly = false) {
+    if (item.music_folder && !detailOnly) {
+      const track = document.createElement('div'); track.className = 'track music-track';
+      const heading = document.createElement('h4'); heading.textContent = `音乐文件夹：${item.music_folder.split('/').pop()}`; heading.title = item.music_folder;
+      const summary = document.createElement('p'); summary.className = 'field-help';
+      const uses = (batch.items || []).filter(entry => entry.music_folder === item.music_folder).length;
+      summary.textContent = `本组使用 ${uses} 条任务 · ${item.music_unique_count || new Set(item.music.map(song => song.id)).size} 首不同歌曲 · 清单共 ${item.music.length} 次 · ${item.music_rounds || 1} 轮 · 音乐 ${fmt(item.music_total_duration)}（成片按目标时长截取）`;
+      track.append(heading, summary);
+      if(item.music_order_warning){const warning=document.createElement('p');warning.className='field-help';warning.textContent=item.music_order_warning;track.append(warning);}
+      if (batch.status === 'draft') {
+        const select = document.createElement('select'); select.className = 'music-folder-select'; select.setAttribute('aria-label', '选择音乐文件夹');
+        (batch.music_folder_catalog || []).forEach(folder => { const count = (batch.items || []).filter(entry => entry.music_folder === folder.path).length; select.append(new Option(`${folder.name} · ${folder.song_count} 首 · 本组 ${count} 次`, folder.path)); });
+        select.value = item.music_folder; select.addEventListener('change', () => changeMusicFolder(batch, item, {folder:select.value}, select));
+        const random = document.createElement('button'); random.type = 'button'; random.className = 'button'; random.textContent = '随机换文件夹'; random.onclick = () => changeMusicFolder(batch, item, {random:true}, random);
+        const shuffle = document.createElement('button'); shuffle.type = 'button'; shuffle.className = 'button'; shuffle.textContent = '重新排列音乐';
+        shuffle.onclick = async () => { shuffle.disabled=true; try { const updated=await api(`/api/batches/${encodeURIComponent(batch.id)}/items/${encodeURIComponent(item.id)}/refresh-music`, {method:'POST',body:'{}'}); state.batches=state.batches.map(entry=>entry.id===updated.id?updated:entry);renderPlan(updated);toast('已在当前文件夹内重新排列音乐。'); } catch(error) {shuffle.disabled=false;toast(error.message,true);} };
+        const controls=document.createElement('div'); controls.className='button-row'; controls.append(select,random,shuffle);track.append(controls);
+      }
+      const details=document.createElement('details'); const label=document.createElement('summary');label.textContent='展开歌曲顺序和播放次数';details.append(label);
+      const key=taskKey(batch.id,item.id);details.dataset.musicOrderKey=key;
+      details.open=expandedMusicOrders.has(key);
+      if(details.open)appendMusicOrder(details,batch,item,counts,true);
+      details.addEventListener('toggle',()=>{if(!details.isConnected)return;if(details.open)expandedMusicOrders.add(key);else expandedMusicOrders.delete(key);if(details.open && details.childElementCount===1)appendMusicOrder(details,batch,item,counts,true);});track.append(details);root.append(track);return;
+    }
     const track = document.createElement('div'); track.className = 'track music-track';
     const h = document.createElement('h4'); h.textContent = '歌曲顺序';
     const editable = batch.status === 'draft' && (item.music?.length || 0) > 1;
     const hint = document.createElement('p'); hint.className = 'music-order-help'; hint.textContent = editable ? '拖动歌曲，或使用箭头调整；修改会立即保存。' : '歌曲顺序已锁定。';
     const list = document.createElement('ol'); list.className = 'music-order';
+    const localCounts = new Map(); (item.music || []).forEach(song => localCounts.set(song.id, (localCounts.get(song.id) || 0) + 1));
     const move = (from,to) => { if (from === to || to < 0 || to >= item.music.length) return; const ids = item.music.map(song => song.id); const [value] = ids.splice(from,1); ids.splice(to,0,value); saveMusicOrder(batch,item,ids); };
     (item.music || []).forEach((song,index) => {
       const li = document.createElement('li'); li.dataset.index = String(index); li.draggable = editable;
       const handle = document.createElement('span'); handle.className = 'drag-handle'; handle.textContent = editable ? '⠿' : '•'; handle.title = editable ? '拖动调整顺序' : '';
       const name = document.createElement('span'); name.className = 'music-name'; name.textContent = song.name || song.path || song.asset_id || String(song);
-      const badge = document.createElement('span'); badge.className = 'use-count'; badge.textContent = `本批使用 ${counts.songs.get(song.id) || 1} 次`;
+      const badge = document.createElement('span'); badge.className = 'use-count'; badge.textContent = item.music_folder ? `本条播放 ${localCounts.get(song.id)} 次 · 本组播放 ${counts.songs.get(song.id) || 1} 次` : `本批使用 ${counts.songs.get(song.id) || 1} 次`;
       li.append(handle,name,badge);
       if (batch.status === 'draft') {
-        const replace = document.createElement('button'); replace.type = 'button'; replace.className = 'button replace-media'; replace.textContent = '随机替换这首歌'; replace.onclick = () => replaceMedia(batch,item,'music',index,replace); li.append(replace);
+        const replace = document.createElement('button'); replace.type = 'button'; replace.className = 'button replace-media'; replace.textContent = '随机替换这首歌'; if(item.music_folder && index<2 && !item.music_order_warning){replace.disabled=true;replace.title='前两首自动固定为01、02；可拖动或使用上下箭头手动调整';} replace.onclick = () => replaceMedia(batch,item,'music',index,replace); li.append(replace);
       }
       if (editable) {
         const controls = document.createElement('span'); controls.className = 'order-buttons';
@@ -251,13 +281,22 @@
     });
     track.append(h,hint,list);
     if (batch.status === 'draft') {
-      const refresh = document.createElement('button'); refresh.type = 'button'; refresh.className = 'button'; refresh.textContent = '刷新这条音乐';
+      const refresh = document.createElement('button'); refresh.type = 'button'; refresh.className = 'button'; refresh.textContent = item.music_folder ? '重新排列音乐' : '刷新这条音乐';
       refresh.onclick = async () => { refresh.disabled = true; try { const updated = await api(`/api/batches/${encodeURIComponent(batch.id)}/items/${encodeURIComponent(item.id)}/refresh-music`,{method:'POST',body:'{}'}); state.batches = state.batches.map(entry => entry.id === updated.id ? updated : entry); renderPlan(updated); toast('已重新分配音乐，整批使用次数已更新。'); } catch (error) { refresh.disabled = false; toast(error.message,true); } };
       track.append(refresh);
     }
     root.append(track);
   }
+  async function changeMusicFolder(batch, item, body, control) {
+    control.disabled = true;
+    try {
+      const updated = await api(`/api/batches/${encodeURIComponent(batch.id)}/items/${encodeURIComponent(item.id)}/music-folder`, {method:'POST',body:JSON.stringify(body)});
+      state.batches = state.batches.map(entry => entry.id === updated.id ? updated : entry); renderPlan(updated);
+      toast('音乐文件夹已更换，整组使用次数已更新。');
+    } catch(error) {control.disabled=false;control.value=item.music_folder;toast(error.message,true);}
+  }
   function renderPlan(batch) {
+    $$('#plan-items details[data-music-order-key]').forEach(details=>{if(details.open)expandedMusicOrders.add(details.dataset.musicOrderKey);else expandedMusicOrders.delete(details.dataset.musicOrderKey);});
     state.batch = batch; $('#plan-message').textContent = batch ? `当前方案共 ${batch.items?.length || 0} 条任务。核对后开始渲染。${batch.output_folder ? ` 输出目录：${batch.output_folder}` : ''}` : '尚未生成方案。'; $('#start-btn').disabled = !batch || !batch.items?.length || batch.status !== 'draft'; $('#manifest-btn').disabled = !batch; const stats = $('#plan-stats'), warnings = $('#plan-warnings'), list = $('#plan-items'); stats.replaceChildren(); warnings.replaceChildren(); list.replaceChildren(); if (!batch) { updateSelectionButtons(); return; }
     if(batch.config?.sticker_layers?.length){const note=document.createElement('div');note.textContent=`贴图模板：${batch.config.sticker_template?.name || '已保存模板'} · ${batch.config.sticker_layers.length}层（位置、大小和出现时间已固定到本批次）`;warnings.append(note);}
     const s = batch.stats || {};
@@ -270,7 +309,7 @@
     if (Number.isFinite(Number(s.estimated_output_bytes))) stats.append(stat('预计输出大小', `${(Number(s.estimated_output_bytes) / 1024 ** 3).toFixed(2)} GB`));
     if (s.total_duration !== undefined) stats.append(stat('总成片时长', fmt(s.total_duration)));
     (batch.warnings || []).forEach(w => { const line = document.createElement('div'); line.textContent = typeof w === 'string' ? w : (w.message || JSON.stringify(w)); warnings.append(line); });
-    const counts = planCounts(batch); (batch.items || []).forEach(item => { const card = document.createElement('article'); card.className = 'plan-item'; const head = document.createElement('div'); head.className = 'item-head'; const title = document.createElement('h3'); title.textContent = item.output_name || `成片 ${item.index ?? '—'}`; const duration = document.createElement('span'); duration.className = 'duration'; duration.textContent = fmt(item.duration); head.append(taskSelection(batch,item), title, duration); const tracks = document.createElement('div'); tracks.className = 'tracks'; appendVideoList(tracks,batch,item,counts); appendMusicOrder(tracks,batch,item,counts); card.append(head, tracks); list.append(card); });
+    const counts = planCounts(batch); (batch.items || []).forEach(item => { const card = document.createElement('article'); card.className = 'plan-item'; const head = document.createElement('div'); head.className = 'item-head'; const title = document.createElement('h3'); title.textContent = item.output_name || `成片 ${item.index ?? '—'}`; const duration = document.createElement('span'); duration.className = 'duration'; duration.textContent = fmt(item.duration); head.append(taskSelection(batch,item), title, duration); const tracks = document.createElement('div'); tracks.className = 'tracks'; appendVideoList(tracks,batch,item,counts); appendMusicOrder(tracks,batch,item,counts); card.append(head, trackTitleOption(batch,item), tracks); list.append(card); });
     updateSelectionButtons();
   }
   const stopScanPolling = () => { if (state.scanPoller) clearTimeout(state.scanPoller); state.scanPoller = null; };
@@ -326,7 +365,7 @@
   }
   async function createPlan() { let config; try { config = getConfig(); } catch (error) { toast(error.message, true); return; } const btn = $('#plan-btn'); btn.disabled = true; btn.textContent = '正在规划…'; try { const data = await api('/api/plan', { method: 'POST', body: JSON.stringify({ config }) }); const planned = data.batch || data; state.batches = [planned, ...state.batches.filter(batch => batch.id !== planned.id)]; renderPlan(planned); location.hash = 'plan'; toast('方案生成完成，请核对每条歌曲与视频区间。'); } catch (error) { renderPlan(null); $('#plan-message').textContent = `无法生成方案：${error.message}`; location.hash = 'plan'; toast(error.message, true); } finally { btn.disabled = false; btn.textContent = '生成方案'; } }
   async function batchAction(id, action) { try { const data = await api(`/api/batches/${encodeURIComponent(id)}/${action}`, { method: 'POST', body: '{}' }); if (action === 'start') renderPlan(null); else if (data.batch && state.batch?.id === id) renderPlan(data.batch); toast({start:'已加入渲染队列',pause:'将在执行中的成片完成后暂停',resume:'已继续队列',stop:'已停止队列',retry:'已安排重试'}[action] || '操作成功'); if (action === 'start') location.hash = 'tasks'; refreshBatches(); } catch (error) { toast(error.message, true); } }
-  async function itemAction(batchId, itemId, action) { try { const result = await api(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}/${action}`, { method:'POST', body:'{}' }); if (action === 'delete' && result.updated_batches) applyDeletedBatches(result.updated_batches); else { state.batchSignature=''; await refreshBatches(); } toast(result.preview_cleanup_errors?.length ? `任务已删除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : {start:'已重新开始该条任务',stop:'已终止该条任务',delete:'已删除任务；成品和素材保留，缩略图已清理'}[action], !!result.preview_cleanup_errors?.length); } catch (error) { toast(error.message,true); } }
+  async function itemAction(batchId, itemId, action) { try { const result = await api(`/api/batches/${encodeURIComponent(batchId)}/items/${encodeURIComponent(itemId)}/${action}`, { method:'POST', body:'{}' }); if (action === 'delete' && result.updated_batches) applyDeletedBatches(result.updated_batches); else { state.batchSignature=''; await refreshBatches(); } toast(result.preview_cleanup_errors?.length ? `任务已删除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : {start:'已重新开始该条任务',stop:'已终止该条任务',delete:'已删除任务；所有文件保留不变'}[action], !!result.preview_cleanup_errors?.length); } catch (error) { toast(error.message,true); } }
   async function allBatches(action) { const candidates=state.batches.filter(batch=>action==='pause'?['queued','running'].includes(batch.status):(action==='stop'?['queued','running','pausing','paused'].includes(batch.status):['paused','stopped','draft'].includes(batch.status))); for(const batch of candidates){const next=action==='pause'?'pause':(action==='stop'?'stop':(batch.status==='paused'?'resume':'start'));try{await api(`/api/batches/${encodeURIComponent(batch.id)}/${next}`,{method:'POST',body:'{}'});}catch(error){toast(`批次 ${batch.id}：${error.message}`,true);}} state.batchSignature='';await refreshBatches(); }
   function applyDeletedBatches(updatedBatches) {
     const byId = new Map(state.batches.map(batch => [batch.id, batch]));
@@ -343,6 +382,30 @@
     }
     updateSelectionButtons();
   }
+  async function setTrackTitles(selections, enabled) {
+    const result = await api('/api/tasks/track-titles', {method:'POST',body:JSON.stringify({selections,enabled})});
+    const keys = new Set(selections.map(entry => taskKey(entry.batch_id,entry.item_id)));
+    for (const batch of [...state.batches, ...(state.batch?[state.batch]:[])]) for(const item of batch.items || []) if(keys.has(taskKey(batch.id,item.id))) item.include_track_titles=enabled;
+    if(state.batch) renderPlan(state.batch);
+    renderBatches(state.batches); updateSelectionButtons();
+    toast(result.errors?.length ? `设置已保存，但文档更新失败：${result.errors[0].error}` : (enabled?'已开启曲目曲名；成片文档按实际播放顺序列出。':'已取消附带曲目曲名。'),!!result.errors?.length);
+    return result;
+  }
+  function trackTitleOption(batch,item) {
+    const label=document.createElement('label');label.className='track-title-option';
+    const checkbox=document.createElement('input');checkbox.type='checkbox';checkbox.checked=!!item.include_track_titles;checkbox.setAttribute('aria-label',`任务 ${item.index || item.id} 附带曲目曲名`);
+    checkbox.addEventListener('change',async()=>{ const previous=!!item.include_track_titles;checkbox.disabled=true;try{await setTrackTitles([{batch_id:batch.id,item_id:item.id}],checkbox.checked);}catch(error){checkbox.checked=previous;toast(error.message,true);}finally{checkbox.disabled=false;} });
+    label.append(checkbox,document.createTextNode('附带曲目曲名'));
+    if(item.status==='success'){const open=document.createElement('button');open.type='button';open.className='button';open.textContent='打开成品文件夹';open.onclick=async event=>{event.preventDefault();try{await api('/api/reveal',{method:'POST',body:JSON.stringify({batch_id:batch.id,item_id:item.id,review:item.review?.status==='approved'})});}catch(error){toast(error.message,true);}};label.append(open);}
+    return label;
+  }
+  async function setSelectedTrackTitles(scope,enabled) {
+    const batches=scope==='plan'?(state.batch?[state.batch]:[]):state.batches;
+    const selections=batches.flatMap(batch=>(batch.items || []).filter(item=>selectedTasks.has(taskKey(batch.id,item.id))).map(item=>({batch_id:batch.id,item_id:item.id})));
+    if(!selections.length)return toast('请先勾选任务。',true);
+    const button=$(`#track-titles-${enabled?'enable':'disable'}-${scope}`);button.disabled=true;
+    try{await setTrackTitles(selections,enabled);}catch(error){toast(error.message,true);}finally{updateSelectionButtons();}
+  }
   async function deleteSelectedTasks(scope = 'tasks') {
     const batches = scope === 'plan' ? (state.batch ? [state.batch] : []) : state.batches;
     const selections = batches.map(batch => ({batch_id:batch.id,item_ids:(batch.items || []).filter(item => selectedTasks.has(taskKey(batch.id,item.id))).map(item => item.id)})).filter(entry => entry.item_ids.length);
@@ -355,8 +418,8 @@
       selections.forEach(entry => entry.item_ids.forEach(id => selectedTasks.delete(taskKey(entry.batch_id,id))));
       if (result.updated_batches) applyDeletedBatches(result.updated_batches);
       else { state.batchSignature=''; await refreshBatches(); if (state.batch) renderPlan(state.batches.find(batch => batch.id === state.batch.id) || null); }
-      if (scope === 'plan') $('#plan-message').textContent = `已删除 ${result.deleted_items} 条任务记录，当前方案剩余 ${state.batch?.items?.length || 0} 条。成品和素材保留，缩略图已清理。`;
-      toast(result.preview_cleanup_errors?.length ? `任务已删除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : `已删除 ${result.deleted_items} 条任务记录；成品和素材保留，缩略图已清理。`, !!result.preview_cleanup_errors?.length);
+      if (scope === 'plan') $('#plan-message').textContent = `已删除 ${result.deleted_items} 条任务记录，当前方案剩余 ${state.batch?.items?.length || 0} 条。所有文件保留不变。`;
+      toast(result.preview_cleanup_errors?.length ? `任务已删除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : `已删除 ${result.deleted_items} 条任务记录；所有文件保留不变。`, !!result.preview_cleanup_errors?.length);
     } catch(error) { toast(error.message,true); }
     finally { button.disabled = false; updateSelectionButtons(); }
   }
@@ -370,7 +433,7 @@
     try {
       const result=await api('/api/tasks/clear',{method:'POST',body:'{}'});
       selectedTasks.clear();applyDeletedBatches(result.updated_batches);renderPlan(null);
-      toast(result.preview_cleanup_errors?.length ? `任务已清除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : `已清除 ${result.deleted_items} 条任务记录；成品和素材保留，缩略图已清理。`, !!result.preview_cleanup_errors?.length);
+      toast(result.preview_cleanup_errors?.length ? `任务已清除，但部分缩略图未能清理：${result.preview_cleanup_errors[0]}` : `已清除 ${result.deleted_items} 条任务记录；所有文件保留不变。`, !!result.preview_cleanup_errors?.length);
     } catch(error){toast(error.message,true);}
   }
   async function downloadDeletionRecords() {
@@ -387,7 +450,7 @@
     const reviewJob = state.reviewJobs.get(batch.id);
     const reviewAll = document.createElement('button'); reviewAll.className = 'button primary batch-approve-all'; reviewAll.type = 'button'; reviewAll.textContent = '一键审核'; reviewAll.disabled = reviewJob?.status === 'running' || !reviewCandidates(batch).length; reviewAll.onclick = () => approveBatch(batch); controls.append(reviewAll);
     const reviewNote = document.createElement('span'); reviewNote.className = `batch-review-state ${reviewJob?.status === 'failed' ? 'error' : 'field-help'}`; reviewNote.textContent = reviewJob?.status === 'running' ? `审核中 ${reviewJob.completed}/${reviewJob.total}，当前任务 ${reviewJob.current_item || '准备中'}` : reviewJob?.status === 'failed' ? `审核停在任务 ${reviewJob.failed_item}：${reviewJob.error}。修复后可再次点击。` : ''; controls.append(reviewNote);
-    if (batch.error || batch.recovery_note) { const note = document.createElement('div'); note.className = 'notice'; note.textContent = batch.error || batch.recovery_note; card.append(note); } const taskItems = document.createElement('div'); taskItems.className = 'task-items'; (batch.items || []).forEach(item => { const row = document.createElement('div'); row.className = 'task-item'; row.dataset.taskKey = taskKey(batch.id, item.id); if (expandedTasks.has(row.dataset.taskKey)) row.classList.add('expanded'); const index = document.createElement('span'); index.textContent = String(item.index ?? '—').padStart(2, '0'); const label = document.createElement('span'); label.className = 'task-label'; const pct = Number.isFinite(Number(item.progress)) ? ` · ${Math.round(Number(item.progress) * 100)}%` : ''; label.textContent = `${item.output_name ? item.output_name + ' · ' : ''}${fmt(item.duration)}${pct}${item.status === 'running' && renderStep(item) ? ' · ' + renderStep(item) : ''}${item.status === 'running' && item.render_stage === 'silence_detection' ? ` · 正在进行音乐静音检测（${item.music_detection?.done || 0}/${item.music_detection?.total || 0} 首）` : ''}`; const itemStatus = document.createElement('span'); const itemState = safeClass(item.status); itemStatus.className = `status ${itemState}`; itemStatus.textContent = itemState === 'success' && item.review?.status !== 'approved' && item.thumbnails ? ({queued:'缩略图排队中',generating:'生成缩略图',ready:'可审核',failed:'缩略图失败'}[item.thumbnails.status] || '已完成') : (statusLabels[itemState] || item.status || '待处理'); row.append(taskSelection(batch,item),index,label,itemStatus); if (item.status === 'success' && item.result?.shortened_seconds > 0.1) { const note = document.createElement('p'); note.className='field-help duration-note'; note.textContent=`实际时长约 ${fmt(item.result.duration)}，比规划短约 ${fmt(item.result.shortened_seconds)}；已按可用视频或有效音乐时长完成成片。`; row.append(note); } if (item.status === 'success' && item.result?.recovery_warnings?.length) { const note=document.createElement('p');note.className='field-help recovery-note';note.textContent='制作中已自动处理异常素材：' + item.result.recovery_warnings.filter(text => text.includes('已自动') || text.includes('缩短')).join('；');row.append(note); } if (item.error) { const error = document.createElement('div'); error.className = 'error'; error.textContent = item.error; row.append(error); } if (['completed','success'].includes(String(item.status).toLowerCase()) && !item.cleanup?.output_deleted) { const video = document.createElement('video'); video.controls = true; video.preload = 'none'; video.src = `/api/output?batch=${encodeURIComponent(batch.id)}&item=${encodeURIComponent(item.id)}`; row.append(video); } taskItems.append(row); }); card.append(head, progress, controls, taskItems); box.append(card); });
+    if (batch.error || batch.recovery_note) { const note = document.createElement('div'); note.className = 'notice'; note.textContent = batch.error || batch.recovery_note; card.append(note); } const taskItems = document.createElement('div'); taskItems.className = 'task-items'; (batch.items || []).forEach(item => { const row = document.createElement('div'); row.className = 'task-item'; row.dataset.taskKey = taskKey(batch.id, item.id); if (expandedTasks.has(row.dataset.taskKey)) row.classList.add('expanded'); const index = document.createElement('span'); index.textContent = String(item.index ?? '—').padStart(2, '0'); const label = document.createElement('span'); label.className = 'task-label'; const pct = Number.isFinite(Number(item.progress)) ? ` · ${Math.round(Number(item.progress) * 100)}%` : ''; label.textContent = `${item.output_name ? item.output_name + ' · ' : ''}${fmt(item.duration)}${pct}${item.status === 'running' && renderStep(item) ? ' · ' + renderStep(item) : ''}${item.status === 'running' && item.render_stage === 'silence_detection' ? ` · 正在进行音乐静音检测（${item.music_detection?.done || 0}/${item.music_detection?.total || 0} 首）` : ''}`; const itemStatus = document.createElement('span'); const itemState = safeClass(item.status); itemStatus.className = `status ${itemState}`; itemStatus.textContent = itemState === 'success' && item.review?.status !== 'approved' && item.thumbnails ? ({queued:'缩略图排队中',generating:'生成缩略图',ready:'可审核',failed:'缩略图失败'}[item.thumbnails.status] || '已完成') : (statusLabels[itemState] || item.status || '待处理'); row.append(taskSelection(batch,item),index,label,itemStatus,trackTitleOption(batch,item)); if (item.status === 'success' && item.result?.shortened_seconds > 0.1) { const note = document.createElement('p'); note.className='field-help duration-note'; note.textContent=`实际时长约 ${fmt(item.result.duration)}，比规划短约 ${fmt(item.result.shortened_seconds)}；已按可用视频或有效音乐时长完成成片。`; row.append(note); } if (item.status === 'success' && item.result?.recovery_warnings?.length) { const note=document.createElement('p');note.className='field-help recovery-note';note.textContent='制作中已自动处理异常素材：' + item.result.recovery_warnings.filter(text => text.includes('已自动') || text.includes('缩短')).join('；');row.append(note); } if (item.error) { const error = document.createElement('div'); error.className = 'error'; error.textContent = item.error; row.append(error); } if (['completed','success'].includes(String(item.status).toLowerCase()) && !item.cleanup?.output_deleted) { const video = document.createElement('video'); video.controls = true; video.preload = 'none'; video.src = `/api/output?batch=${encodeURIComponent(batch.id)}&item=${encodeURIComponent(item.id)}`; row.append(video); } taskItems.append(row); }); card.append(head, progress, controls, taskItems); box.append(card); });
     hydrateGalleries();
   }
   async function refreshCache() {
@@ -422,8 +485,8 @@
     else { renderBatches(batches); hydrateGalleries(); restoreTaskScroll(anchor); requestAnimationFrame(() => restoreTaskScroll(anchor)); }
     if (!state.poller) setupPolling();
   }
-  async function bootstrap() { try { const data = await api('/api/bootstrap'); if (data.api_protocol !== 10) throw new Error(`本地后台接口版本不兼容（当前 ${data.api_protocol ?? '未知'}，需要 10）。请先停止旧版后台再重新打开 MixCut Studio。`); state.serverVersion = data.version || ''; $('#video-dir').value = data.video_dir || ''; $('#music-dir').value = data.music_dir || ''; state.libraryDirs = {video: data.video_dir || '', music: data.music_dir || ''}; $('#output-dir').value = data.output_dir || ''; syncReviewDir(data.review_dir || ''); state.scan = data.scan || state.scan; state.batches = data.batches || []; state.reviewJobs = new Map(Object.entries(data.review_jobs || {})); state.batchSignature = batchesSignature(state.batches); state.batchLayoutSignature = batchesLayoutSignature(state.batches); renderAssets(); updateStickerSelectors(); renderErrors(state.scan.errors || []); renderBatches(state.batches); refreshCache(); hydrateGalleries(); const draft = state.batches.find(batch => batch.status === 'draft'); if (draft) renderPlan(draft); if (data.scan_job && ['discovering','analyzing'].includes(data.scan_job.status)) applyScanJob(data.scan_job); setServer(true, data.ffmpeg_available === false ? `${connectedLabel()} · 未找到 FFmpeg` : connectedLabel()); Object.entries(data.review_jobs || {}).filter(([, job]) => job.status === 'running').forEach(([id]) => watchBatchReview(id)); if (data.global_review_job?.status === 'running') watchAllReview(); document.dispatchEvent(new Event('mixcut-bootstrap')); } catch (error) { setServer(false, error.message); renderErrors([error.message]); } }
-  document.addEventListener('DOMContentLoaded', () => { window.addEventListener('hashchange', showView); $('#scan-btn').addEventListener('click', scan); $('#plan-btn').addEventListener('click', createPlan); $('#start-btn').addEventListener('click', () => state.batch && batchAction(state.batch.id, 'start')); $('#manifest-btn').addEventListener('click', () => { if (state.batch) window.open(`/api/manifest?batch=${encodeURIComponent(state.batch.id)}`, '_blank', 'noopener'); }); $('#clear-cache').addEventListener('click', clearCache); $('#retry-failed').addEventListener('click', retryFailed); $('#refresh-tasks').addEventListener('click', () => refreshBatches()); $('#pause-all').addEventListener('click',()=>allBatches('pause')); $('#start-all').addEventListener('click',()=>allBatches('start')); $('#stop-all').addEventListener('click',()=>allBatches('stop')); $('#approve-all-visible').addEventListener('click',approveAllVisible); $('#clear-all').addEventListener('click',clearAllBatches); $('#select-all-plan').addEventListener('click',()=>selectAllTasks('plan')); $('#delete-selected-plan').addEventListener('click',()=>deleteSelectedTasks('plan')); $('#select-all-tasks').addEventListener('click',()=>selectAllTasks('tasks')); $('#delete-selected-tasks').addEventListener('click',()=>deleteSelectedTasks('tasks')); $('#shutdown-btn').addEventListener('click', async () => { if (!confirm('确定停止本地后台服务吗？正在处理的任务会停止。')) return; try { await api('/api/shutdown', { method:'POST', body:'{}' }); } catch (error) { toast(error.message, true); return; } stopPolling(); setServer(false, '本地服务已停止'); toast('已请求停止后台服务。'); }); $('#config-form').addEventListener('change', event => { if (event.target.name === 'mode') { $$('.mode-multi').forEach(el => el.hidden = event.target.value !== 'multi'); $$('.mode-single').forEach(el => el.hidden = event.target.value !== 'single'); } if (event.target.name === 'music_mode') $$('.pool-settings').forEach(el => el.hidden = event.target.value !== 'pool'); }); $('#video-assets').addEventListener('change', event => { if (event.target.matches('.asset-select,.group-input')) { saveAssetPrefs(); renderPickers(); } }); $('#music-assets').addEventListener('change', event => { if (event.target.matches('.asset-select')) { saveAssetPrefs(); renderPickers(); } }); bootstrap().then(showView); });
+  async function bootstrap() { try { const data = await api('/api/bootstrap'); if (data.api_protocol !== 16) throw new Error(`本地后台接口版本不兼容（当前 ${data.api_protocol ?? '未知'}，需要 16）。请先停止旧版后台再重新打开 MixCut Studio。`); state.serverVersion = data.version || ''; $('#video-dir').value = data.video_dir || ''; $('#music-dir').value = data.music_dir || ''; state.libraryDirs = {video: data.video_dir || '', music: data.music_dir || ''}; $('#output-dir').value = data.output_dir || ''; syncReviewDir(data.review_dir || ''); state.scan = data.scan || state.scan; state.batches = data.batches || []; state.reviewJobs = new Map(Object.entries(data.review_jobs || {})); state.batchSignature = batchesSignature(state.batches); state.batchLayoutSignature = batchesLayoutSignature(state.batches); renderAssets(); updateStickerSelectors(); renderErrors(state.scan.errors || []); renderBatches(state.batches); refreshCache(); hydrateGalleries(); const draft = state.batches.find(batch => batch.status === 'draft'); if (draft) renderPlan(draft); if (data.scan_job && ['discovering','analyzing'].includes(data.scan_job.status)) applyScanJob(data.scan_job); setServer(true, data.ffmpeg_available === false ? `${connectedLabel()} · 未找到 FFmpeg` : connectedLabel()); Object.entries(data.review_jobs || {}).filter(([, job]) => job.status === 'running').forEach(([id]) => watchBatchReview(id)); if (data.global_review_job?.status === 'running') watchAllReview(); document.dispatchEvent(new Event('mixcut-bootstrap')); } catch (error) { setServer(false, error.message); renderErrors([error.message]); } }
+  document.addEventListener('DOMContentLoaded', () => { window.addEventListener('hashchange', showView); for(const scope of ['plan','tasks']) for(const action of ['enable','disable']) $(`#track-titles-${action}-${scope}`).addEventListener('click',()=>setSelectedTrackTitles(scope,action==='enable')); $('#scan-btn').addEventListener('click', scan); $('#plan-btn').addEventListener('click', createPlan); $('#start-btn').addEventListener('click', () => state.batch && batchAction(state.batch.id, 'start')); $('#manifest-btn').addEventListener('click', () => { if (state.batch) window.open(`/api/manifest?batch=${encodeURIComponent(state.batch.id)}`, '_blank', 'noopener'); }); $('#clear-cache').addEventListener('click', clearCache); $('#retry-failed').addEventListener('click', retryFailed); $('#refresh-tasks').addEventListener('click', () => refreshBatches()); $('#pause-all').addEventListener('click',()=>allBatches('pause')); $('#start-all').addEventListener('click',()=>allBatches('start')); $('#stop-all').addEventListener('click',()=>allBatches('stop')); $('#approve-all-visible').addEventListener('click',approveAllVisible); $('#clear-all').addEventListener('click',clearAllBatches); $('#select-all-plan').addEventListener('click',()=>selectAllTasks('plan')); $('#delete-selected-plan').addEventListener('click',()=>deleteSelectedTasks('plan')); $('#select-all-tasks').addEventListener('click',()=>selectAllTasks('tasks')); $('#delete-selected-tasks').addEventListener('click',()=>deleteSelectedTasks('tasks')); $('#shutdown-btn').addEventListener('click', async () => { if (!confirm('确定停止本地后台服务吗？正在处理的任务会停止。')) return; try { await api('/api/shutdown', { method:'POST', body:'{}' }); } catch (error) { toast(error.message, true); return; } stopPolling(); setServer(false, '本地服务已停止'); toast('已请求停止后台服务。'); }); $('#config-form').addEventListener('change', event => { if (event.target.name === 'mode') { $$('.mode-multi').forEach(el => el.hidden = event.target.value !== 'multi'); $$('.mode-single').forEach(el => el.hidden = event.target.value !== 'single'); } if (event.target.name === 'music_mode') { $$('.pool-settings').forEach(el => el.hidden = event.target.value !== 'pool'); $('#folder-mode-help').hidden = event.target.value !== 'folder'; renderPickers(); } }); $('#video-assets').addEventListener('change', event => { if (event.target.matches('.asset-select,.group-input')) { saveAssetPrefs(); renderPickers(); } }); $('#music-assets').addEventListener('change', event => { if (event.target.matches('.asset-select')) { saveAssetPrefs(); renderPickers(); } }); bootstrap().then(showView); });
   document.addEventListener('DOMContentLoaded', () => { $$('.folder-picker').forEach(button => button.addEventListener('click', () => pickFolder(button.dataset.kind))); $('#output-dir').addEventListener('change', () => persistPreference('output_dir', $('#output-dir').value.trim())); ['review-dir', 'task-review-dir'].forEach(id => $(`#${id}`).addEventListener('change', () => { const value = $(`#${id}`).value.trim(); syncReviewDir(value); persistPreference('review_dir', value); })); [['video-dir','video'],['music-dir','music']].forEach(([id,kind]) => $(`#${id}`).addEventListener('change', () => { if ($(`#${id}`).value.trim() !== state.libraryDirs?.[kind]) clearScannedLibrary(kind); })); });
   const polishTaskControls = () => $$('.batch').forEach(card => {
     const badge = $('.batch-head .status', card); if (badge?.textContent === 'validating') badge.textContent = '校验中';
@@ -460,7 +523,7 @@
       action.className = 'review-action field-help';
       if (item.review?.status === 'approved') {
         action.classList.add('review-approved');
-        action.textContent = `已通过审核：${item.review.path || '已归档'}`;
+        action.textContent = `已通过审核，保留原处：${item.review.path || '已归档'}`;
         const reveal = document.createElement('button');
         reveal.className = 'button'; reveal.type = 'button';
         reveal.textContent = '在 Finder 中显示审核文件';
@@ -471,7 +534,7 @@
         action.append(document.createElement('br'),reveal);
         const cleanup = document.createElement('p'); cleanup.className = 'field-help';
         const sourceStates = Object.values(item.cleanup?.source_files || {});
-        cleanup.textContent = `制作目录成品：${item.cleanup?.output_deleted ? '已删除' : (item.cleanup?.output_error || '待确认')} · 原始视频：${sourceStates.length ? sourceStates.join('；') : '无待删源片段记录'}`;
+        cleanup.textContent = `制作目录成品：${item.cleanup?.output_retained ? '保留原处' : item.cleanup?.output_deleted ? '已删除' : (item.cleanup?.output_error || '待确认')} · 原始视频：${sourceStates.length ? sourceStates.join('；') : '无待删源片段记录'}`;
         const origin = batch.sticker_origin;
         const original = item.kind === 'sticker_variant' && origin ? (state.batches.find(entry => entry.id === origin.batch_id)?.items || []).find(entry => entry.id === origin.item_id) : null;
         if (item.kind === 'sticker_variant') {
@@ -479,8 +542,8 @@
           if (original?.segments?.length) cleanup.textContent += ` · 原素材：${Object.values(original.cleanup?.source_files || {}).join('；') || '待清理'}`;
         }
         action.append(cleanup);
-        if (!item.cleanup?.output_deleted || (item.segments?.length && !item.cleanup?.original_recordings_deleted) || (item.kind === 'sticker_variant' && (!item.cleanup?.origin_output_deleted || (original?.segments?.length && !original.cleanup?.original_recordings_deleted)))) {
-          const retry = document.createElement('button'); retry.className = 'button'; retry.type = 'button'; retry.textContent = '重试清理原片与制作成片';
+        if ((!item.cleanup?.output_deleted && !item.cleanup?.output_retained) || (item.segments?.length && !item.cleanup?.original_recordings_deleted) || (item.kind === 'sticker_variant' && (!item.cleanup?.origin_output_deleted || (original?.segments?.length && !original.cleanup?.original_recordings_deleted)))) {
+          const retry = document.createElement('button'); retry.className = 'button'; retry.type = 'button'; retry.textContent = '重试清理缓存与原素材';
           retry.addEventListener('click', async () => { retry.disabled = true; try { await api(`/api/batches/${encodeURIComponent(batch.id)}/items/${encodeURIComponent(item.id)}/retry-cleanup`, {method:'POST',body:'{}'}); state.batchSignature=''; await refreshBatches(); toast('清理状态已更新。'); } catch(error) { retry.disabled = false; toast(error.message,true); } });
           action.append(retry);
         }
@@ -497,15 +560,15 @@
         const approve = document.createElement('button');
         approve.className = 'button primary'; approve.type = 'button';
         approve.disabled = item.review?.status === 'copying';
-        approve.textContent = approve.disabled ? '正在归档' : '通过审核';
+        approve.textContent = approve.disabled ? '正在审核' : '通过审核';
         approve.addEventListener('click', () => approveItem(batch.id,item.id,approve));
         const collapse=document.createElement('button');collapse.className='button';collapse.type='button';collapse.textContent='收起';collapse.onclick=()=>setTaskExpanded(row,false);
         const reject=document.createElement('button');reject.className='button danger';reject.type='button';reject.textContent='审核不通过';reject.disabled=approve.disabled;reject.onclick=()=>rejectItem(batch,item,reject);
         const buttons=document.createElement('div');buttons.className='review-buttons';buttons.append(approve,collapse,reject);action.append(buttons);
-        const variant = document.createElement('select'); variant.className = 'sticker-variant'; variant.setAttribute('aria-label','审核时追加的贴图模板'); variant.append(new Option('不追加贴图', '')); (state.stickers?.templates || []).forEach(template => variant.append(new Option(template.name, template.id))); const makeVariant = document.createElement('button'); makeVariant.className = 'button'; makeVariant.type = 'button'; makeVariant.textContent = '生成贴图版本'; makeVariant.addEventListener('click', async () => { if (!variant.value) return toast('请选择一个贴图模板。', true); makeVariant.disabled = true; try { const job = await api('/api/sticker-variants', { method:'POST', body:JSON.stringify({batch_id:batch.id,item_id:item.id,template_id:variant.value}) }); makeVariant.textContent = '贴图版本排队中'; const timer = setInterval(async () => { try { const status = await api(`/api/sticker-variants/${encodeURIComponent(job.job_id)}`); makeVariant.textContent = status.status === 'completed' ? '贴图版本已生成' : `生成中 ${Math.round((status.progress || 0) * 100)}%`; if (['completed','failed'].includes(status.status)) { clearInterval(timer); makeVariant.disabled = false; if (status.status === 'failed') toast(status.error || '贴图版本生成失败', true); await refreshBatches(); } } catch (_) { clearInterval(timer); makeVariant.disabled = false; } }, 3000); } catch (error) { makeVariant.disabled = false; toast(error.message,true); } }); const hint=document.createElement('p');hint.className='field-help';hint.textContent='审核贴图版后，会清理未审核的原成片及可安全删除的原素材。';makeVariant.disabled=!variant.value;variant.addEventListener('change',()=>{makeVariant.disabled=!variant.value;approve.disabled=!!variant.value || item.review?.status==='copying';approve.textContent=variant.value?'请先生成贴图版本':(approve.disabled?'正在归档':'通过审核');});action.append(hint, variant, makeVariant);
+        const variant = document.createElement('select'); variant.className = 'sticker-variant'; variant.setAttribute('aria-label','审核时追加的贴图模板'); variant.append(new Option('不追加贴图', '')); (state.stickers?.templates || []).forEach(template => variant.append(new Option(template.name, template.id))); const makeVariant = document.createElement('button'); makeVariant.className = 'button'; makeVariant.type = 'button'; makeVariant.textContent = '生成贴图版本'; makeVariant.addEventListener('click', async () => { if (!variant.value) return toast('请选择一个贴图模板。', true); makeVariant.disabled = true; try { const job = await api('/api/sticker-variants', { method:'POST', body:JSON.stringify({batch_id:batch.id,item_id:item.id,template_id:variant.value}) }); makeVariant.textContent = '贴图版本排队中'; const timer = setInterval(async () => { try { const status = await api(`/api/sticker-variants/${encodeURIComponent(job.job_id)}`); makeVariant.textContent = status.status === 'completed' ? '贴图版本已生成' : `生成中 ${Math.round((status.progress || 0) * 100)}%`; if (['completed','failed'].includes(status.status)) { clearInterval(timer); makeVariant.disabled = false; if (status.status === 'failed') toast(status.error || '贴图版本生成失败', true); await refreshBatches(); } } catch (_) { clearInterval(timer); makeVariant.disabled = false; } }, 3000); } catch (error) { makeVariant.disabled = false; toast(error.message,true); } }); const hint=document.createElement('p');hint.className='field-help';hint.textContent='审核贴图版后，会清理未审核的原成片及可安全删除的原素材。';makeVariant.disabled=!variant.value;variant.addEventListener('change',()=>{makeVariant.disabled=!variant.value;approve.disabled=!!variant.value || item.review?.status==='copying';approve.textContent=variant.value?'请先生成贴图版本':(approve.disabled?'正在审核':'通过审核');});action.append(hint, variant, makeVariant);
         if (item.review?.error) {
           const error = document.createElement('div'); error.className = 'review-error';
-          error.textContent = `归档失败：${item.review.error}`; action.append(error);
+          error.textContent = `审核失败：${item.review.error}`; action.append(error);
         }
       }
       if (video) { const directSticker = document.createElement('button'); directSticker.className = 'button direct-sticker'; directSticker.type = 'button'; directSticker.textContent = '在视频上添加贴图'; directSticker.addEventListener('click', () => openVideoStickerEditor(batch, item, video)); action.append(document.createElement('br'), directSticker); video.before(action); }
@@ -723,7 +786,7 @@
       ['count', 'min_source_duration_minutes', 'min_duration', 'max_duration', 'min_songs', 'max_songs', 'start_gap', 'segment_min', 'segment_max', 'seed', 'fps', 'original_volume', 'music_volume'].forEach(key => { config[key] = Number(config[key]); });
       [config.width, config.height] = String(config.resolution || '1280x720').split('x').map(Number);
       delete config.resolution;
-      if (String(config.seed || '').trim()) config.seed = Number(config.seed); else delete config.seed; config.allow_overlap = form.elements.allow_overlap.checked;
+      if (String(config.seed || '').trim()) config.seed = Number(config.seed); else delete config.seed; config.allow_overlap = form.elements.allow_overlap.checked; config.include_track_titles = form.elements.include_track_titles.checked;
       config.within_group = config.within_group === 'true';
       config.sticker_template_id = config.sticker_template_id || null;
       config.first_song_ids = [];
