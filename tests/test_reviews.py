@@ -8,13 +8,17 @@ import time
 import unittest
 from unittest.mock import patch
 
+from recycle_fixture import install_recycle_fixture
 from mixcut.server import Application
 
 
-class ReviewTests(unittest.TestCase):
+class LegacyArchiveReviewTests(unittest.TestCase):
     def setUp(self):
+        legacy=patch.object(Application, "approve", Application._approve_legacy)
+        legacy.start();self.addCleanup(legacy.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
+        install_recycle_fixture(self,self.root)
         self.app = Application(self.root / 'state')
         self.export = self.root / 'exports' / '2026-09-22_001'
         self.export.mkdir(parents=True)
@@ -124,12 +128,13 @@ class ReviewTests(unittest.TestCase):
         first = self.approve()['items'][0]['review']
         second = self.approve('2')['items'][1]['review']
         self.assertEqual('approved', first['status'])
-        self.assertRegex(Path(first['path']).parent.parent.name, r'^\d{4}-\d{2}-\d{2}$')
+        self.assertEqual(self.target_root, Path(first['path']).parent.parent)
         self.assertEqual(Path(first['path']).parent.parent, Path(second['path']).parent.parent)
         self.assertNotEqual(Path(first['path']).parent, Path(second['path']).parent)
         self.assertEqual('去重歌曲03_001', Path(first['path']).stem)
         self.assertEqual('去重歌曲03_002', Path(second['path']).stem)
-        self.assertEqual(Path(first['path']).stem, Path(first['path']).parent.name)
+        self.assertEqual('001-reviewed', Path(first['path']).parent.name)
+        self.assertEqual('002-reviewed', Path(second['path']).parent.name)
         self.assertEqual(original, Path(first['path']).read_bytes())
         sidecar = Path(first['path']).with_suffix('.txt')
         self.assertEqual([str(self.root / 'music' / '去重歌曲03')], sidecar.read_text().splitlines())
@@ -184,7 +189,7 @@ class ReviewTests(unittest.TestCase):
 
     def test_different_existing_file_is_not_overwritten(self):
         day = datetime.now().astimezone().strftime('%Y-%m-%d')
-        folder = self.target_root / day / '去重歌曲03_001'; folder.mkdir(parents=True)
+        folder = self.target_root / '001-reviewed'; folder.mkdir(parents=True)
         target = folder / '去重歌曲03_001.mp4'
         target.write_bytes(b'keep-existing')
         approved = self.approve()['items'][0]['review']
