@@ -131,7 +131,7 @@ class StickerApplicationTest(unittest.TestCase):
                          self.app.batch(original['id'])['items'][0]['review'])
         self.assertEqual(template['id'], job['config']['sticker_template_id'])
         self.assertEqual(asset['id'], job['config']['sticker_layers'][0]['sticker_id'])
-        self.assertRegex(Path(job['output_folder']).name, r'^\d{4}-\d{2}-\d{2}_\d{3}$')
+        self.assertRegex(Path(job['output_folder']).name, r'^\d{3}-exports$')
         self.assertEqual(Path(job['output_folder']) / '001.mp4', Path(job_item['output_path']))
         self.assertEqual(job['id'], reply['output_batch_id'])
 
@@ -163,7 +163,7 @@ class StickerApplicationTest(unittest.TestCase):
         approved = self.app.approve({'batch_id': original['id'], 'item_id': 'item01',
                                      'review_dir': str(self.root / 'approved')})
         archived = approved['items'][0]['review']['path']
-        self.assertFalse(source.exists())
+        self.assertTrue(source.exists())
         reply = self.app.create_sticker_variant({'batch_id': original['id'], 'item_id': 'item01',
                                                   'template_id': template['id']})
         self.assertEqual(archived, self.app.batch(reply['job_id'])['items'][0]['source_asset']['path'])
