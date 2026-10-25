@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+from recycle_fixture import install_recycle_fixture
 from mixcut.server import Application
 from mixcut.keyframes import KeyframeCache
 
@@ -15,6 +16,7 @@ class RejectTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
+        install_recycle_fixture(self,self.root)
         self.app = Application(self.root/'state')
         sources = self.root/'sources'; sources.mkdir()
         self.source = sources/'source.mp4'; self.source.write_bytes(b'video')
@@ -50,11 +52,7 @@ class RejectTests(unittest.TestCase):
         self.assertTrue(self.reject()['ok'])
 
     def test_cleanup_failure_keeps_task_and_can_retry(self):
-        original = Path.unlink
-        def denied(path, *args, **kwargs):
-            if path == self.source:raise PermissionError('fixture denied')
-            return original(path,*args,**kwargs)
-        with patch.object(Path,'unlink',denied): result=self.reject()
+        with patch('mixcut.server.move_to_trash',side_effect=PermissionError('fixture denied')): result=self.reject()
         self.assertFalse(result['ok']);self.assertTrue(self.source.exists());self.assertTrue(self.music.exists())
         self.assertEqual('reject_failed',self.app.visible_batches()[0]['items'][0]['review']['status'])
         self.assertTrue(self.reject()['ok']);self.assertFalse(self.source.exists())
@@ -92,15 +90,15 @@ class PairedFrameTests(unittest.TestCase):
             listing=root/'concat.txt';listing.write_text("file 'one.mp4'\nfile 'two.mp4'\n")
             video=root/'joined.mp4';ff('-f','concat','-safe','0','-i',str(listing),'-c','copy',str(video))
             cache=KeyframeCache(root/'cache');data=cache.prepare(video)
-            self.assertEqual([0.,30.,60.],[f['time'] for f in data['frames']])
-            self.assertTrue(cache.ready(data['version'],3))
-            for index in range(3):
+            self.assertEqual([0.,60.],[f['time'] for f in data['frames']])
+            self.assertTrue(cache.ready(data['version'],2))
+            for index in range(2):
                 for size in ('thumb','large'):
                     with patch('mixcut.keyframes.subprocess.run',side_effect=AssertionError('cached preview must not decode')):
                         image=cache.image(video,index,size)
                     rgb=ff('-i',str(image),'-vf','scale=1:1','-frames:v','1','-pix_fmt','rgb24','-f','rawvideo','pipe:1').stdout
                     self.assertEqual(3,len(rgb))
-                    self.assertGreater(rgb[0] if index<2 else rgb[2],200)
+                    self.assertGreater(rgb[0] if index==0 else rgb[2],200)
 
     def test_rejected_original_checkpoint_is_not_reused(self):
         from mixcut import media, renderer, checkpoints

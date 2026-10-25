@@ -11,11 +11,11 @@ def asset(identity, seconds):
 
 
 class SourceDurationTests(unittest.TestCase):
-    def test_single_mode_excludes_below_and_exact_boundary(self):
-        result = planner.plan([asset('short', 299), asset('equal', 300), asset('long', 300.01)],
+    def test_single_mode_includes_exact_boundary(self):
+        result = planner.plan([asset('short', 299), asset('equal', 300)],
                               [asset('song', 10)], {'count': 1, 'min_source_duration_minutes': 5})
-        self.assertEqual('long', result['items'][0]['segments'][0]['asset_id'])
-        self.assertTrue(any('排除 2 条' in warning for warning in result['warnings']))
+        self.assertEqual('equal', result['items'][0]['segments'][0]['asset_id'])
+        self.assertTrue(any('排除 1 条' in warning for warning in result['warnings']))
 
     def test_multi_mode_uses_only_eligible_sources(self):
         result = planner.plan([asset('short', 30), asset('a', 300.01), asset('b', 360)],
@@ -26,19 +26,19 @@ class SourceDurationTests(unittest.TestCase):
     def test_zero_unset_and_fractional_minutes(self):
         for value in ({}, {'min_source_duration_minutes': 0}):
             self.assertEqual(1, len(planner.plan([asset('v', 10)], [asset('song', 5)], {'count': 1, **value})['items']))
-        result = planner.plan([asset('equal', 30), asset('long', 30.01)], [asset('song', 5)],
+        result = planner.plan([asset('equal', 30)], [asset('song', 5)],
                               {'count': 1, 'min_source_duration_minutes': .5})
-        self.assertEqual('long', result['items'][0]['segments'][0]['asset_id'])
+        self.assertEqual('equal', result['items'][0]['segments'][0]['asset_id'])
 
     def test_partial_planning_waits_while_strict_mode_explains_filter(self):
-        videos, songs = [asset('v', 300)], [asset('song', 5)]
+        videos, songs = [asset('v', 299)], [asset('song', 5)]
         config = {'count': 50, 'min_source_duration_minutes': 5}
-        with self.assertRaisesRegex(ValueError, '大于 5 分钟'):
+        with self.assertRaisesRegex(ValueError, '达到 5 分钟'):
             planner.plan(videos, songs, config)
         result = planner.plan(videos, songs, config, allow_partial=True)
         self.assertEqual([], result['items'])
         self.assertEqual(50, result['stats']['remaining'])
-        self.assertIn('大于 5 分钟', result['warnings'][0])
+        self.assertIn('达到 5 分钟', result['warnings'][0])
 
     def test_invalid_values_and_scheduler_snapshot(self):
         for value in (-1, float('nan'), float('inf'), 'bad', None):

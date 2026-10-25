@@ -261,6 +261,12 @@ def _scan_paths(paths: list[Path], kind: str, root: Path, cache: dict[str, Any],
     for path in paths:
         asset = None
         before_errors = len(errors)
+        snapshot = None
+        try:
+            st = path.stat()
+            snapshot = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "dev": st.st_dev, "ino": st.st_ino}
+        except OSError:
+            pass
         try:
             asset = _cached_asset(path, kind, cache, identities, quick_music=quick_music)
             if asset and kind == 'music':
@@ -273,7 +279,7 @@ def _scan_paths(paths: list[Path], kind: str, root: Path, cache: dict[str, Any],
                     stats['duplicates' if asset else 'skipped_content'] += 1
                 asset = None
         except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
-            errors.append({"path": str(path), "error": str(exc)})
+            errors.append({"path": str(path), "error": str(exc), "kind": kind, "snapshot": snapshot})
         if stats is not None and len(errors) > before_errors:
             stats['failed'] += 1
         if progress:

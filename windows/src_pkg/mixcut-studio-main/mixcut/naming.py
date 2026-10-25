@@ -61,3 +61,8 @@ def export_filename(styles, index):
     if len(prefix.encode('utf-8')) > 180:
         prefix = prefix.encode('utf-8')[:165].decode('utf-8', errors='ignore').rstrip(' .') + '-' + hashlib.sha256(prefix.encode()).hexdigest()[:8]
     return f'{prefix}_{int(index):03d}.mp4' if prefix else f'{int(index):03d}.mp4'
+
+
+def review_folder_name(day, number):
+    """Portable daily task bundle name, independent of root labels or music."""
+    return f'{day}-{int(number):03d}'
