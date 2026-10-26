@@ -1,5 +1,6 @@
 """Music-folder labels and portable export filenames; no audio-style guessing."""
 import hashlib
+import math
 from pathlib import Path
 import re
 
@@ -61,3 +62,44 @@ def export_filename(styles, index):
     if len(prefix.encode('utf-8')) > 180:
         prefix = prefix.encode('utf-8')[:165].decode('utf-8', errors='ignore').rstrip(' .') + '-' + hashlib.sha256(prefix.encode()).hexdigest()[:8]
     return f'{prefix}_{int(index):03d}.mp4' if prefix else f'{int(index):03d}.mp4'
+
+
+def review_folder_name(day, number):
+    """Portable daily task bundle name, independent of root labels or music."""
+    return f'{day}-{int(number):03d}'
+
+
+def youtube_id(folder):
+    """Recognize standard IDs in Set directory names, never in ancestor labels."""
+    name = Path(folder).name
+    for pattern in (r'首[_ ]([A-Za-z0-9_-]{11})(?=$|[_\s])',
+                    r'\[([A-Za-z0-9_-]{11})\]',
+                    r'^([A-Za-z0-9_-]{11})$',
+                    r'_([A-Za-z0-9_-]{11})$'):
+        match = re.search(pattern, name)
+        if match:
+            return match[1]
+    return None
+
+
+def duration_filename(item, duration=None):
+    """Name exports by duration and distinct leaf-folder YouTube IDs."""
+    seconds = float(item.get('duration', 0) if duration is None else duration)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError('成片命名时长无效')
+    seconds = int(seconds + .5)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    folders = ([item['music_folder']] if item.get('music_folder') else
+               music_folders(item.get('music', [])) or item.get('music_source_folders', []))
+    ids = list(dict.fromkeys(value for folder in folders if (value := youtube_id(folder))))
+    label = '+'.join(ids) if ids else '未识别ID'
+    if len(label) > 144:
+        label = label[:131] + '-' + hashlib.sha256(label.encode()).hexdigest()[:8]
+    return f'{hours}小时{minutes}分{seconds}秒-{label}.mp4'
+
+
+def item_filename(item):
+    if item.get('output_naming') == 'duration-youtube-v1':
+        return duration_filename(item)
+    return export_filename(item.get('music_styles', []), item['index'])

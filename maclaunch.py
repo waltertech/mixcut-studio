@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import os
 from pathlib import Path
 import subprocess
@@ -15,12 +16,25 @@ PORT = 8877
 URL = f'http://127.0.0.1:{PORT}'
 
 
+def _local_json(path, *, port=PORT, timeout=2.0, data=None):
+    """Contact this machine directly; system/VPN proxies never apply to loopback."""
+    connection = http.client.HTTPConnection('127.0.0.1', port, timeout=timeout)
+    try:
+        headers = {'Content-Type': 'application/json'} if data is not None else {}
+        connection.request('POST' if data is not None else 'GET', path, body=data, headers=headers)
+        response = connection.getresponse()
+        if response.status != 200:
+            raise OSError(f'本机服务返回 HTTP {response.status}')
+        return json.load(response)
+    finally:
+        connection.close()
+
+
 def _readiness(port=PORT, timeout=2.0):
     try:
-        with urlopen(f'http://127.0.0.1:{port}/api/bootstrap', timeout=timeout) as response:
-            data = json.load(response)
-        return data if 'ffmpeg_available' in data and 'batches' in data else None
-    except (URLError, OSError, ValueError, json.JSONDecodeError):
+        data = _local_json('/api/bootstrap', port=port, timeout=timeout)
+        return data if isinstance(data, dict) and 'ffmpeg_available' in data and 'batches' in data else None
+    except (http.client.HTTPException, OSError, ValueError):
         return None
 
 
@@ -66,10 +80,7 @@ def _attach_streams(state: Path):
 
 def _stop():
     try:
-        request = Request(URL + '/api/shutdown', data=b'{}', method='POST',
-                          headers={'Content-Type': 'application/json'})
-        with urlopen(request, timeout=10) as response:
-            json.load(response)
+        _local_json('/api/shutdown', timeout=10, data=b'{}')
     except Exception as exc:
         print(f'退出后台失败：{exc}', flush=True)
         return 1
@@ -98,6 +109,19 @@ def main(argv):
     state = data / '.mixcut'
     _attach_streams(state)
 
+    if '--diagnose-startup' in argv:
+        # Read-only comparison for investigating the original packaged URL opener.
+        result = {'direct': _readiness(), 'legacy': None}
+        try:
+            with urlopen(URL + '/api/bootstrap', timeout=2) as response:
+                legacy = json.load(response)
+            result['legacy'] = {key: legacy.get(key) for key in ('version', 'api_protocol')}
+        except Exception as exc:
+            import traceback
+            result['legacy'] = {'error_type': type(exc).__name__, 'error': str(exc), 'traceback': traceback.format_exc()}
+        result['direct'] = {key: (result['direct'] or {}).get(key) for key in ('version', 'api_protocol')}
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return 0
     if '--server' in argv:
         from mixcut import server
         forwarded = [item for item in argv if item != '--server']
