@@ -218,51 +218,79 @@ def render(item, config, output_path, work_dir, progress_callback=None):
         raise ValueError('导出规格或时长无效')
     if not item.get('segments') or not item.get('music'):
         raise ValueError('方案缺少视频或音乐')
+    if item.get('music_folder') and not item.get('nonstop') and item.get('duration_basis') != 'music':
+        # The rest of a shuffled round is stored for review but never opened by FFmpeg.
+        total, prefix = 0., []
+        for song in item['music']:
+            prefix.append(song); total += float(song['duration'])
+            if total >= duration: break
+        item = dict(item, music=prefix)
     for asset in {a['id']: a for a in item['music']}.values():
-        media.verify_asset(asset)
+        try:
+            media.verify_asset(asset)
+        except (OSError, ValueError) as exc:
+            if item.get('music_folder'):
+                raise MusicInputError('当前文件夹音乐无法读取：' + str(exc), [asset['id']]) from exc
+            raise
     output = Path(output_path).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.exists():
         raise ValueError('输出文件已存在，程序不会覆盖：' + str(output))
     work = Path(work_dir).resolve()
     work.mkdir(parents=True, exist_ok=True)
+    if item.get('duration_basis') == 'music' and item.get('kind') != 'sticker_variant':
+        from .musicled import prepare_audio
+        item = prepare_audio(item, config, work, progress_callback)
+        duration = float(item['duration'])
     temporary = output.parent / f'.{output.stem}-{uuid.uuid4().hex[:8]}.partial.mp4'
     log_path = work / 'ffmpeg.log'
     log_path.write_text('', encoding='utf-8')
     from . import checkpoints
     concat, video_duration, checkpoint_state = checkpoints.prepare(item, config, work, progress_callback)
+    if item.get('duration_basis') == 'music' and video_duration < duration - 1 / fps:
+        # Keep the full soundtrack even if damaged footage exhausted replacements.
+        lines = concat.read_text(encoding='utf-8')
+        concat.write_text(lines * math.ceil(duration / video_duration), encoding='utf-8')
+        checkpoint_state['warnings'].append('异常素材不足，已自动循环保留的有效画面以完整播放音乐。')
+        video_duration = duration
     duration = min(duration, video_duration)
+    copy_audio = bool(item.get('prepared_audio')) and not float(config.get('original_volume', 0))
     inputs = ['-f', 'concat', '-safe', '1', '-i', str(concat)]
     filters = []
     count = 1
     original_volume = float(config.get('original_volume', 0))
     if original_volume:
         filters.append(f'[0:a:0]volume={original_volume}[original]')
-    for index, song in enumerate(item['music']):
-        inputs += ['-i', song['path']]
-        edges = song.get('nonstop_edges') if item.get('nonstop') else None
-        trim = f"atrim=start={edges['start']:.8f}:end={edges['end']:.8f}," if edges else ''
-        filters.append(f'[{count + index}:a:0]{trim}asetpts=PTS-STARTPTS,aresample=48000,'
-                       f'aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]')
-    if item.get('nonstop'):
-        label = 'a0'
-        for index, fade in enumerate(item['nonstop']['crossfades'], 1):
-            next_label = f'join{index}'
-            filters.append(f'[{label}][a{index}]acrossfade=d={fade:.8f}:c1=tri:c2=tri[{next_label}]')
-            label = next_label
-        filters.append(f'[{label}]atrim=duration={duration:.8f},'
-                       f'volume={float(config.get("music_volume", 1))},afade=t=out:'
-                       f'st={max(0.,duration-.15):.8f}:d={min(.15,duration):.8f}[music]')
+    if item.get('prepared_audio'):
+        inputs += ['-i', item['prepared_audio']]
+        if not copy_audio:
+            filters.append('[1:a:0]anull[music]')
     else:
-        music_labels = ''.join(f'[a{i}]' for i in range(len(item['music'])))
-        filters.append(f'{music_labels}concat=n={len(item["music"])}:v=0:a=1,'
-                       f'atrim=duration={duration:.8f},volume={float(config.get("music_volume", 1))}[music]')
+        for index, song in enumerate(item['music']):
+            inputs += ['-i', song['path']]
+            edges = song.get('nonstop_edges') if item.get('nonstop') else None
+            trim = f"atrim=start={edges['start']:.8f}:end={edges['end']:.8f}," if edges else ''
+            filters.append(f'[{count + index}:a:0]{trim}asetpts=PTS-STARTPTS,aresample=48000,'
+                           f'aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]')
+        if item.get('nonstop'):
+            label = 'a0'
+            for index, fade in enumerate(item['nonstop']['crossfades'], 1):
+                next_label = f'join{index}'
+                filters.append(f'[{label}][a{index}]acrossfade=d={fade:.8f}:c1=tri:c2=tri[{next_label}]')
+                label = next_label
+            filters.append(f'[{label}]atrim=duration={duration:.8f},'
+                           f'volume={float(config.get("music_volume", 1))},afade=t=out:'
+                           f'st={max(0.,duration-.15):.8f}:d={min(.15,duration):.8f}[music]')
+        else:
+            music_labels = ''.join(f'[a{i}]' for i in range(len(item['music'])))
+            filters.append(f'{music_labels}concat=n={len(item["music"])}:v=0:a=1,'
+                           f'atrim=duration={duration:.8f},volume={float(config.get("music_volume", 1))}[music]')
     if original_volume:
         filters.append('[music][original]amix=inputs=2:duration=first:normalize=0:dropout_transition=0[aout]')
-    else:
+    elif not copy_audio:
         filters.append('[music]anull[aout]')
     output_label = stickers.add_overlay_filters(inputs, filters, config.get('sticker_layers') or [],
-                                                count + len(item['music']), '0:v:0', width, height, fps, duration)
+                                                count + (1 if item.get('prepared_audio') else len(item['music'])), '0:v:0', width, height, fps, duration)
     requested = config.get('hardware', 'auto')
     codecs = _codec_candidates(requested) if config.get('sticker_layers') else ['copy']
     started = time.monotonic()
@@ -272,9 +300,9 @@ def render(item, config, output_path, work_dir, progress_callback=None):
             encoding = (['-c:v', 'copy'] if codec == 'copy' else
                         _encoding(codec, width, height, fps, requested, config.get('video_bitrate_mbps', 0)))
             command = ['ffmpeg', '-nostdin', '-y', '-hide_banner', '-loglevel', 'error', '-xerror',
-                       '-filter_complex_threads', _filter_threads(), *inputs, '-filter_complex', ';'.join(filters),
-                       '-map', (f'[{output_label}]' if config.get('sticker_layers') else '0:v:0'), '-map', '[aout]', *encoding, '-pix_fmt', 'yuv420p',
-                       '-r', str(fps), '-t', str(duration), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
+                       '-filter_complex_threads', _filter_threads(), *inputs, *(['-filter_complex', ';'.join(filters)] if filters else []),
+                       '-map', (f'[{output_label}]' if config.get('sticker_layers') else '0:v:0'), '-map', ('1:a:0' if copy_audio else '[aout]'), *encoding, '-pix_fmt', 'yuv420p',
+                       '-r', str(fps), '-t', str(duration), *(['-c:a', 'copy'] if copy_audio else ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000']),
                        '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', str(temporary)]
             with log_path.open('a', encoding='utf-8') as log:
                 log.write(f'\nEncoder attempt: {codec}\n'); log.flush()
@@ -311,6 +339,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
                                                capture_output=True, text=True, timeout=120)
                         if remux.returncode: raise ValueError('截短成片失败：' + remux.stderr[-500:])
                         checked = validate(str(shortened), actual, progress_callback, work / 'validation-short.log')
+                        duration = min(duration, actual)
                         os.replace(shortened, temporary)
                     finally:
                         shortened.unlink(missing_ok=True)
@@ -320,8 +349,14 @@ def render(item, config, output_path, work_dir, progress_callback=None):
                     raise
             else:
                 raise
-        recovery_result = dict(checked, recovery_warnings=checkpoint_state['warnings'],
-                               rendered_segments=checkpoints.rendered_segments(checkpoint_state['chunks']))
+        from .tracklist import played_music
+        actual_segments = checkpoints.rendered_segments(checkpoint_state['chunks'])
+        if item.get('duration_basis') == 'music':
+            from .musicled import fit_segments
+            actual_segments = fit_segments(actual_segments, duration)
+        actual_music = played_music(item, min(duration, float(checked.get('duration', duration))))
+        recovery_result = dict(checked, played_music=actual_music, recovery_warnings=checkpoint_state['warnings'],
+                               rendered_segments=actual_segments)
         snapshot = work / 'render-result.json'
         snapshot.write_text(json.dumps(recovery_result, ensure_ascii=False), encoding='utf-8')
         from .fsutil import flush_to_disk
@@ -329,7 +364,7 @@ def render(item, config, output_path, work_dir, progress_callback=None):
         publish(temporary, output)
         checked.update(path=str(output), encoder=checkpoint_state['chunks'][0].get('encoder', chosen), assembly_encoder=chosen, elapsed_seconds=round(time.monotonic() - started, 3),
                        recovery_warnings=checkpoint_state['warnings'],
-                       rendered_segments=checkpoints.rendered_segments(checkpoint_state['chunks']))
+                       rendered_segments=actual_segments, played_music=actual_music)
         import shutil
         shutil.rmtree(work / 'checkpoints', ignore_errors=True)
         if progress_callback:

@@ -160,6 +160,30 @@ def prepare(item, config, work, callback=None):
         # Truncate the manifest at the first missing/invalid checkpoint.
         state['chunks'] = state['chunks'][:index]
         target.unlink(missing_ok=True)
+        if item.get('duration_basis') == 'music' and allowed(original):
+            # Reuse identical encoded loop chunks inside this task; no media decode.
+            for prior_index, prior in enumerate(state['chunks']):
+                prior_path = root / f'{prior_index:04d}.mov'
+                try:
+                    stat = prior_path.stat()
+                    reusable = (prior['segment'] == original and prior['version'] == source_version(original['path'])
+                                and stat.st_size == prior['size'] and stat.st_mtime_ns == prior['mtime_ns'])
+                    if not reusable:
+                        continue
+                    import os
+                    os.link(prior_path, target)
+                    record = dict(prior)
+                    state['chunks'].append(record)
+                    _save(manifest, state)
+                    paths.append(target); completed += original['duration']
+                    notify = config.get('checkpoint_ready')
+                    if notify: notify(state['chunks'], state['warnings'])
+                    report('video_segments')
+                    break
+                except OSError:
+                    target.unlink(missing_ok=True)
+            if target.is_file():
+                continue
         estimate = max(200_000_000, int(float(config.get('video_bitrate_mbps') or 8) * 125_000 * original['duration'] * 1.5))
         if shutil.disk_usage(root).free < estimate * max(1, int(config.get('parallel_tasks', 1))) + 200_000_000:
             raise OSError('本地分段缓存空间不足，请清理缓存后继续；已完成片段保留。')

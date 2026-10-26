@@ -162,6 +162,15 @@ def _respect_start_gap(ranges, old_starts, gap):
     return ranges
 
 
+def source_meets_minimum(video, minutes):
+    """Source admission is inclusive; it is independent of output/segment length."""
+    try:
+        duration = float(video['duration'])
+        return math.isfinite(duration) and duration > .1 and duration >= float(minutes) * 60
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def choose_video_segment(videos, length, occupied, usage, rng, *, allow_overlap=True,
                          excluded_ids=(), protected=None, placement='random', min_start_gap=0):
     """Use the least-used eligible source, and prefer unseen time ranges in every round."""
@@ -267,13 +276,23 @@ def annotate_batch(items):
     """Derive display counts from the current plan after every edit or refresh."""
     video_usage = defaultdict(int)
     music_usage = defaultdict(int)
+    folder_usage = defaultdict(int)
+    for item in items:
+        if item.get("music_folder"): folder_usage[item["music_folder"]] += 1
     for item in items:
         for segment in item.get('segments', []):
             video_usage[segment['asset_id']] += 1
         for song in item.get('music', []):
             music_usage[song['id']] += 1
     for item in items:
+        local_usage = defaultdict(int)
+        for song in item.get('music', []): local_usage[song['id']] += 1
+        if item.get('music_folder'):
+            from .foldermusic import describe
+            describe(item)
+            item['music_folder_use_count'] = folder_usage[item['music_folder']]
         for song in item.get('music', []):
+            song['task_use_count'] = local_usage[song['id']]
             song['batch_use_count'] = music_usage[song['id']]
         for segment in item.get('segments', []):
             segment['source_use_count'] = video_usage[segment['asset_id']]
@@ -284,19 +303,37 @@ def annotate_batch(items):
                         float(segment.get('start', 0)) + float(segment.get('duration', 0))) -
                     max(float(candidate.get('start', 0)), float(segment.get('start', 0))) > 1e-6
                     for candidate in other.get('segments', [])))
+    # Merge source-time ranges before measuring coverage. Looping a source must
+    # not multiply the same intersection or produce a percentage above 100%.
+    merged = {}
+    for item in items:
+        ranges = defaultdict(list)
+        for part in item.get('segments', []):
+            ranges[part['asset_id']].append((part.get('start', 0), part.get('start', 0)+part.get('duration', 0)))
+        groups = {}
+        for source_id, intervals in ranges.items():
+            union = []
+            for start, end in sorted(intervals):
+                if union and start <= union[-1][1]:
+                    union[-1] = (union[-1][0], max(end, union[-1][1]))
+                else:
+                    union.append((start, end))
+            groups[source_id] = union
+        merged[id(item)] = groups
+    def covered(item, other):
+        return sum(max(0., min(part.get('start', 0)+part.get('duration', 0), end)-max(part.get('start', 0), start))
+                   for part in item.get('segments', [])
+                   for start, end in merged[id(other)].get(part['asset_id'], []))
     overlaps = []
     overlap_pairs = 0
     for left, right in itertools.combinations(items, 2):
-        shared = 0.0
-        for a in left.get('segments', []):
-            for b in right.get('segments', []):
-                if a['asset_id'] == b['asset_id']:
-                    shared += max(0.0, min(a.get('start', 0) + a.get('duration', 0),
-                                           b.get('start', 0) + b.get('duration', 0))
-                                  - max(a.get('start', 0), b.get('start', 0)))
+        shorter, longer = (left, right) if left['duration'] <= right['duration'] else (right, left)
+        shared = covered(shorter, longer)
+        if abs(left['duration']-right['duration']) < 1e-6:
+            shared = min(shared, covered(longer, shorter))
         overlap_pairs += shared > 1e-6
-        overlaps.append(shared / min(left['duration'], right['duration']))
-    return {'video_usage': dict(video_usage), 'music_usage': dict(music_usage),
+        overlaps.append(min(1., shared / shorter['duration']))
+    return {'video_usage': dict(video_usage), 'music_usage': dict(music_usage), 'music_folder_usage': dict(folder_usage),
             'segment_overlap_pairs': overlap_pairs,
             'max_overlap_ratio': max(overlaps, default=0.0)}
 
@@ -304,6 +341,9 @@ def annotate_batch(items):
 def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict[str, Any], *,
          allow_partial: bool = False, previous_items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Build unique ordered music and video plans; does not render or mutate sources."""
+    if config.get('duration_basis') == 'music':
+        from . import musicled
+        return musicled.plan(videos, music, config, previous_items, allow_partial)
     count = int(config.get("count", 1))
     try:
         source_minutes = float(config.get('min_source_duration_minutes', 0))
@@ -320,10 +360,10 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
         raise ValueError('每批最多 500 条，请分批生成')
     if count < 1:
         raise ValueError("请至少选择一个视频、一首音乐，并将数量设为正数")
-    if config.get('music_mode', 'pool') not in {'fixed', 'pool'}:
-        raise ValueError('音乐模式必须为 fixed 或 pool')
+    if config.get('music_mode', 'pool') not in {'fixed', 'pool', 'folder'}:
+        raise ValueError('音乐模式必须为 fixed、pool 或 folder')
     default_max_songs = len(music) if music else 1
-    if int(config.get('min_songs', 1)) < 1 or int(config.get('max_songs', default_max_songs)) < int(config.get('min_songs', 1)):
+    if config.get('music_mode') != 'folder' and (int(config.get('min_songs', 1)) < 1 or int(config.get('max_songs', default_max_songs)) < int(config.get('min_songs', 1))):
         raise ValueError('每条最少/最多歌曲数设置无效')
     if float(config.get('start_gap', 1)) < 0:
         raise ValueError('起点间隔不能为负数')
@@ -333,12 +373,16 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
     videos = _selected(videos, config.get("video_ids"), "视频")
     selected_video_count = len(videos)
     if source_minutes > 0:
-        videos = [video for video in videos if float(video['duration']) > source_minutes * 60]
+        videos = [video for video in videos if source_meets_minimum(video, source_minutes)]
     filtered_video_count = selected_video_count - len(videos)
-    music = _selected(music, config.get("music_ids"), "音乐")
+    music = _selected(music, None if config.get("music_mode") == "folder" else config.get("music_ids"), "音乐")
+    from . import foldermusic
+    grouped = foldermusic.groups(music, config.get("music_root")) if config.get("music_mode") == "folder" else {}
+    if config.get("music_mode") == "folder" and not grouped:
+        raise ValueError("所选路径下没有包含有效音乐的末级文件夹，请重新扫描音乐库")
     if not videos or not music:
         if not videos and source_minutes > 0:
-            message = f'没有时长大于 {source_minutes:g} 分钟的可用源视频（已排除 {filtered_video_count} 条）；请降低门槛或添加更长的视频'
+            message = f'没有时长达到 {source_minutes:g} 分钟的可用源视频（已排除 {filtered_video_count} 条）；请降低门槛或添加更长的视频'
             if not allow_partial:
                 raise ValueError(message)
             return {'items': [], 'stats': {'count': 0, 'requested_count': count, 'remaining': count,
@@ -380,9 +424,17 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
     for old in previous_items:
         for song in old.get('music', []):
             batch_music_usage[song['id']] += 1
-    if config.get('music_mode', 'pool') == 'pool':
+    local_folders = defaultdict(int)
+    history = config.get('_music_folder_history')
+    folder_usage = defaultdict(int, {path: value['completed'] + value['pending'] for path, value in (history or {}).items()})
+    for old in previous_items:
+        if old.get('music_folder'):
+            local_folders[old['music_folder']] += 1
+            if history is None: folder_usage[old['music_folder']] += 1
+    if config.get('music_mode', 'pool') in {'pool', 'folder'}:
         orders = [None] * count
     for order in orders:
+        folder = foldermusic.choose_folder(grouped, folder_usage, rng, history=history, local_usage=local_folders) if grouped else None
         if order is None:
             lower = float(config.get('min_duration', min(float(song['duration']) for song in music)))
             upper = float(config.get('max_duration', lower))
@@ -391,7 +443,8 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
             last_error = None
             for target in candidates:
                 try:
-                    order, music_total = allocate_music(music, target, config, rng, batch_music_usage)
+                    order, music_total = (foldermusic.allocate(grouped[folder], target, config, rng) if folder
+                                          else allocate_music(music, target, config, rng, batch_music_usage))
                     break
                 except ValueError as exc:
                     last_error = exc
@@ -417,6 +470,11 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
                       "music_total_duration": music_total,
                       "video_assets": [segment_assets[p["asset_id"]] for p in segments],
                       "video_fingerprint": video_fingerprint, "music_fingerprint": _fingerprint(music_key)})
+        if folder:
+            items[-1].update(music_folder=folder, music_folder_song_count=len(grouped[folder]))
+            foldermusic.describe(items[-1])
+            folder_usage[folder] += 1
+            local_folders[folder] += 1
         for song in order:
             batch_music_usage[song['id']] += 1
         for segment in segments:
@@ -436,7 +494,7 @@ def plan(videos: list[dict[str, Any]], music: list[dict[str, Any]], config: dict
             len(statistics['music_usage']) < len(music)):
         warnings.append('本轮剩余未用歌曲无法在最多首数内覆盖目标时长，已使用下一轮歌曲；可增加最多首数或降低成片时长')
     if filtered_video_count:
-        warnings.append(f'源视频须大于 {source_minutes:g} 分钟，已排除 {filtered_video_count} 条不符合时长的视频')
+        warnings.append(f'源视频须至少 {source_minutes:g} 分钟，已排除 {filtered_video_count} 条不符合时长的视频')
     if allow_partial and len(items) < count:
         warnings.append(f"仅生成 {len(items)}/{count} 条；可用音乐顺序或视频方案不足")
     return {"items": items, "stats": {"count": len(items), "requested_count": count, "remaining": count - len(items),

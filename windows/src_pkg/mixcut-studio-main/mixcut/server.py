@@ -31,7 +31,9 @@ from .folders import batch_output_folder, choose_folder, reveal
 from .fsutil import flush_to_disk, publish
 from .keyframes import KeyframeCache
 from .lockfile import LockUnavailable, acquire as acquire_lock, release as release_lock
-from .naming import export_filename, music_folders, music_styles, tag_music_style
+from .naming import duration_filename, item_filename, export_filename, music_folders, music_styles, tag_music_style
+from .trash import move_to_trash
+from .planner import video_plan_key
 from .runtime import API_PROTOCOL, activate_bundled_tools, app_version, data_root, resource_root
 
 # ROOT keeps holding read-only resources so existing callers stay valid; DATA is the
@@ -46,25 +48,50 @@ class Store:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.path = self.directory / 'state.sqlite3'
         self.lock = threading.RLock()
+        self._connections = threading.local()
         with self.connection() as conn:
             conn.execute('CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
+            from . import folderusage
+            folderusage.initialize(conn)
+            for key, body in conn.execute("SELECT id,body FROM records WHERE id LIKE 'batch:%'").fetchall():
+                batch = json.loads(body)
+                folderusage.record_successes(conn, batch, migration=True)
+                conn.execute('UPDATE records SET body=? WHERE id=?', (json.dumps(batch, ensure_ascii=False), key))
 
     @contextmanager
     def connection(self):
-        connection = sqlite3.connect(self.path, timeout=30)
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+        # Nested Store calls must share the outer transaction. A second SQLite
+        # connection cannot read through this thread's own uncommitted write lock.
+        # Only the outer context commits/rolls back and closes the connection.
+        with self.lock:
+            active = getattr(self._connections, 'active', None)
+            if active is not None:
+                yield active
+                return
+            connection = sqlite3.connect(self.path, timeout=30)
+            self._connections.active = connection
+            try:
+                with connection:
+                    yield connection
+            finally:
+                del self._connections.active
+                connection.close()
 
     def get(self, key, default=None):
         with self.lock, self.connection() as conn:
             row = conn.execute('SELECT body FROM records WHERE id=?', (key,)).fetchone()
             return json.loads(row[0]) if row else default
 
+    def folder_usage(self, exclude_task=None):
+        from . import folderusage
+        with self.lock, self.connection() as conn:
+            return folderusage.snapshot(conn, self.batches(), exclude_task)
+
     def put(self, key, value):
         with self.lock, self.connection() as conn:
+            if key.startswith('batch:'):
+                from . import folderusage
+                folderusage.record_successes(conn, value)
             conn.execute('INSERT OR REPLACE INTO records VALUES (?,?)',
                          (key, json.dumps(value, ensure_ascii=False)))
 
@@ -98,6 +125,8 @@ class Application:
         # Preserve the process version even if an installer replaces VERSION on disk.
         self.running_version = app_version()
         self.store = Store(state_dir)
+        self.music_allocation_lock = threading.RLock()
+        self.render_claims = set()
         from .nonstop import MusicEdges
         self.music_edges = MusicEdges(self.store)
         self.closing = threading.Event()
@@ -124,6 +153,8 @@ class Application:
         self.preview_lock = threading.RLock()
         self.preview_worker = None
         self.recover()
+        from .loopmusic import LoopMusic
+        self.loop_music = LoopMusic(self, Store)
         from .scheduler import Scheduler
         self.scheduler = Scheduler(self)
 
@@ -147,7 +178,8 @@ class Application:
                 'sticker_catalog': self.sticker_catalog(),
                 'version': self.running_version,
                 'api_protocol': API_PROTOCOL,
-                'active_work': bool(self.executing_batches) or bool(self.preview_jobs) or any(batch['status'] in {'queued', 'running', 'pausing', 'stopping'}
+                'loop_music_available': True,
+                'active_work': self.loop_music.has_work() or bool(self.executing_batches) or bool(self.preview_jobs) or any(batch['status'] in {'queued', 'running', 'pausing', 'stopping'}
                                    for batch in self.store.batches()),
                 'ffmpeg_available': bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))}
 
@@ -330,6 +362,9 @@ class Application:
                 return
             old_version = preview.get('version')
             if old_version and old_version != version:
+                if (preview.get('status') == 'ready' and old_version in self.keyframes.previous_versions(item['output_path'])
+                        and self.keyframes.ready(old_version, preview.get('total', 0))):
+                    self.keyframes.describe(item['output_path'])  # Reuse ready 30/60s cache before removing it.
                 self.keyframes.remove(old_version)
             self.store.update(batch_id, lambda b: next(i for i in b['items'] if str(i['id']) == str(item_id)).update(
                 thumbnails={'status': 'queued', 'version': version}))
@@ -340,36 +375,66 @@ class Application:
     def start_preview_worker(self):
         if self.preview_worker and self.preview_worker.is_alive():
             return
-        def work():
-            while not self.closing.is_set():
+
+        def finish(key):
+            with self.preview_lock:
+                self.preview_jobs.pop(key, None)
+            self.preview_queue.task_done()
+
+        def run_job(entry):
+            key, path, cancel = entry
+            def update(value):
+                def change(batch):
+                    item = next((i for i in batch['items'] if str(i['id']) == key[1]), None)
+                    if item and not item.get('dismissed') and not cancel.is_set():
+                        item['thumbnails'].update(value)
+                self.store.update(key[0], change)
+            try:
+                if cancel.is_set() or self.closing.is_set():
+                    return
+                update({'status': 'generating'})
+                with self.cached_preview():
+                    data = self.keyframes.prepare(path, lambda: cancel.is_set() or self.closing.is_set())
+                update({'status': 'ready', 'total': data['total'], 'version': data['version'], 'error': None})
+            except InterruptedError:
+                pass
+            except Exception as exc:
                 try:
-                    key, path, cancel = self.preview_queue.get(timeout=.2)
-                except queue.Empty:
-                    continue
-                def update(value):
-                    def change(batch):
-                        item = next((i for i in batch['items'] if str(i['id']) == key[1]), None)
-                        if item and not item.get('dismissed') and not cancel.is_set():
-                            item['thumbnails'].update(value)
-                    self.store.update(key[0], change)
-                try:
-                    if cancel.is_set():
-                        continue
-                    update({'status': 'generating'})
-                    with self.cached_preview():
-                        data = self.keyframes.prepare(path, lambda: cancel.is_set() or self.closing.is_set())
-                    update({'status': 'ready', 'total': data['total'], 'version': data['version'], 'error': None})
-                except InterruptedError:
+                    update({'status': 'failed', 'error': str(exc)})
+                except ValueError:
                     pass
-                except Exception as exc:
-                    try:
-                        update({'status': 'failed', 'error': str(exc)})
-                    except ValueError:
-                        pass
+            finally:
+                finish(key)
+
+        def work():
+            active = set()
+            pending = None
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix='thumbnail-seek') as pool:
+                try:
+                    while not self.closing.is_set():
+                        active = {future for future in active if not future.done()}
+                        if pending is None:
+                            try:
+                                pending = self.preview_queue.get(timeout=.2)
+                            except queue.Empty:
+                                continue
+                        key, _, cancel = pending
+                        batch = self.store.get('batch:' + key[0], {})
+                        if cancel.is_set() or not batch:
+                            finish(key); pending = None
+                            continue
+                        try:
+                            capacity = max(1, min(4, int(batch.get('config', {}).get('parallel_tasks', 1))))
+                        except (ValueError, TypeError):
+                            capacity = 1
+                        if len(active) >= capacity:
+                            wait(active, timeout=.2, return_when=FIRST_COMPLETED)
+                            continue
+                        active.add(pool.submit(run_job, pending))
+                        pending = None
                 finally:
-                    with self.preview_lock:
-                        self.preview_jobs.pop(key, None)
-                    self.preview_queue.task_done()
+                    if pending is not None:
+                        finish(pending[0])
         self.preview_worker = threading.Thread(target=work, daemon=True, name='thumbnail-queue')
         self.preview_worker.start()
 
@@ -498,20 +563,28 @@ class Application:
                         (existing['status'] != 'completed' or Path(existing['items'][0]['output_path']).is_file())):
                     return {'job_id': existing['id'], **self.sticker_variant_status(existing['id'])}
             output_root = Path(source_batch['config']['output_dir'])
-            folder = self.reserve_output_folder(output_root)
+            day = output_root / datetime.now().astimezone().strftime('%Y-%m-%d')
+            folder, _ = self.reserve_review_bundle(day, {}, label=output_root.name)
             batch_id = uuid.uuid4().hex[:12]
             config = copy.deepcopy(source_batch['config'])
             config.update(count=1, sticker_template_id=template.get('id'),
                           sticker_template=template, sticker_layers=layers)
             styles = source_item.get('music_styles') or music_styles(source_item.get('music', []))
-            filename = export_filename(styles, 1) if styles else source.name
-            item = {'id': uuid.uuid4().hex, 'index': 1, 'kind': 'sticker_variant',
+            filename = source.name if source_item.get('output_naming') else (export_filename(styles, 1) if styles else source.name)
+            from .tracklist import for_item
+            item = {'include_track_titles':source_item.get('include_track_titles', False),
+                    'played_music':for_item(source_item),
+                    **({'output_naming':source_item['output_naming']} if source_item.get('output_naming') else {}),
+                    'id': uuid.uuid4().hex, 'index': 1, 'kind': 'sticker_variant',
                     'duration': source_item['duration'], 'segments': [], 'music': [],
                     'music_source_folders': source_item.get('music_source_folders') or
                                             music_folders(source_item.get('music', [])),
                     'source_asset': source_asset, 'status': 'pending', 'progress': 0, 'error': None, 'attempts': 0,
                     'music_styles': styles, 'output_name': filename,
-                    'output_path': str(folder / filename)}
+                    'output_bundle':str(folder), 'output_path': str(folder / filename)}
+            if item.get('output_naming') == 'bundle-library-v1':
+                item['output_name'] = item_filename(item)
+                item['output_path'] = str(folder / item['output_name'])
             origin = {'batch_id': source_batch_id, 'item_id': source_item_id, 'signature': signature,
                       'template_name': template['name'], 'replace_origin_on_approval': True}
             batch = {'id': batch_id, 'status': 'draft', 'created_at': time.time(), 'updated_at': time.time(),
@@ -611,6 +684,69 @@ class Application:
             self.store.put('library', {'video_dir': str(video_dir), 'music_dir': str(music_dir), 'scan': self.filter_rejected_scan(result)})
             return self.filter_rejected_scan(result)
 
+    def clear_scan_errors(self):
+        """Recycle only unchanged video failures from the latest completed inventory."""
+        from . import media
+        if not self.scan_lock.acquire(blocking=False):
+            raise ValueError('素材扫描或清理正在进行，请等待完成')
+        try:
+            library = self.store.get('library', {})
+            if library.get('refresh_required'):
+                raise ValueError('请先完成一次素材扫描，再清除异常文件')
+            scan = library.get('scan', {})
+            root = Path(library.get('video_dir', '')).resolve()
+            music_root = Path(library.get('music_dir', '')).resolve()
+            referenced = set()
+            for batch in self.store.batches():
+                for item in batch.get('items', []):
+                    for part in item.get('segments', []) + item.get('checkpoint_segments', []) + item.get('video_assets', []):
+                        if part.get('path'):
+                            referenced.add(str(Path(part['path']).resolve()))
+            removed, skipped, failed, remaining = [], [], [], []
+            for error in scan.get('errors', []):
+                if not isinstance(error, dict) or error.get('kind') != 'video' or not error.get('snapshot'):
+                    remaining.append(error)
+                    continue
+                path = Path(error['path'])
+                try:
+                    canonical = path.resolve()
+                    if (path.is_symlink() or not canonical.is_relative_to(root)
+                            or canonical.is_relative_to(music_root) or not path.is_file()):
+                        raise ValueError('文件已不存在或不属于可清理的视频目录')
+                    def unchanged():
+                        st = path.stat()
+                        return error['snapshot'] == {'size': st.st_size, 'mtime_ns': st.st_mtime_ns,
+                                                     'dev': st.st_dev, 'ino': st.st_ino}
+                    if not unchanged():
+                        raise ValueError('文件已变化，可能仍在录制，请重新扫描')
+                    if str(canonical) in referenced:
+                        raise ValueError('已有任务引用该视频，请先处理相关任务')
+                    try:
+                        media._asset(path, 'video', quick_music=True)
+                    except ValueError:
+                        pass  # Confirmed invalid metadata/streams, not a disk access failure.
+                    else:
+                        raise RuntimeError('文件现在已可正常识别，请重新扫描')
+                    if not unchanged():
+                        raise ValueError('检查期间文件发生变化，已保留')
+                    move_to_trash(path)
+                    removed.append(str(path))
+                    logging.info('scan-error recycled: %s', path)
+                except (ValueError, RuntimeError) as exc:
+                    skipped.append({'path': str(path), 'reason': str(exc)})
+                    remaining.append(error)
+                except Exception as exc:
+                    failed.append({'path': str(path), 'reason': str(exc)})
+                    remaining.append(error)
+            scan = dict(scan, errors=remaining)
+            self.store.put('library', dict(library, scan=scan))
+            with self.scan_state_lock:
+                if self.scan_job and self.scan_job.get('status') == 'completed':
+                    self.scan_job['scan'] = copy.deepcopy(scan)
+            return {'scan': scan, 'removed': removed, 'skipped': skipped, 'failed': failed}
+        finally:
+            self.scan_lock.release()
+
     def scan_status(self, compact=False):
         with self.scan_state_lock:
             if compact and self.scan_job and self.scan_job['status'] in {'discovering', 'analyzing'}:
@@ -635,6 +771,11 @@ class Application:
                 raise ValueError('另一个素材路径也已更改，请同时刷新两个素材库')
         if not self.scan_lock.acquire(blocking=False):
             raise ValueError('已有素材扫描正在进行，请等待完成')
+        try:
+            self.store.put('library', dict(old, refresh_required=True))
+        except Exception:
+            self.scan_lock.release()
+            raise
         job = {'id': uuid.uuid4().hex[:12], 'status': 'discovering', 'kind': kind,
                'video_dir': str(video_dir), 'music_dir': str(music_dir),
                'totals': {}, 'processed': {'video': 0, 'music': 0},
@@ -689,14 +830,22 @@ class Application:
         return self.scan_status()
 
     def create_plan(self, body):
+        with self.music_allocation_lock:
+            return self._create_plan(body)
+
+    def _create_plan(self, body):
         from . import media, planner
         with self.scan_state_lock:
             if self.scan_job and self.scan_job['status'] in {'discovering', 'analyzing'}:
                 raise ValueError('素材库仍在扫描，请等待完成后再生成方案')
         config = dict(body.get('config', {}))
+        if config.get('duration_basis', 'video') not in {'video', 'music'}:
+            raise ValueError('时长依据无效')
         template, layers = self.resolve_sticker_template(config.get('sticker_template_id'))
         config['sticker_template'] = template
         config['sticker_layers'] = layers
+        from .musicrounds import validate as validate_repeats
+        config['music_repeats'] = validate_repeats(config.get('music_repeats', 1))
         config.setdefault('count', 50)
         count = int(config['count'])
         if not 1 <= count <= 500:
@@ -706,7 +855,8 @@ class Application:
         if isinstance(concurrency, bool) or str(concurrency) not in {'1', '2', '3', '4'}:
             raise ValueError('并行剪辑数量须为 1、2、3 或 4')
         config['parallel_tasks'] = int(concurrency)
-        config['nonstop_music'] = str(config.get('nonstop_music', 'true')).lower() not in {'false', '0'}
+        config['nonstop_music'] = str(config.get('nonstop_music', 'false' if config.get('duration_basis') == 'music' else 'true')).lower() not in {'false', '0'}
+        config['include_track_titles'] = str(config.get('include_track_titles', 'false')).lower() == 'true'
         for field, default in [('width', 1280), ('height', 720), ('fps', 30)]:
             config[field] = int(config.get(field, default))
         if (config['width'], config['height']) not in [(1280, 720), (1920, 1080), (640, 360)]:
@@ -726,6 +876,8 @@ class Application:
             if not 0 <= config[field] <= 2:
                 raise ValueError('音量须在 0～2 之间')
         library_record = self.store.get('library', {})
+        if library_record.get('refresh_required'):
+            raise ValueError('素材库刷新尚未成功，请重新扫描素材后再生成方案')
         library = self.filter_rejected_scan(library_record.get('scan', {}))
         if not library.get('videos') or not library.get('music'):
             raise ValueError('请先扫描视频和音乐素材')
@@ -735,7 +887,9 @@ class Application:
             raise ValueError('导出路径必须是文件夹')
         config['output_dir'] = str(output)
         config['source_video_dir'] = self.store.get('library', {}).get('video_dir')
+        config['music_root'] = library_record.get('music_dir')
         config.setdefault('seed', random.SystemRandom().randrange(2**63))
+        config['_music_folder_history'] = self.store.folder_usage() if config.get('music_mode') == 'folder' else {}
         result = planner.plan(library['videos'], library['music'], config)
         if len(result['items']) != count:
             raise ValueError(f"只找到 {len(result['items'])}/{count} 条方案，请调整设置")
@@ -747,6 +901,7 @@ class Application:
     def make_batch(self, config, result, assets, *, music_root=None, scheduled_run_id=None,
                    schedule_name=None, index_offset=0):
         config = copy.deepcopy(config)
+        history = config.pop('_music_folder_history', {})
         result = copy.deepcopy(result)
         output = Path(config['output_dir']).expanduser().resolve()
         batch_id = uuid.uuid4().hex[:12]
@@ -765,21 +920,34 @@ class Application:
             '实际大小随编码变化；另需 TS 缓存和临时文件空间。')
         if estimated_bytes > free_bytes:
             result['warnings'].append('估计输出超过磁盘可用空间，请更换输出磁盘或减少数量。')
+        if config.get('music_mode') == 'folder':
+            from . import foldermusic
+            config['music_root'] = music_root or config.get('music_root')
+            folder_catalog = foldermusic.catalog(foldermusic.groups([a for a in assets if str(a.get('mime_type', '')).startswith('audio/')], config['music_root']))
+        else:
+            folder_catalog = []
         items = result['items']
-        output_folder = self.reserve_output_folder(output)
+        output_folder = output / datetime.now().astimezone().strftime('%Y-%m-%d')
+        output_folder.mkdir(parents=True, exist_ok=True)
         for index, item in enumerate(items, 1):
             item['id'] = str(item.get('id') or index)
             item['index'] = index + index_offset
             item.update(status='pending', progress=0, error=None, attempts=0)
+            item.setdefault('include_track_titles', bool(config.get('include_track_titles', False)))
+            item['output_naming'] = 'bundle-library-v1'
             item['music'] = [tag_music_style(song, music_root) for song in item.get('music', [])]
             item['music_source_folders'] = music_folders(item['music'])
             item['music_styles'] = music_styles(item['music'], music_root)
-            item['output_name'] = export_filename(item['music_styles'], item['index'])
-            item['output_path'] = str(output_folder / item['output_name'])
+            folder, _ = self.reserve_review_bundle(output_folder, item, label=output.name)
+            item['output_bundle'] = str(folder)
+            item['output_name'] = item_filename(item)
+            item['output_path'] = str(folder / item['output_name'])
+        for folder in folder_catalog:
+            folder['historical_usage'] = history.get(folder['path'], {'completed': 0, 'pending': 0, 'last_used': 0})
         batch = {'id': batch_id, 'status': 'draft', 'created_at': time.time(),
                  'updated_at': time.time(), 'config': config, 'items': items,
                  'stats': result.get('stats', {}), 'warnings': result.get('warnings', []),
-                 'assets': assets,
+                 'assets': assets, 'music_folder_catalog': folder_catalog,
                  'output_folder': str(output_folder), 'folder_name': output_folder.name}
         if scheduled_run_id:
             batch.update(scheduled_run_id=scheduled_run_id, schedule_name=schedule_name)
@@ -819,14 +987,26 @@ class Application:
         batch['warnings'] = warnings
 
     def _set_item_music(self, batch, item, order):
-        root = self.store.get('library', {}).get('music_dir')
-        item['music'] = [tag_music_style(song, root) for song in order]
-        item['music_total_duration'] = sum(float(song['duration']) for song in order)
-        item['music_fingerprint'] = self._fingerprint(tuple(song['id'] for song in order))
+        root = batch['config'].get('music_root') or self.store.get('library', {}).get('music_dir')
+        order = [tag_music_style(song, root) for song in order]
+        if batch['config'].get('duration_basis') == 'music' and 'music_base' in item:
+            from .musicrounds import apply as repeat_playlist
+            repeat_playlist(item, order, item.get('music_repeats', 1))
+        else:
+            item['music'] = order
+        item['music_total_duration'] = sum(float(song['duration']) for song in item['music'])
+        if batch['config'].get('duration_basis') == 'music':
+            from .musicrounds import retime
+            item['duration'] = item['music_total_duration']
+            item['segments'] = retime(item, item['duration'], batch['config'])
+            item['video_fingerprint'] = self._fingerprint(video_plan_key(item['segments'], batch['config'].get('fps', 30)))
+            item.pop('nonstop', None)
+            item.pop('planned_duration', None)
+        item['music_fingerprint'] = self._fingerprint(tuple(song['id'] for song in item['music']))
         item['music_source_folders'] = music_folders(item['music'])
         item['music_styles'] = music_styles(item['music'], root)
-        item['output_name'] = export_filename(item['music_styles'], item['index'])
-        item['output_path'] = str(Path(batch['output_folder']) / item['output_name'])
+        item['output_name'] = item_filename(item)
+        item['output_path'] = str(Path(item.get('output_bundle') or batch['output_folder']) / item['output_name'])
         self._update_plan_counts(batch)
 
     def reorder_music(self, batch_id, item_id, music_ids):
@@ -842,19 +1022,23 @@ class Application:
             item = next((entry for entry in batch['items'] if str(entry['id']) == str(item_id)), None)
             if item is None:
                 raise ValueError('方案条目不存在')
-            current_ids = [song['id'] for song in item.get('music', [])]
+            current_ids = [song['id'] for song in item.get('music_base', item.get('music', []))]
             if len(music_ids) != len(current_ids) or sorted(music_ids) != sorted(current_ids):
                 raise ValueError('只能调整当前方案已有歌曲的顺序')
             candidate = fingerprint(music_ids)
             for other in batch['items']:
-                if other is item:
+                if other is item or batch['config'].get('music_mode') == 'folder':
                     continue
                 other_ids = [song['id'] for song in other.get('music', [])]
                 if fingerprint(other_ids) == candidate:
                     raise ValueError('该歌曲顺序与本批另一条方案重复，请换一个顺序')
-            by_id = {song['id']: song for song in item['music']}
-            item['music'] = [by_id[value] for value in music_ids]
-            item['music_fingerprint'] = candidate
+            by_id = {song['id']: song for song in item.get('music_base', item['music'])}
+            order = [by_id[value] for value in music_ids]
+            if 'music_base' in item:
+                self._set_item_music(batch, item, order)
+            else:
+                item['music'] = order
+                item['music_fingerprint'] = candidate
             item['manual_music_order'] = True
             self._update_plan_counts(batch)
 
@@ -862,6 +1046,16 @@ class Application:
 
     def _choose_item_music(self, batch, item, target, *, avoid_current=False, excluded_ids=()):
         from . import planner
+        if batch['config'].get('music_mode') == 'folder':
+            excluded_ids = set(excluded_ids) | set(batch.get('failed_music_ids', []))
+            from . import foldermusic
+            grouped = foldermusic.groups([a for a in batch.get('assets', []) if str(a.get('mime_type', '')).startswith('audio/') and a['id'] not in excluded_ids], batch['config'].get('music_root'))
+            songs = grouped.get(item.get('music_folder'), [])
+            if not songs:
+                raise ValueError('当前音乐文件夹没有可用歌曲，请更换文件夹')
+            order, _ = foldermusic.allocate(songs, target, batch['config'], random.Random(time.time_ns()))
+            item['music_folder_song_count'] = len(songs)
+            return order
         selected = set(batch.get('config', {}).get('music_ids') or
                        [song['id'] for song in self.store.get('library', {}).get('scan', {}).get('music', [])] or
                        [song['id'] for entry in batch['items'] for song in entry.get('music', [])])
@@ -872,6 +1066,9 @@ class Application:
             if other is not item:
                 for song in other.get('music', []):
                     usage[song['id']] += 1
+        if batch['config'].get('duration_basis') == 'music':
+            from .musicled import choose_music
+            return choose_music(music, batch['config'], random.Random(time.time_ns()), usage)
         old_ids = tuple(song['id'] for song in item.get('music', []))
         used_orders = {tuple(song['id'] for song in other['music']) for other in batch['items'] if other is not item}
         for attempt in range(24):
@@ -906,12 +1103,44 @@ class Application:
         def change(batch):
             if batch['status'] != 'draft':
                 raise ValueError('只有草稿方案可以刷新音乐')
-            if batch['config'].get('music_mode', 'pool') != 'pool':
+            if batch['config'].get('music_mode', 'pool') not in {'pool', 'folder'}:
                 raise ValueError('固定歌曲集合模式不能随机刷新；请选择候选池组合')
             item = next((entry for entry in batch['items'] if str(entry['id']) == str(item_id)), None)
             if item is None:
                 raise ValueError('方案条目不存在')
             order = self._choose_item_music(batch, item, float(item['duration']), avoid_current=True)
+            self._set_item_music(batch, item, order)
+        return self.store.update(batch_id, change)
+
+    def change_music_folder(self, batch_id, item_id, body):
+        with self.music_allocation_lock:
+            return self._change_music_folder(batch_id, item_id, body)
+
+    def _change_music_folder(self, batch_id, item_id, body):
+        from . import foldermusic
+        history = self.store.folder_usage((batch_id, str(item_id)))
+        def change(batch):
+            if batch['status'] != 'draft' or batch['config'].get('music_mode') != 'folder':
+                raise ValueError('只有单文件夹模式的草稿方案可以更换音乐文件夹')
+            item = next((i for i in batch['items'] if str(i['id']) == str(item_id)), None)
+            if item is None: raise ValueError('方案条目不存在')
+            blocked = set(batch.get('failed_music_ids', []))
+            grouped = foldermusic.groups([a for a in batch['assets'] if str(a.get('mime_type', '')).startswith('audio/') and a['id'] not in blocked], batch['config'].get('music_root'))
+            usage = defaultdict(int, {path: value['completed'] + value['pending'] for path, value in history.items()})
+            local_folders = defaultdict(int)
+            for other in batch['items']:
+                if other is not item and not other.get('dismissed') and other.get('music_folder'):
+                    local_folders[other['music_folder']] += 1
+            rng = random.Random(time.time_ns())
+            folder = body.get('folder')
+            if body.get('random') is True:
+                folder = foldermusic.choose_folder(grouped, usage, rng, item.get('music_folder'), history=history, local_usage=local_folders)
+            if not isinstance(folder, str) or folder not in grouped: raise ValueError('所选文件夹不在当前方案的音乐库中或没有可用歌曲')
+            order, _ = foldermusic.allocate(grouped[folder], item['duration'], batch['config'], rng)
+            for entry in batch.get('music_folder_catalog', []):
+                entry['historical_usage'] = history.get(entry['path'], {'completed': 0, 'pending': 0, 'last_used': 0})
+            item.update(music_folder=folder, music_folder_song_count=len(grouped[folder]))
+            item.pop('manual_music_order', None)
             self._set_item_music(batch, item, order)
         return self.store.update(batch_id, change)
 
@@ -932,15 +1161,40 @@ class Application:
             if item is None:
                 raise ValueError('方案条目不存在')
             field = 'music' if kind == 'music' else 'segments'
-            if index < 0 or index >= len(item.get(field, [])):
+            entries = item.get('music_base', item.get('music', [])) if kind == 'music' else item.get(field, [])
+            if index < 0 or index >= len(entries):
                 raise ValueError('替换位置超出范围')
             config = batch['config']
             rng = random.Random(time.time_ns())
             if kind == 'music':
-                if config.get('music_mode', 'pool') != 'pool':
+                if config.get('music_mode', 'pool') not in {'pool', 'folder'}:
                     raise ValueError('固定歌曲集合模式不能替换单曲')
+                if config.get('music_mode') == 'folder':
+                    from . import foldermusic
+                    blocked = set(batch.get('failed_music_ids', []))
+                    grouped = foldermusic.groups([a for a in batch['assets'] if str(a.get('mime_type', '')).startswith('audio/') and a['id'] not in blocked], config.get('music_root'))
+                    if index < 2 and len(foldermusic.opening_tracks(grouped.get(item['music_folder'], []))) == 2:
+                        raise ValueError('前两首自动固定为01、02；需要手动调整请拖动歌曲或使用上下箭头')
+                    if config.get('duration_basis') == 'music':
+                        positions = [n for n in range(2, len(item.get('music_base', item['music']))) if n != index]
+                        if not positions:
+                            raise ValueError('没有其他可随机换位的歌曲')
+                        other = rng.choice(positions)
+                        order = list(item.get('music_base', item['music']))
+                        order[index], order[other] = order[other], order[index]
+                        self._set_item_music(batch, item, order)
+                        return
+                    candidates = [song for song in grouped.get(item['music_folder'], []) if song['id'] != item['music'][index]['id']]
+                    if not candidates:
+                        raise ValueError('该文件夹没有其他可替换歌曲')
+                    order = list(item['music'])
+                    order[index] = rng.choice(candidates)
+                    if sum(float(song['duration']) for song in order) < float(item['duration']):
+                        order = self._choose_item_music(batch, item, float(item['duration']), excluded_ids=blocked)
+                    self._set_item_music(batch, item, order)
+                    return
                 selected = set(config.get('music_ids') or [])
-                current = item['music']
+                current = item.get('music_base', item['music'])
                 ids = {song['id'] for song in current}
                 usage = defaultdict(int)
                 for other in batch['items']:
@@ -949,8 +1203,8 @@ class Application:
                             usage[song['id']] += 1
                 remaining_duration = sum(float(song['duration']) for n, song in enumerate(current) if n != index)
                 candidates = [song for song in batch['assets'] if song['id'] in selected and song['id'] not in ids
-                              and remaining_duration + float(song['duration']) + 1e-7 >= float(item['duration']) +
-                              min(float(config.get('music_margin_seconds', 0)), float(item['duration']) * 0.005)]
+                              and (config.get('duration_basis') == 'music' or remaining_duration + float(song['duration']) + 1e-7 >= float(item['duration']) +
+                              min(float(config.get('music_margin_seconds', 0)), float(item['duration']) * 0.005))]
                 if not candidates:
                     raise ValueError('没有满足时长和任务内去重要求的替换歌曲')
                 least = min(usage[song['id']] for song in candidates)
@@ -961,15 +1215,39 @@ class Application:
                 return
 
             selected = set(config.get('video_ids') or [])
-            threshold = float(config.get('min_source_duration_minutes', 0)) * 60
+            threshold = float(config.get('min_source_duration_minutes', 0))
             current = item['segments'][index]
-            videos = [asset for asset in batch['assets'] if asset['id'] in selected
-                      and float(asset['duration']) > threshold and asset['id'] != current['asset_id']]
+            videos = [asset for asset in batch['assets'] if (asset['id'] in selected or (not selected and str(asset.get('mime_type', '')).startswith('video/')))
+                      and planner.source_meets_minimum(asset, threshold) and asset['id'] != current['asset_id']]
             videos = self.allowed_videos(videos)
             if config.get('mode') == 'multi' and config.get('within_group'):
                 other = next((part for n, part in enumerate(item['segments']) if n != index), None)
                 group = config.get('groups', {}).get(other['asset_id']) if other else None
                 videos = [video for video in videos if group and config.get('groups', {}).get(video['id']) == group]
+            if config.get('duration_basis') == 'music':
+                from .musicled import fit_segments, video_segments
+                if not videos: raise ValueError('没有其他可替换视频')
+                if config.get('mode', 'single') == 'single':
+                    usage, occupied = defaultdict(int), defaultdict(list)
+                    for other_item in batch['items']:
+                        if other_item is item or other_item.get('dismissed'):
+                            continue
+                        for source_id in {s['asset_id'] for s in other_item.get('segments', [])}:
+                            usage[source_id] += 1
+                        for part in other_item.get('segments', []):
+                            occupied[part['asset_id']].append((part['start'], part['start']+part['duration']))
+                    updated = video_segments(videos, item['duration'], config, rng, usage, occupied)
+                else:
+                    source = rng.choice(videos)
+                    replacement = {'asset_id':source['id'],'path':source['path'],'start':0.,
+                                   'duration':min(float(source['duration']),float(current['duration']))}
+                    updated = list(item['segments'])
+                    updated[index:index+1] = fit_segments([replacement], float(current['duration']))
+                item['segments'] = updated
+                item['video_assets'] = [a for a in batch['assets'] if any(s['asset_id']==a['id'] for s in updated)]
+                item['video_fingerprint'] = self._fingerprint(planner.video_plan_key(updated,config.get('fps',30)))
+                self._update_plan_counts(batch)
+                return
             occupied = defaultdict(list)
             protected = defaultdict(list)
             usage = defaultdict(int)
@@ -1028,7 +1306,7 @@ class Application:
                     continue
                 order = None
                 if abs(target - float(item['duration'])) > 1e-5:
-                    if config.get('music_mode', 'pool') == 'pool':
+                    if config.get('music_mode', 'pool') in {'pool', 'folder'}:
                         try:
                             order = self._choose_item_music(batch, item, target)
                         except ValueError as exc:
@@ -1054,6 +1332,27 @@ class Application:
             self._cleanup_approved_sources()
             result = self.batch(batch_id)
         return result
+
+    def set_music_repeats(self, batch_id, item_id, body):
+        from .musicrounds import validate, apply as repeat_playlist
+        repeats = validate(body.get('music_repeats'))
+        def change(batch):
+            item = next((i for i in batch['items'] if str(i['id']) == str(item_id)), None)
+            if item is None:
+                raise ValueError('任务不存在')
+            if (batch['config'].get('duration_basis') != 'music' or batch.get('sticker_origin')
+                    or item.get('kind') == 'sticker_variant'):
+                raise ValueError('仅普通音乐时长混剪任务支持播放轮数')
+            if (item.get('status') != 'pending' or item.get('dismissed') or item.get('attempts', 0)
+                    or item.get('progress', 0) or item.get('result')
+                    or (batch_id, str(item_id)) in self.render_claims
+                    or (item.get('output_path') and Path(item['output_path']).exists())):
+                raise ValueError('仅尚未开始制作的任务可修改轮数；制作中的任务请先停止并重新规划')
+            base = item.get('music_base', item['music'])
+            repeat_playlist(item, base, repeats)
+            self._set_item_music(batch, item, base)
+        with self.music_allocation_lock:
+            return self.store.update(batch_id, change)
 
     def item_action(self, batch_id, item_id, action):
         if action == 'delete':
@@ -1081,11 +1380,35 @@ class Application:
         self.wake.set()
         return result
 
-    @staticmethod
-    def _visible_batch(batch):
+    def approved_record_ready(self, batch, item):
+        """Retire only retained approved works whose cleanup is actually finished."""
+        if item.get('review', {}).get('status') != 'approved' or not item.get('review', {}).get('retained'):
+            return False
+        cleanup = item.get('cleanup', {})
+        if not cleanup.get('output_retained') or not cleanup.get('temporary_segments_deleted') or cleanup.get('output_error'):
+            return False
+        if item.get('segments') and not cleanup.get('original_recordings_deleted'):
+            return False
+        if batch.get('sticker_origin') and not cleanup.get('origin_output_deleted') and not cleanup.get('origin_status'):
+            return False
+        key = (batch['id'], str(item['id']))
+        # Membership reads are atomic; approved tasks cannot acquire a new render slot.
+        # Do not acquire cache/preview locks here: callers may hold the store lock.
+        if key in self.cache_users or (self.store.directory/'work'/batch['id']/str(item['id'])).exists():
+            return False
+        ids = {seg.get('asset_id') for seg in item.get('segments', [])}
+        if ids & set(self.store.get('cache-cleanup-pending', [])) or key in self.preview_jobs:
+            return False
+        version = item.get('thumbnails', {}).get('version')
+        if version and (self.keyframes.root/version).exists():
+            return False
+        return True
+
+    def _visible_batch(self, batch):
         if batch is None:
             return None
         items = [item for item in batch.get('items', []) if not item.get('dismissed')
+                 and not self.approved_record_ready(batch, item)
                  and not (item.get('review', {}).get('status') in {'approved', 'superseded'}
                           and item.get('cleanup', {}).get('output_deleted'))]
         return {**batch, 'items': items} if items else None
@@ -1094,7 +1417,7 @@ class Application:
         return [visible for batch in self.store.batches()
                 if (visible := self._visible_batch(batch)) is not None]
 
-    def forget_items(self, selections, *, clear_history=False):
+    def _forget_records(self, selections, *, clear_history=False, preserve_files=False):
         """Forget task rows promptly; ongoing work is cancelled without touching media files."""
         if not isinstance(selections, list):
             raise ValueError('请选择要删除的任务')
@@ -1105,6 +1428,7 @@ class Application:
             changed = {}
             removed = 0
             preview_cleanup = []
+            preserved_sources = set()
             with self.store.lock, self.store.connection() as conn:
                 for entry in selections:
                     if not isinstance(entry, dict) or not isinstance(entry.get('item_ids'), list):
@@ -1126,6 +1450,15 @@ class Application:
                             retained.append(item)
                             continue
                         preview_cleanup.append((dict(batch), dict(item)))
+                        if preserve_files and item.get('output_bundle') and item.get('review', {}).get('status') != 'approved':
+                            receipt = {'batch': {'id':batch_id, 'config':batch['config']},
+                                       'item': {key:item[key] for key in ('id','output_bundle','output_path','thumbnails','result') if key in item}}
+                            conn.execute('INSERT OR REPLACE INTO records VALUES (?,?)',
+                                         ('forgotten-output:' + batch_id + ':' + str(item['id']), json.dumps(receipt,ensure_ascii=False)))
+                        if preserve_files:
+                            preserved_sources.update(str(Path(part['path']).resolve()) for part in
+                                item.get('segments', []) + item.get('checkpoint_segments', [])
+                                if part.get('path'))
                         if not item.get('dismissed'):
                             removed += 1
                         if active:
@@ -1141,24 +1474,86 @@ class Application:
                         batch['updated_at'] = time.time()
                         conn.execute('UPDATE records SET body=? WHERE id=?',
                                      (json.dumps(batch, ensure_ascii=False), 'batch:' + batch_id))
-                        changed[batch_id] = self._visible_batch(batch)
+                        changed[batch_id] = batch
                     else:
                         conn.execute('DELETE FROM records WHERE id=?', ('batch:' + batch_id,))
                         changed[batch_id] = None
+                if preserved_sources:
+                    row = conn.execute('SELECT body FROM records WHERE id=?', ('preserved-task-sources',)).fetchone()
+                    preserved_sources.update(json.loads(row[0]) if row else [])
+                    conn.execute('INSERT OR REPLACE INTO records VALUES (?,?)',
+                                 ('preserved-task-sources', json.dumps(sorted(preserved_sources))))
                 if clear_history:
                     conn.execute("DELETE FROM records WHERE id LIKE 'deletion:%'")
         finally:
             if review_available:
                 self.review_lock.release()
+        # Rendering the response may inspect cache files and query the Store.
+        # Do it after commit, never while holding the write transaction.
+        changed = {key: self._visible_batch(batch) for key, batch in changed.items()}
         cleanup_errors = []
-        for batch, item in preview_cleanup:
+        if preserve_files:
+            with self.preview_lock:
+                for batch, item in preview_cleanup:
+                    cancel = self.preview_jobs.get((batch['id'], str(item['id'])))
+                    if cancel:
+                        cancel.set()
+        for batch, item in ([] if preserve_files else preview_cleanup):
             try:
                 self.delete_previews(batch, item)
                 self.remove_task_work(batch['id'], item['id'])
             except OSError as exc:
                 cleanup_errors.append(str(exc))
+        if preserve_files:
+            cleanup_errors.extend(self.cleanup_forgotten_outputs())
         self.wake.set()
         return {'ok': True, 'deleted_items': removed, 'updated_batches': changed, 'preview_cleanup_errors': cleanup_errors}
+
+    def cleanup_forgotten_outputs(self):
+        """Recycle dedicated task bundles after writers stop; retain durable retry receipts."""
+        errors = []
+        if not self.review_lock.acquire(blocking=False):
+            return errors
+        try:
+            for record in self.store.records('forgotten-output:'):
+                batch, item = record['batch'], record['item']
+                key = (batch['id'], str(item['id']))
+                live_batch = self.store.get('batch:' + batch['id'], {})
+                live = next((i for i in live_batch.get('items', []) if str(i['id']) == key[1]), {})
+                if live.get('review', {}).get('status') == 'approved':
+                    self.store.delete('forgotten-output:' + batch['id'] + ':' + str(item['id']))
+                    continue
+                with self.cache_lock:
+                    writing = key in self.cache_users
+                with self.preview_lock:
+                    previewing = key in self.preview_jobs
+                if writing or previewing or live.get('status') in {'running', 'validating'}:
+                    continue
+                try:
+                    folder = Path(item['output_bundle'])
+                    shared = any(str(other.get('output_bundle','')) == str(folder) and
+                                 (other_batch['id'],str(other['id'])) != key and not other.get('dismissed')
+                                 for other_batch in self.store.batches() for other in other_batch.get('items',[]))
+                    if shared:
+                        self.store.delete('forgotten-output:' + batch['id'] + ':' + str(item['id']))
+                        continue
+                    if folder.exists():
+                        root = Path(batch['config']['output_dir']).resolve()
+                        if folder.is_symlink() or folder.resolve() == root or not folder.resolve().is_relative_to(root) or Path(item['output_path']).parent != folder:
+                            raise ValueError('任务目录与成品路径不一致，目录已保留')
+                        # Empty reservations need no trash operation and immediately release their number.
+                        try:
+                            folder.rmdir()
+                        except OSError:
+                            self.trash_task_output(batch, item)
+                    self.delete_previews(batch, item)
+                    self.remove_task_work(batch['id'], item['id'])
+                    self.store.delete('forgotten-output:' + batch['id'] + ':' + str(item['id']))
+                except (OSError, ValueError) as exc:
+                    errors.append(str(exc))
+        finally:
+            self.review_lock.release()
+        return errors
 
     def forget_all_items(self):
         selections = [{'batch_id': batch['id'], 'item_ids': [item['id'] for item in batch['items']]}
@@ -1167,6 +1562,7 @@ class Application:
 
     def prune_forgotten_items(self):
         """Drop hidden rows after their worker/reviewer has stopped using their indexes."""
+        self.cleanup_forgotten_outputs()
         if not self.review_lock.acquire(blocking=False):
             return
         try:
@@ -1177,16 +1573,20 @@ class Application:
                 dependents = {(origin.get('batch_id'), origin.get('item_id')) for batch in batches
                               if (origin := batch.get('sticker_origin')) and batch.get('items')}
                 for batch in batches:
+                    run_id = batch.get('scheduled_run_id')
+                    if run_id and self.store.get('scheduled-run:' + run_id, {}).get('status') in {'waiting', 'running'}:
+                        continue  # The scheduler still counts successful rows to avoid overproduction.
                     if batch['status'] in {'running', 'queued', 'pausing', 'stopping'} or batch['id'] in self.executing_batches or batch['id'] in reviewing:
                         continue
                     retained = []
                     for item in batch['items']:
                         cleanup = item.get('cleanup', {})
                         archived = item.get('review', {}).get('status') in {'approved', 'superseded'}
-                        settled = (archived and cleanup.get('output_deleted')
+                        settled = (archived and not item.get('review',{}).get('retained') and cleanup.get('output_deleted')
                                    and (not item.get('segments') or cleanup.get('original_recordings_deleted'))
                                    and (not batch.get('sticker_origin') or cleanup.get('origin_output_deleted'))
                                    and (batch['id'], item['id']) not in dependents)
+                        settled = settled or (self.approved_record_ready(batch, item) and (batch['id'], item['id']) not in dependents)
                         if not item.get('dismissed') and not settled:
                             retained.append(item)
                     if len(retained) == len(batch['items']):
@@ -1200,6 +1600,7 @@ class Application:
                         conn.execute('DELETE FROM records WHERE id=?', ('batch:' + batch['id'],))
         finally:
             self.review_lock.release()
+        self.cleanup_forgotten_outputs()
 
     def delete_items(self, selections, confirmation, expected_count=None):
         """Remove selected task records, retaining a durable snapshot of cleanup state."""
@@ -1361,26 +1762,32 @@ class Application:
             raise OSError('可用磁盘空间少于 512 MB，请清理空间后继续')
 
     @staticmethod
-    def reserve_review_bundle(root, item):
-        day = datetime.now().astimezone().strftime('%Y-%m-%d')
-        parent = Path(root) / day
+    def reserve_review_bundle(root, item, label=None):
+        from .naming import review_folder_name
+        parent = Path(root)
         parent.mkdir(parents=True, exist_ok=True)
+        # The reservation date is fixed across retries, including a midnight boundary.
+        day = datetime.now().astimezone().strftime('%y%m%d')
+        highest = max((int(match.group(1)) for entry in parent.iterdir()
+                       if entry.is_dir() and (match := re.fullmatch(re.escape(day) + r'-(\d{3,})', entry.name))), default=0)
         styles = item.get('music_styles') or music_styles(item.get('music', []))
-        for number in range(1, 10000):
-            name = Path(export_filename(styles, number)).stem
-            folder = parent / name
+        number = highest + 1
+        while True:
+            folder = parent / review_folder_name(day, number)
             try:
                 folder.mkdir()
-                return folder, name
+                return folder, Path(export_filename(styles, number)).stem
             except FileExistsError:
-                continue
-        raise OSError('当天审核文件夹编号已用尽')
+                number += 1
 
     def recover(self):
         for batch in self.store.batches():
             changed = False
             review_changed = False
             for item in batch['items']:
+                if item.get('bundle_relocation'):
+                    from .bundles import finish_relocation
+                    finish_relocation(item, lambda value: self.store.put('batch:' + batch['id'], batch))
                 if item.get('review', {}).get('status') == 'rejecting':
                     item['review'].update(status='reject_failed', error='上次清理中断，请点击重试不通过清理')
                     review_changed = True
@@ -1438,7 +1845,7 @@ class Application:
             for item in batch['items']:
                 if item.get('review', {}).get('status') != 'approved':
                     continue
-                if not item.get('cleanup', {}).get('output_deleted'):
+                if not item.get('cleanup', {}).get('output_deleted') and not item.get('cleanup', {}).get('output_retained'):
                     self._cleanup_approved_output(batch['id'], item['id'])
                 if (batch.get('sticker_origin', {}).get('replace_origin_on_approval')
                         and not item.get('cleanup', {}).get('origin_output_deleted')):
@@ -1449,7 +1856,7 @@ class Application:
         for batch in self.store.batches():
             for item in batch['items']:
                 if item.get('review', {}).get('status') == 'approved':
-                    if not item.get('cleanup', {}).get('output_deleted'):
+                    if not item.get('cleanup', {}).get('output_deleted') and not item.get('cleanup', {}).get('output_retained'):
                         self._cleanup_approved_output(batch['id'], item['id'])
                     if (batch.get('sticker_origin', {}).get('replace_origin_on_approval')
                             and not item.get('cleanup', {}).get('origin_output_deleted')):
@@ -1501,6 +1908,11 @@ class Application:
                 last_prune = time.monotonic()
             candidates = [b for b in self.store.batches() if b['status'] == 'queued']
             if not candidates:
+                try:
+                    if self.loop_music.run_next():
+                        continue
+                except Exception:
+                    logging.exception('music-loop dispatcher failed; original queue remains available')
                 self.wake.wait(1)
                 self.wake.clear()
                 continue
@@ -1572,6 +1984,57 @@ class Application:
         self.write_manifest(batch_id)
 
     def execute_item(self, batch_id, index):
+        with self.store.lock:
+            batch = self.batch(batch_id)
+            key = (batch_id, str(batch['items'][index]['id']))
+            if key in self.render_claims:
+                return
+            self.render_claims.add(key)
+        try:
+            return self._execute_item(batch_id, index)
+        finally:
+            with self.store.lock:
+                self.render_claims.discard(key)
+
+    def finalize_output_name(self, batch_id, index, duration=None):
+        item = self.batch(batch_id)['items'][index]
+        if item.get('output_naming') not in {'duration-youtube-v1', 'bundle-library-v1'}:
+            return Path(item['output_path'])
+        intent = item.get('output_rename')
+        if not intent:
+            source = Path(item['output_path'])
+            basename = (item_filename(item) if item.get('output_naming') == 'bundle-library-v1'
+                        else duration_filename(item, duration))
+            target = source.with_name(basename)
+            if source == target or item.get('output_name_base') == basename:
+                return source
+            stem, suffix, number = target.stem, target.suffix, 2
+            while target.exists():
+                target = source.with_name(f'{stem}-{number:02d}{suffix}')
+                number += 1
+            stat = source.stat()
+            intent = {'source':str(source), 'target':str(target), 'basename':basename,
+                      'size':stat.st_size, 'mtime_ns':stat.st_mtime_ns}
+            self.store.update(batch_id, lambda b: b['items'][index].update(output_rename=intent))
+        source, target = Path(intent['source']), Path(intent['target'])
+        if target.exists():
+            stat = target.stat()
+            if stat.st_size != intent['size'] or stat.st_mtime_ns != intent['mtime_ns']:
+                raise ValueError('成片重命名目标已存在且不匹配，已保留文件，请检查')
+            if source.exists():
+                if not os.path.samefile(source, target):
+                    raise ValueError('成片重命名目标冲突，已保留文件，请检查')
+                source.unlink()
+        else:
+            publish(source, target)
+        def finish(batch):
+            record = batch['items'][index]
+            record.update(output_name=target.name, output_path=str(target), output_name_base=intent['basename'])
+            record.pop('output_rename', None)
+        self.store.update(batch_id, finish)
+        return target
+
+    def _execute_item(self, batch_id, index):
         from .processwatch import RenderStalled
         from .checkpoints import VideoRecoveryNeeded
         from . import media, renderer
@@ -1580,6 +2043,13 @@ class Application:
         if (item['status'] != 'pending' or item.get('dismissed') or self.closing.is_set()
                 or batch['status'] != 'running' or batch.get('scheduled_cancelled')):
             return
+        if item.get('output_rename'):
+            try:
+                self.finalize_output_name(batch_id, index)
+                item = self.batch(batch_id)['items'][index]
+            except (OSError, ValueError) as exc:
+                self.store.update(batch_id, lambda b: b['items'][index].update(status='failed', error=str(exc)))
+                return
         output = Path(item['output_path'])
         try:
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -1587,7 +2057,8 @@ class Application:
         except OSError as exc:
             self.store.update(batch_id, lambda b: b.update(status='paused', error=str(exc)))
             return
-        used_ids = {song['id'] for song in item['music']}
+        # Folder playlists include unused suffixes; verify actual inputs during preparation/render.
+        used_ids = set() if item.get('music_folder') else {song['id'] for song in item['music']}
         try:
             if item.get('kind') == 'sticker_variant':
                 media.verify_asset(item['source_asset'])
@@ -1608,10 +2079,13 @@ class Application:
                     recovered = {}
                 metadata = renderer.validate(str(output), recovered.get('duration', item['duration']))
                 metadata.update(recovery_warnings=recovered.get('recovery_warnings', []))
+                if 'played_music' in recovered: metadata['played_music'] = recovered['played_music']
                 if recovered.get('rendered_segments'):
                     self.store.update(batch_id, lambda b: b['items'][index].update(
                         segments=recovered['rendered_segments'], video_assets=item.get('checkpoint_video_assets', item.get('video_assets', [])),
                         duration=metadata['duration'], checkpoint_segments=[]))
+                metadata.setdefault('duration', item['duration'])
+                output = self.finalize_output_name(batch_id, index, metadata['duration'])
                 metadata.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns)
                 self.store.update(batch_id, lambda b: b['items'][index].update(
                     status='success', progress=1, result=metadata, error=None, thumbnails={'status': 'queued'}))
@@ -1675,7 +2149,8 @@ class Application:
                     item = self.music_edges.prepare(item, cancelled, detecting)
                     self.store.update(batch_id, lambda b: b['items'][index].update(
                         duration=item['duration'], planned_duration=item['planned_duration'], music=item['music'],
-                        nonstop=item['nonstop'], render_stage='rendering'))
+                        nonstop=item['nonstop'], render_stage='rendering',
+                        **({key:item[key] for key in ('music_unique_count','music_play_count','music_rounds')} if item.get('music_folder') else {})))
                 render_config = dict(batch['config'], cache_dir=str(self.store.directory / 'cache'))
                 work_dir = str(self.store.directory / 'work' / batch_id / item['id'])
                 library = self.store.get('library', {}).get('scan', {}).get('videos', [])
@@ -1740,6 +2215,9 @@ class Application:
                                                        video_bitrate_mbps=render_config.get('video_bitrate_mbps', 0)))
                 else:
                     result = self.render_with_cache(batch_id, item, lambda: renderer.render(item, render_config, str(output), work_dir, progress))
+                if item.get('kind') == 'sticker_variant':
+                    from .tracklist import for_item
+                    result['played_music'] = for_item(item)
                 if result.get('rendered_segments'):
                     actual_segments = result['rendered_segments']
                     actual_assets = [candidates[identity] for identity in
@@ -1747,6 +2225,7 @@ class Application:
                     self.store.update(batch_id, lambda b: b['items'][index].update(
                         segments=actual_segments, video_assets=actual_assets, checkpoint_segments=[]))
                     self.store.update(batch_id, self._update_plan_counts)
+                output = self.finalize_output_name(batch_id, index, result.get('duration', item['duration']))
                 result.update(output_size=output.stat().st_size, output_mtime_ns=output.stat().st_mtime_ns,
                               planned_duration=item.get('planned_duration', item['duration']))
                 result.setdefault('duration', item['duration'])
@@ -1807,7 +2286,7 @@ class Application:
 
     def write_manifest(self, batch_id):
         batch = self.batch(batch_id)
-        directory = batch_output_folder(batch)
+        directory = self.store.directory / 'manifests' / batch_id
         directory.mkdir(parents=True, exist_ok=True)
         temporary = directory / '.manifest.json.tmp'
         temporary.write_text(json.dumps(batch, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -1817,13 +2296,48 @@ class Application:
                 continue
             self.write_music_sidecar(item, item['output_path'], replace=True)
 
+    def set_track_titles(self, body):
+        enabled = body.get('enabled')
+        selections = body.get('selections')
+        if not isinstance(enabled, bool) or not isinstance(selections, list) or not selections or len(selections) > 500:
+            raise ValueError('请选择1～500条任务，并设置是否附带曲目曲名')
+        targets = []
+        seen = set()
+        with self.review_lock:
+            for selection in selections:
+                if not isinstance(selection, dict): raise ValueError('任务选择格式无效')
+                bid, iid = str(selection.get('batch_id', '')), str(selection.get('item_id', ''))
+                if (bid, iid) in seen: continue
+                seen.add((bid, iid))
+                batch = self.batch(bid)
+                item = next((i for i in batch['items'] if str(i['id']) == iid and not i.get('dismissed')), None)
+                if item is None: raise ValueError('任务不存在或已删除')
+                targets.append((bid, iid))
+            errors = []
+            for bid, iid in targets:
+                def change(batch):
+                    item = next(i for i in batch['items'] if str(i['id']) == iid)
+                    item['include_track_titles'] = enabled
+                batch = self.store.update(bid, change)
+                item = next(i for i in batch['items'] if str(i['id']) == iid)
+                if item['status'] == 'success':
+                    review = item.get('review', {})
+                    target = review.get('path') if review.get('status') == 'approved' else item.get('output_path')
+                    try:
+                        if not target or not Path(target).is_file():
+                            raise ValueError('成片已移动或删除，无法更新同名文档')
+                        self.write_music_sidecar(item, target, replace=True)
+                    except (OSError, ValueError) as exc:
+                        errors.append({'batch_id':bid, 'item_id':iid, 'error':str(exc)})
+            return {'ok':not errors, 'updated':len(targets), 'enabled':enabled, 'errors':errors}
+
     @staticmethod
     def write_music_sidecar(item, video_path, *, replace=False):
-        folders = item.get('music_source_folders') or music_folders(item.get('music', []))
-        if not folders:
+        from .tracklist import sidecar_content
+        content = sidecar_content(item)
+        if not content:
             return None
         sidecar = Path(video_path).with_suffix('.txt')
-        content = '\n'.join(folders) + '\n'
         if sidecar.exists() and not replace:
             if sidecar.is_file() and sidecar.read_text(encoding='utf-8') == content:
                 return sidecar
@@ -1893,6 +2407,12 @@ class Application:
         review = item.get('review', {})
         if review.get('status') != 'approved':
             return batch
+        if review.get('retained'):
+            try:
+                self.cleanup_task_cache(batch, item)
+                return self.store.update(batch_id, lambda b: next(i for i in b['items'] if i['id']==item_id).setdefault('cleanup',{}).update(output_retained=True,temporary_segments_deleted=True,output_error=None))
+            except (OSError, ValueError) as exc:
+                return self.store.update(batch_id, lambda b: next(i for i in b['items'] if i['id']==item_id).setdefault('cleanup',{}).update(output_error=str(exc)))
         archived = Path(review['path'])
         try:
             if not archived.is_file() or self.file_digest(archived) != review.get('sha256'):
@@ -1930,8 +2450,12 @@ class Application:
         if review.get('status') != 'approved':
             raise ValueError('关联任务尚未审核通过')
         archive = Path(review.get('path', ''))
-        if not archive.is_file() or not review.get('sha256') or self.file_digest(archive) != review['sha256']:
+        if not archive.is_file() or (not review.get('retained') and (not review.get('sha256') or self.file_digest(archive) != review['sha256'])):
             raise ValueError('关联任务的审核成片缺失或校验失败')
+        if review.get('retained'):
+            stat = archive.stat()
+            if stat.st_size != review.get('size') or (review.get('mtime_ns') and stat.st_mtime_ns != review['mtime_ns']):
+                raise ValueError('已保留成片发生变化，原素材暂不删除')
         return archive
 
     def _cleanup_sticker_origin(self, batch_id, item_id):
@@ -1955,6 +2479,8 @@ class Application:
             if source_item is None:
                 raise ValueError('原任务记录已删除，无法自动清理原成片和素材')
             source_review = source_item.get('review', {})
+            if source_review.get('status') == 'approved' and source_review.get('retained'):
+                return self.store.update(batch_id,lambda b:next(i for i in b['items'] if i['id']==item_id).setdefault('cleanup',{}).update(origin_output_deleted=True,origin_status='原视频已单独审核，保留原处',origin_error=None))
             if source_review.get('status') == 'approved':
                 # An independently approved original is a separate accepted deliverable.
                 if not source_item.get('cleanup', {}).get('output_deleted'):
@@ -2003,8 +2529,11 @@ class Application:
                     source_cleanup_requested=bool(original.get('segments')))
             self.store.update(source_batch['id'], mark_replaced)
             self.cleanup_task_cache(source_batch, source_item)
-            source_path.unlink(missing_ok=True)
-            source_path.with_suffix('.txt').unlink(missing_ok=True)
+            if item.get('review',{}).get('retained'):
+                self.trash_task_output(source_batch,source_item)
+            else:
+                source_path.unlink(missing_ok=True)
+                source_path.with_suffix('.txt').unlink(missing_ok=True)
             shutil.rmtree(self.store.directory / 'work' / source_batch['id'] / source_item['id'], ignore_errors=True)
             self.store.update(source_batch['id'], lambda current: next(
                 entry for entry in current['items'] if entry['id'] == source_item['id']
@@ -2035,7 +2564,10 @@ class Application:
                             seen.add(path)
         updates = defaultdict(dict)
         verified_archives = set()
+        preserved_sources = set(self.store.get('preserved-task-sources', []))
         for path_text, refs in references.items():
+            if path_text in preserved_sources:
+                continue
             def settled(item):
                 review = item.get('review', {}).get('status')
                 return review == 'approved' or (review == 'superseded'
@@ -2073,9 +2605,9 @@ class Application:
                         raise ValueError('无法确认源文件属于已扫描的视频目录；请重新扫描原目录后重试清理')
                     if path.exists():
                         media.verify_asset(asset)
-                        path.unlink()
-                    status = '已删除'
-                except (OSError, ValueError, StopIteration) as exc:
+                        move_to_trash(path)
+                    status = '已移入废纸篓'
+                except (OSError, ValueError, StopIteration, subprocess.TimeoutExpired) as exc:
                     status = f'删除失败：{exc}'
             for batch, item, _ in requested:
                 updates[batch['id']].setdefault(item['id'], {})[path_text] = status
@@ -2087,7 +2619,7 @@ class Application:
                     cleanup = item.setdefault('cleanup', {})
                     cleanup.setdefault('source_files', {}).update(by_item[item['id']])
                     cleanup['original_recordings_deleted'] = bool(cleanup['source_files']) and all(
-                        value == '已删除' for value in cleanup['source_files'].values())
+                        value in {'已删除', '已移入废纸篓'} for value in cleanup['source_files'].values())
             self.store.update(batch_id, change)
 
     def retry_approved_cleanup(self, batch_id, item_id):
@@ -2097,7 +2629,7 @@ class Application:
             if item is None or item.get('review', {}).get('status') != 'approved':
                 raise ValueError('只有审核通过的任务可以重试清理')
             archive = Path(item['review'].get('path', ''))
-            if not archive.is_file() or self.file_digest(archive) != item['review'].get('sha256'):
+            if not archive.is_file() or (not item['review'].get('retained') and self.file_digest(archive) != item['review'].get('sha256')):
                 raise ValueError('审核成片缺失或校验失败，请先恢复审核文件')
             self.store.update(batch_id, lambda current: next(
                 entry for entry in current['items'] if str(entry['id']) == str(item_id)
@@ -2169,15 +2701,14 @@ class Application:
             errors, removed = [], []
             for path in paths:
                 try:
-                    Path(path).unlink(missing_ok=True)
+                    move_to_trash(path)
                     removed.append(path)
-                except OSError as exc:
+                except (OSError, subprocess.TimeoutExpired) as exc:
                     errors.append(f'{path}: {exc}')
             for current, entry in outputs:
                 try:
                     self.cleanup_task_cache(current, entry)
-                    Path(entry['output_path']).unlink(missing_ok=True)
-                    Path(entry['output_path']).with_suffix('.txt').unlink(missing_ok=True)
+                    self.trash_task_output(current, entry)
                     if entry['id'] != item_id or current['id'] != batch_id:
                         self.store.update(current['id'], lambda b: next(i for i in b['items'] if i['id'] == entry['id']).update(
                             dismissed=True, cancel_requested=True, status='cancelled'))
@@ -2195,7 +2726,86 @@ class Application:
             self.wake.set()
             return {'ok': not errors, **result}
 
+    def trash_task_output(self, batch, item):
+        from .trash import move_to_trash
+        output = Path(item['output_path'])
+        bundle = item.get('output_bundle')
+        if bundle:
+            folder = Path(bundle)
+            root = Path(batch['config']['output_dir']).resolve()
+            if folder.is_symlink() or folder.resolve() == root or not folder.resolve().is_relative_to(root) or output.parent != folder:
+                raise ValueError('成品目录与任务记录不一致，文件已保留')
+            return move_to_trash(folder)
+        # Old batches share a directory: recycle only this task's known files.
+        paths = [output, output.with_suffix('.txt')]
+        reviewed = item.get('review', {}).get('path')
+        if reviewed:
+            paths.extend([Path(reviewed),Path(reviewed).with_suffix('.txt')])
+        for path in dict.fromkeys(paths):
+            if path.is_symlink(): raise ValueError('成品路径是链接，文件已保留')
+            move_to_trash(path)
+
+    def forget_items(self, selections, *, clear_history=False):
+        """Remove records and recycle dedicated output folders; preserve original sources."""
+        return self._forget_records(selections, clear_history=clear_history, preserve_files=True)
+
     def approve(self, body):
+        bid,iid=str(body['batch_id']),str(body['item_id'])
+        with self.review_lock,self.sticker_lock:
+            batch=self.batch(bid)
+            item=next((i for i in batch['items'] if i['id']==iid),None)
+            if not item or item.get('status')!='success': raise ValueError('只能审核已成功生成的视频')
+            previous=item.get('review',{})
+            if previous.get('status') != 'approved':
+                # Do not move a video while a dependent sticker render still reads it.
+                for dependent in self.store.batches():
+                    origin = dependent.get('sticker_origin', {})
+                    if (origin.get('batch_id') == bid and origin.get('item_id') == iid
+                            and any(i.get('status') not in {'success', 'cancelled'} for i in dependent.get('items', []))):
+                        raise ValueError('贴图任务仍需读取原成片，请完成或删除贴图任务后再审核')
+            if previous.get('status') in {'rejecting','reject_failed','rejected','superseded'}: raise ValueError('该任务无法审核通过')
+            if item.get('thumbnails') and previous.get('status')!='approved':
+                if not self.review_ready(item) or not self.keyframes.ready(item['thumbnails'].get('version'),item['thumbnails'].get('total',0)):
+                    raise ValueError('缩略图尚未准备好，请等待或重试生成后审核')
+            if item.get('bundle_relocation'):
+                from .bundles import finish_relocation
+                finish_relocation(item, lambda value: self.store.update(bid, lambda b: next(i for i in b['items'] if i['id'] == iid).update(value)))
+            source=self.completed_output(bid,iid)
+            stat=source.stat();expected=item.get('result',{})
+            if previous.get('status')!='approved' and expected.get('output_mtime_ns') and (stat.st_size!=expected.get('output_size') or stat.st_mtime_ns!=expected['output_mtime_ns']):
+                raise ValueError('成片已被修改，请检查文件')
+            if previous.get('status') != 'approved':
+                from .bundles import date_for_approval
+                old_bundle = item.get('output_bundle')
+                def persist_bundle(value):
+                    def update_paths(current):
+                        next(i for i in current['items'] if i['id'] == iid).update(
+                            output_path=value['output_path'], output_bundle=value.get('output_bundle'),
+                            output_name=value.get('output_name', Path(value['output_path']).name),
+                            bundle_relocation=value.get('bundle_relocation'))
+                        if current.get('output_folder') == old_bundle:
+                            current.update(output_folder=value['output_bundle'], folder_name=Path(value['output_bundle']).name)
+                    self.store.update(bid, update_paths)
+                date_for_approval(item, batch['config']['output_dir'], self.reserve_review_bundle, persist_bundle)
+                source = Path(item['output_path'])
+            self.write_music_sidecar(item,source,replace=True)
+            if previous.get('status')!='approved':
+                review={'status':'approved','path':str(source),'retained':True,'size':stat.st_size,'mtime_ns':stat.st_mtime_ns,
+                        'approved_at':datetime.now().astimezone().isoformat(timespec='seconds'),
+                        'music_paths':str(source.with_suffix('.txt')) if source.with_suffix('.txt').exists() else None}
+                self.store.update(bid,lambda b:next(i for i in b['items'] if i['id']==iid).update(review=review, cleanup={'output_retained':True,'source_cleanup_requested':bool(item.get('segments'))}))
+            # A new explicit approval authorizes source cleanup again. Forgetting a
+            # record alone must not release a shared source to background deletion.
+            approved_paths = {str(Path(part['path']).resolve()) for part in item.get('segments', []) if part.get('path')}
+            preserved_sources = set(self.store.get('preserved-task-sources', []))
+            if approved_paths & preserved_sources:
+                self.store.put('preserved-task-sources', sorted(preserved_sources - approved_paths))
+            self._cleanup_approved_output(bid,iid)
+            self._cleanup_sticker_origin(bid,iid)
+            self._cleanup_approved_sources()
+            return self.batch(bid)
+
+    def _approve_legacy(self, body):
         batch_id, item_id = str(body['batch_id']), str(body['item_id'])
         # Serialize approvals, not rendering. Double clicks cannot copy the same item twice.
         with self.review_lock, self.sticker_lock:
@@ -2298,7 +2908,7 @@ class Application:
     def start_batch_review(self, batch_id, body):
         review_dir = str(body.get('review_dir', '')).strip()
         if not review_dir:
-            raise ValueError('请先设置审核通过文件夹')
+            review_dir = self.bootstrap()['output_dir']
         with self.review_lock, self.review_job_lock:
             existing = self.review_jobs.get(batch_id)
             if existing and existing['status'] == 'running':
@@ -2343,7 +2953,7 @@ class Application:
     def start_review_all(self, body):
         review_dir = str(body.get('review_dir', '')).strip()
         if not review_dir:
-            raise ValueError('请先设置审核通过文件夹')
+            review_dir = self.bootstrap()['output_dir']
         with self.review_job_lock:
             if self.global_review_job['status'] == 'running':
                 return dict(self.global_review_job)
@@ -2441,6 +3051,26 @@ class Handler(BaseHTTPRequestHandler):
                 if size < 0 or size > (18_000_000 if path == '/api/stickers/import' else 2_000_000):
                     raise ValueError('请求过大')
                 body = json.loads(self.rfile.read(size) or '{}')
+                if path == '/api/music-loop/reveal':
+                    task = self.app.loop_music.get(str(body['id']))
+                    target = Path(task.get('output_bundle', task['output_root']))
+                    if not target.exists():
+                        raise ValueError('输出尚未生成')
+                    reveal(target)
+                    return self.json_response({'ok': True})
+                if path == '/api/music-loop/start':
+                    return self.json_response(self.app.loop_music.start_tasks(body.get('ids'), body.get('parallel_tasks')))
+                if path == '/api/music-loop/import':
+                    return self.json_response(self.app.loop_music.import_tasks(body))
+                loop_action = re.fullmatch(r'/api/music-loop/([a-f0-9]{16})/(start|pause|delete|approve|reject|relocate)', path)
+                if loop_action:
+                    if loop_action[2] == 'relocate':
+                        return self.json_response(self.app.loop_music.relocate(loop_action[1], body.get('music_root')))
+                    if loop_action[2] == 'start' and 'parallel_tasks' in body:
+                        return self.json_response(self.app.loop_music.start_tasks([loop_action[1]], body['parallel_tasks']))
+                    return self.json_response(self.app.loop_music.action(*loop_action.groups()))
+                if path == '/api/music-loop/cache/clear':
+                    return self.json_response(self.app.loop_music.clear_cache())
                 if path == '/api/stickers/import':
                     return self.json_response(self.app.import_sticker(body))
                 if path == '/api/sticker-templates':
@@ -2449,6 +3079,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response(self.app.create_sticker_variant(body))
                 if path == '/api/scan':
                     return self.json_response(self.app.scan(body))
+                if path == '/api/scan/errors/clear':
+                    return self.json_response(self.app.clear_scan_errors())
                 if path == '/api/scan/start':
                     return self.json_response(self.app.start_scan(body))
                 if path == '/api/schedules':
@@ -2471,6 +3103,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json_response(self.app.start_batch_review(batch_review_match[1], body))
                 if path == '/api/plan':
                     return self.json_response(self.app.create_plan(body))
+                if path == '/api/tasks/track-titles':
+                    return self.json_response(self.app.set_track_titles(body))
+                repeats_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/music-repeats', path)
+                if repeats_match:
+                    return self.json_response(self.app.set_music_repeats(*repeats_match.groups(), body))
                 music_order_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/music-order', path)
                 if music_order_match:
                     return self.json_response(self.app.reorder_music(
@@ -2478,6 +3115,9 @@ class Handler(BaseHTTPRequestHandler):
                 music_refresh_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/refresh-music', path)
                 if music_refresh_match:
                     return self.json_response(self.app.refresh_music(*music_refresh_match.groups()))
+                folder_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/music-folder', path)
+                if folder_match:
+                    return self.json_response(self.app.change_music_folder(*folder_match.groups(), body))
                 replacement_match = re.fullmatch(r'/api/batches/([a-f0-9]+)/items/([^/]+)/replace', path)
                 if replacement_match:
                     return self.json_response(self.app.replace_media(*replacement_match.groups(), body))
@@ -2526,6 +3166,8 @@ class Handler(BaseHTTPRequestHandler):
                     reveal(target)
                     return self.json_response({'ok': True})
                 if path == '/api/shutdown':
+                    if self.app.loop_music.active:
+                        raise ValueError('请先暂停音乐循环任务，等待后台停止后退出')
                     with self.app.review_job_lock:
                         if any(job['status'] == 'running' for job in self.app.review_jobs.values()):
                             raise ValueError('一键审核正在进行，请等待结束后退出')
@@ -2536,6 +3178,15 @@ class Handler(BaseHTTPRequestHandler):
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
                     return
             else:
+                if path == '/api/music-loop/cache':
+                    return self.json_response(self.app.loop_music.cache_info())
+                if path == '/api/music-loop':
+                    return self.json_response({'tasks': self.app.loop_music.listing()})
+                if path == '/api/music-loop/output':
+                    task = self.app.loop_music.get(query['id'][0])
+                    if task['status'] not in {'success', 'approved'}:
+                        raise ValueError('任务尚不可审核')
+                    return self.send_file(Path(task['output_path']))
                 if path == '/api/schedules':
                     return self.json_response(self.app.scheduler.listing())
                 if path == '/api/stickers':
@@ -2600,7 +3251,7 @@ class Handler(BaseHTTPRequestHandler):
                             index = int(query['index'][0])
                             if index < 0 or index >= preview.get('total', 0):
                                 raise ValueError('关键帧编号超出范围')
-                            cache_missing = not (self.app.keyframes.root / preview['version'] / f'{index:06d}-{size}.jpg').is_file()
+                            cache_missing = not (self.app.keyframes.root / preview['version'] / f'{index:06d}.jpg').is_file()
                     if cache_missing:
                         self.app.enqueue_previews(query['batch'][0], query['item'][0])
                         raise ValueError('缩略图缓存已清除，正在重新准备')
@@ -2622,7 +3273,8 @@ class Handler(BaseHTTPRequestHandler):
                 if path == '/api/manifest':
                     return self.json_response(self.app.batch(query['batch'][0]))
                 files = {'/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css',
-                         '/static/app.js': 'app.js', '/static/style.css': 'style.css'}
+                         '/static/app.js': 'app.js', '/static/style.css': 'style.css',
+                         '/static/loopmusic.js': 'loopmusic.js'}
                 if path in files:
                     return self.send_file(ROOT / 'static' / files[path], no_store=True)
             self.json_response({'error': '接口不存在'}, 404)

@@ -27,7 +27,7 @@ class KeyframeTests(unittest.TestCase):
     def setUp(self):
         self.cache = KeyframeCache(self.root / self._testMethodName)
 
-    def test_frames_are_sampled_every_thirty_seconds(self):
+    def test_frames_are_sampled_every_sixty_seconds(self):
         data = self.cache.describe(self.video)
         self.assertEqual(1, data['total'])
         self.assertEqual([0], [frame['time'] for frame in data['frames']])
@@ -41,8 +41,8 @@ class KeyframeTests(unittest.TestCase):
             self.assertEqual(thumbnail, self.cache.image(self.video, 0))
         self.assertEqual(b'\xff\xd8', thumbnail.read_bytes()[:2])
 
-    def test_thumbnail_and_large_have_distinct_dimensions(self):
-        for size, width in [('thumb', 320), ('large', 640)]:
+    def test_thumbnail_and_hover_reuse_one_low_resolution_image(self):
+        for size, width in [('thumb', 480), ('large', 480)]:
             path = self.cache.image(self.video, 0, size)
             result = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
                                      '-show_entries', 'stream=width', '-of', 'csv=p=0', str(path)],

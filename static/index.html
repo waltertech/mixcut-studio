@@ -23,19 +23,22 @@
         <a href="#tasks" data-view="tasks"><b>04</b> 任务结果</a>
         <a href="#stickers" data-view="stickers"><b>05</b> 贴图库</a>
         <a href="#schedules" data-view="schedules"><b>06</b> 定时任务</a>
+        <a href="#music-loop" data-view="music-loop"><b>07</b> 音乐循环视频</a>
       </nav>
       <main>
         <section id="assets" class="view">
           <div class="page-heading"><div><p class="eyebrow">MATERIAL LIBRARY</p><h1>素材</h1><p>填入本机绝对路径，递归扫描可用的视频与音乐。审核通过后，程序会按规则删除已用原始视频。</p></div><button id="scan-btn" class="button primary">扫描素材</button></div>
-          <div class="notice"><strong>音乐时长覆盖成片</strong>：候选池规划按读取到的时长分配歌曲，并预留视频时长的 0.5%（最多 3 秒）；成片结束时可能截断最后一首歌曲，不变速、不循环。渲染时识别到异常音乐会自动换歌重试。</div>
+          <div class="notice"><strong>成片时长由音乐决定</strong>：先排列完整音乐，视频不足则循环补足，视频过长则截断最后片段。默认直接拼接音乐，保留首尾静音；规划阶段不解码音乐。</div>
           <p id="scan-progress" class="field-help" role="status" aria-live="polite"></p>
           <form id="paths-form" class="panel paths-grid">
             <label>视频文件夹<span class="path-control"><input id="video-dir" name="video_dir" required placeholder="/Users/…/视频素材"><button class="button folder-picker" data-kind="video" type="button">选择文件夹</button></span></label>
             <label>音乐文件夹<span class="path-control"><input id="music-dir" name="music_dir" required placeholder="/Users/…/音乐素材"><button class="button folder-picker" data-kind="music" type="button">选择文件夹</button></span></label>
-            <label>导出文件夹<span class="path-control"><input id="output-dir" name="output_dir" required placeholder="/Users/…/导出"><button class="button folder-picker" data-kind="output" type="button">选择文件夹</button></span></label>
-            <label>审核通过文件夹<span class="path-control"><input id="review-dir" name="review_dir" placeholder="/Users/…/审核通过"><button class="button folder-picker" data-kind="review" type="button">选择文件夹</button></span></label>
+            <label>成品保存文件夹<span class="path-control"><input id="output-dir" name="output_dir" required placeholder="/Users/…/导出"><button class="button folder-picker" data-kind="output" type="button">选择文件夹</button></span></label>
+            <label hidden>旧版审核目录（不再使用）<span class="path-control"><input id="review-dir" name="review_dir" placeholder="/Users/…/审核通过"><button class="button folder-picker" data-kind="review" type="button">选择文件夹</button></span></label>
             <p class="field-help">路径由本机服务验证；视频或音乐目录变更后请重新扫描。导出会按 <strong>YYYY-MM-DD_001</strong> 建立当日递增子文件夹。</p>
           </form>
+          <button id="clear-scan-errors" class="button" hidden>一键清除异常视频（移入废纸篓）</button>
+          <div id="scan-cleanup-result" class="notice" hidden></div>
           <div id="scan-errors" class="error-list" hidden></div>
           <div class="asset-summary" id="asset-summary"><span>尚未扫描</span></div>
           <div class="library-grid">
@@ -46,33 +49,35 @@
 
         <section id="settings" class="view" hidden>
           <div class="page-heading"><div><p class="eyebrow">EDITING RULES</p><h1>剪辑设置</h1><p>先选择素材和规则，再生成一批可复现的方案。</p></div><button id="plan-btn" class="button primary">生成方案</button></div>
-          <form id="config-form" class="settings-grid" novalidate>
-            <section class="panel span-2"><div class="section-title"><h2>导出规格</h2></div><div class="form-grid"><label>分辨率<select name="resolution"><option value="1280x720">1280 × 720（默认）</option><option value="1920x1080">1920 × 1080</option></select></label><label>帧率<select name="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label><label>视频码率（Mbps；0 为自动）<input name="video_bitrate_mbps" type="number" min="0" max="50" step="0.5" value="0"></label><label>同时并行剪辑数量<select name="parallel_tasks"><option value="1">1（默认）</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></label><label>编码方式<select name="hardware"><option value="auto">自动硬件加速（推荐）</option><option value="software_fast">软件极速（文件较大）</option><option value="software">软件高质量（较慢）</option></select></label><label>原音音量<input name="original_volume" type="number" min="0" max="1" step=".05" value="0"></label><label>无缝音乐衔接<select name="nonstop_music"><option value="true">开启（去首尾静音＋短过渡）</option><option value="false">关闭</option></select></label><label>音乐音量<input name="music_volume" type="number" min="0" max="1" step=".05" value="1"></label></div><p class="field-help">视频码率设为 0 时沿用自动编码设置；设置固定码率可控制输出大小。720p/30fps 通常最快。并行数量为同时执行的任务上限，旧方案默认 1；暂停后等待所有执行中的任务完成。</p></section>
+          <form id="config-form" class="settings-grid" novalidate><input type="hidden" name="duration_basis" value="music">
+            <section class="panel span-2"><div class="section-title"><h2>导出规格</h2></div><div class="form-grid"><label>分辨率<select name="resolution"><option value="1280x720">1280 × 720</option><option value="1920x1080" selected>1920 × 1080（默认）</option></select></label><label>帧率<select name="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label><label>视频码率（Mbps；0 为自动）<input name="video_bitrate_mbps" type="number" min="0" max="50" step="0.5" value="0"></label><label>同时并行剪辑数量<select name="parallel_tasks"><option value="1">1</option><option value="2">2</option><option value="3" selected>3（默认）</option><option value="4">4</option></select></label><label>编码方式<select name="hardware"><option value="auto">自动硬件加速（推荐）</option><option value="software_fast">软件极速（文件较大）</option><option value="software">软件高质量（较慢）</option></select></label><label>原音音量<input name="original_volume" type="number" min="0" max="1" step=".05" value="0"></label><label>无缝音乐衔接<select name="nonstop_music"><option value="false">音乐拼接（默认，保留首尾静音）</option><option value="true">剔除首尾静音＋短过渡</option></select></label><label>音乐音量<input name="music_volume" type="number" min="0" max="1" step=".05" value="1"></label></div><p class="field-help">视频码率设为 0 时沿用自动编码设置；设置固定码率可控制输出大小。720p/30fps 通常最快。渲染与缩略图生成均使用所选并行数量，旧方案默认 1；暂停后等待所有执行中的任务完成。</p></section>
             <section class="panel span-2"><div class="section-title"><h2>画面组织</h2></div>
-              <div class="choice-row"><label class="choice"><input type="radio" name="mode" value="single" checked><span><strong>单源连续截取</strong><small>每条只从一个视频中连续截取</small></span></label><label class="choice"><input type="radio" name="mode" value="multi"><span><strong>多源片段拼接</strong><small>至少两个来源，按原顺序拼接</small></span></label></div>
-              <div class="form-grid"><label>生成数量<input name="count" type="number" min="1" value="3"></label><label>期望最短时长（秒）<input name="min_duration" type="number" min="1" value="30"></label><label>期望最长时长（秒）<input name="max_duration" type="number" min="1" value="450"></label><label>随机种子（留空每批随机）<input name="seed" type="number" placeholder="自动生成"></label></div>
-              <div class="form-grid"><label>源视频时长必须大于（分钟）<input name="min_source_duration_minutes" type="number" min="0" step="0.1" value="0" aria-describedby="source-duration-help"></label></div>
-              <p id="source-duration-help" class="field-help">0 表示不限制；例如填 5，只使用超过 5 分钟的原始视频，正好 5 分钟也会排除。此项筛选源文件，不是设置成片或截取片段的长度；手动生成和定时任务均生效。</p>
-              <div class="form-grid mode-multi" hidden><label>单段最短（秒）<input name="segment_min" type="number" min="1" value="30"></label><label>单段最长（秒）<input name="segment_max" type="number" min="1" value="120"></label><label>组内拼接<select name="within_group"><option value="false">允许跨组</option><option value="true">仅同组内</option></select></label></div>
-              <div class="form-grid mode-single"><label>起点最小间隔（秒）<input name="start_gap" type="number" min="0" value="30"></label><label class="switch-label"><input name="allow_overlap" type="checkbox" checked><span>无空闲视频区间时允许下一轮复用</span></label></div>
+              <div class="choice-row"><label class="choice"><input type="radio" name="mode" value="single"><span><strong>单源连续截取</strong><small>先选本批少用的合格源视频，长则截断、短则循环补足</small></span></label><label class="choice"><input type="radio" name="mode" value="multi" checked><span><strong>多源片段拼接</strong><small>随机拼接多个来源，直到音乐结束</small></span></label></div>
+              <div class="form-grid"><label>生成数量<input name="count" type="number" min="1" value="30"></label><label hidden>期望最短时长（秒）<input name="min_duration" type="number" min="1" value="30"></label><label hidden>期望最长时长（秒）<input name="max_duration" type="number" min="1" value="450"></label><label>随机种子（留空每批随机）<input name="seed" type="number" placeholder="自动生成"></label></div>
+              <div class="form-grid"><label>源视频最短时长（分钟，含等于）<input name="min_source_duration_minutes" type="number" min="0" step="0.1" value="5" aria-describedby="source-duration-help"></label></div>
+              <p id="source-duration-help" class="field-help">0 表示不限制；例如填 5，使用至少 5 分钟的原始视频，正好 5 分钟也会参与。此项筛选源文件，不是设置成片或截取片段的长度；手动生成和定时任务均生效。</p>
+              <div class="form-grid mode-multi"><label>单段最短（秒）<input name="segment_min" type="number" min="1" value="300"></label><label>单段最长（秒）<input name="segment_max" type="number" min="1" value="5000"></label><label>组内拼接<select name="within_group"><option value="false">允许跨组</option><option value="true">仅同组内</option></select></label></div>
+              <div class="form-grid mode-single" hidden><label>起点最小间隔（秒）<input name="start_gap" type="number" min="0" value="30"></label><label class="switch-label" hidden><input name="allow_overlap" type="checkbox" checked><span>优先使用空闲区间（音乐时长模式允许循环补足）</span></label></div>
             </section>
-            <section class="panel span-2"><div class="section-title"><h2>歌曲分配规则</h2></div>
-              <div class="choice-row"><label class="choice"><input type="radio" name="music_mode" value="fixed"><span><strong>固定歌曲集合</strong><small>每条都用所选歌曲，只改变顺序</small></span></label><label class="choice"><input type="radio" name="music_mode" value="pool" checked><span><strong>候选池组合</strong><small>每条选不同子集，再改变顺序</small></span></label></div>
-              <div class="form-grid pool-settings"><label>每条最少歌曲数<input name="min_songs" type="number" min="1" value="3"></label><label>每条最多歌曲数<input name="max_songs" type="number" min="1" value="20"></label></div>
-              <p class="field-help">整批优先分配未用歌曲；需要覆盖成片时长才进入下一轮。选定歌曲后再随机播放顺序，任意歌曲都可排第一。</p>
+            <section class="panel span-2"><div class="section-title"><h2>歌曲分配规则</h2></div><label>音乐播放轮数<select name="music_repeats"><option value="1">单次（1遍）</option><option value="2" selected>两次（默认，2遍）</option><option value="3">三次（3遍）</option><option value="4">四次（4遍）</option></select></label><p class="field-help">先排好一轮歌单，再按相同顺序完整重复。成片时长由全部轮次音乐决定；每条未开始的任务可单独调整。</p>
+              <div class="choice-row"><label class="choice"><input type="radio" name="music_mode" value="folder" checked><span><strong>单文件夹音乐</strong><small>每条只用一个末级音乐文件夹，01、02 开头，其余随机，全部歌曲各播放一遍</small></span></label><label class="choice"><input type="radio" name="music_mode" value="fixed"><span><strong>固定歌曲集合</strong><small>每条都用所选歌曲，只改变顺序</small></span></label><label class="choice"><input type="radio" name="music_mode" value="pool"><span><strong>全路径音乐随机</strong><small>每条选不同子集，再改变顺序</small></span></label></div>
+              <p id="folder-mode-help" class="field-help">按任意深度的末级音乐文件夹识别独立歌单，分类目录不会合并下属歌单；也可以直接选择一个歌单目录。整组优先使用不同歌单，用完后再轮转。若父目录与更深层目录都含音乐，仅采用更深层歌单，父目录散放歌曲不参与。此模式不限制歌曲首数。</p>
+              <div class="form-grid pool-settings" hidden><label>每条最少歌曲数<input name="min_songs" type="number" min="1" value="3"></label><label>每条最多歌曲数<input name="max_songs" type="number" min="1" value="20"></label></div>
+              <p class="field-help">先确定歌曲数量与顺序，以音乐总时长决定成片长度。整批优先使用低次数歌曲，视频不足自动复用，最后一段截断。</p>
             </section>
+            <section class="panel span-2"><label class="track-title-option"><input type="checkbox" name="include_track_titles">附带曲目曲名</label><p class="field-help">在成片同名的原曲路径文档中，按实际播放顺序增加编号曲目表。可在方案或任务中单独调整。</p></section>
             <section class="panel span-2"><div class="section-title"><h2>参与素材</h2></div><p id="selection-summary" class="field-help">扫描后默认使用全部视频和音乐。需要排除文件或设置分组时，在“素材”页展开对应列表。</p><label>贴图模板<select id="generation-sticker-template" name="sticker_template_id"><option value="">不添加贴图</option></select></label></section>
           </form>
         </section>
 
         <section id="plan" class="view" hidden>
-          <div class="page-heading"><div><p class="eyebrow">BATCH BLUEPRINT</p><h1>方案预览</h1><p id="plan-subtitle">生成方案后，逐条核对歌曲顺序和视频区间。</p></div><div class="button-row"><button id="select-all-plan" class="button">全选当前方案</button><button id="delete-selected-plan" class="button">删除选中任务</button><button id="manifest-btn" class="button" disabled>下载清单</button><button id="start-btn" class="button primary" disabled>确认并开始渲染</button></div></div>
+          <div class="page-heading"><div><p class="eyebrow">BATCH BLUEPRINT</p><h1>方案预览</h1><p id="plan-subtitle">生成方案后，逐条核对歌曲顺序和视频区间。</p></div><div class="button-row"><button id="select-all-plan" class="button">全选当前方案</button><button id="delete-selected-plan" class="button">删除选中任务</button><button id="track-titles-enable-plan" class="button" disabled>选中任务附带曲名</button><button id="track-titles-disable-plan" class="button" disabled>取消选中任务曲名</button><button id="manifest-btn" class="button" disabled>下载清单</button><button id="start-btn" class="button primary" disabled>确认并开始渲染</button></div></div>
           <div id="plan-message" class="notice">尚未生成方案。</div><div id="plan-stats" class="stats"></div><div id="plan-warnings" class="warning-list"></div><div id="plan-items" class="plan-list"></div>
         </section>
 
         <section id="tasks" class="view" hidden>
-          <div class="page-heading"><div><p class="eyebrow">RENDER QUEUE</p><h1>任务与结果</h1><p>一条视频就是一条任务。删除任务会清理缩略图，保留未审核的成品和素材。</p></div><div class="button-row"><button id="pause-all" class="button">暂停全部</button><button id="start-all" class="button">开始全部</button><button id="stop-all" class="button">终止全部</button><button id="approve-all-visible" class="button primary">一键审核</button><button id="select-all-tasks" class="button">全选任务</button><button id="delete-selected-tasks" class="button">删除选中任务</button><button id="clear-all" class="button">清空任务记录</button><button id="retry-failed" class="button">重试失败任务</button><button id="refresh-tasks" class="button">刷新状态</button></div></div>
-          <div class="panel task-review-setting"><label>审核通过文件夹<span class="path-control"><input id="task-review-dir" placeholder="选择审核文件夹"><button class="button folder-picker" data-kind="review" type="button">选择文件夹</button></span></label><p class="field-help">通过审核后先校验归档副本，再删除制作目录成片；原始录屏在所有引用任务审核或移除后删除。失败时可重试清理。</p></div>
+          <div class="page-heading"><div><p class="eyebrow">RENDER QUEUE</p><h1>任务与结果</h1><p>一条视频就是一条任务。审核通过保留成品；审核不通过将成品与原视频移至废纸篓。删除已审核任务只清除列表；删除未审核任务同时回收成品文件夹。原音乐始终保留。</p></div><div class="button-row"><button id="pause-all" class="button">暂停全部</button><button id="start-all" class="button">开始全部</button><button id="stop-all" class="button">终止全部</button><button id="approve-all-visible" class="button primary">一键审核</button><button id="select-all-tasks" class="button">全选任务</button><button id="delete-selected-tasks" class="button">删除选中任务</button><button id="track-titles-enable-tasks" class="button" disabled>选中任务附带曲名</button><button id="track-titles-disable-tasks" class="button" disabled>取消选中任务曲名</button><button id="clear-all" class="button">删除全部任务</button><button id="retry-failed" class="button">重试失败任务</button><button id="refresh-tasks" class="button">刷新状态</button></div></div>
+          <div class="panel task-review-setting" hidden><label hidden>旧版审核目录（不再使用）<span class="path-control"><input id="task-review-dir" placeholder="选择审核文件夹"><button class="button folder-picker" data-kind="review" type="button">选择文件夹</button></span></label><p class="field-help">通过审核后先校验归档副本，再删除制作目录成片；原始录屏在所有引用任务审核或移除后删除。失败时可重试清理。</p></div>
           <div class="notice"><span id="cache-usage">剪辑缓存：正在读取…</span> <button id="clear-cache" class="button">一键清除缓存</button><p class="field-help">统计视频转换缓存、任务临时文件及预览图片。正在使用的缓存暂时保留；清除后需要时会重新生成。</p></div>
           <div id="task-summary" class="stats"><div class="stat"><b>—</b><span>等待批次</span></div></div><div id="batches" class="batch-list empty">尚无任务。先生成方案并确认开始渲染。</div>
         </section>
@@ -86,6 +91,28 @@
           <form id="schedule-form" class="panel settings-grid"><label>任务名称<input name="name" value="素材持续监测"></label><label>开始时间<input name="start_at" type="datetime-local"></label><label>重复<select name="repeat"><option value="once">仅一次</option><option value="daily">每天</option><option value="weekly">每周</option></select></label><label>目标成片数<input name="target_count" type="number" min="1" max="500" value="50"></label><label>检查间隔（分钟）<input name="check_interval_minutes" type="number" min="1" max="1440" value="10"></label><label class="switch-label"><input name="enabled" type="checkbox"><span>启用任务</span></label><label>视频目录<span class="path-control"><input name="video_dir" id="schedule-video-dir"><button class="button schedule-folder-picker" data-kind="video" type="button">选择文件夹</button></span></label><label>音乐目录<span class="path-control"><input name="music_dir" id="schedule-music-dir"><button class="button schedule-folder-picker" data-kind="music" type="button">选择文件夹</button></span></label><label class="span-2">导出目录<span class="path-control"><input name="output_dir" id="schedule-output-dir"><button class="button schedule-folder-picker" data-kind="output" type="button">选择文件夹</button></span></label><label class="switch-label span-2"><input id="schedule-current" type="checkbox" checked><span>使用当前目录和剪辑设置（保存为快照，未来新增素材会被扫描）</span></label><div class="button-row span-2"><button class="button primary" type="submit">保存定时任务</button><button id="schedule-check" class="button" type="button">立即检查素材</button></div></form>
           <div id="schedule-active" class="notice">暂无运行中的定时任务。</div><div id="schedules-list" class="batch-list empty">正在读取定时任务…</div>
         </section>
+        <section id="music-loop" class="view" hidden>
+          <div class="page-heading"><div><p class="eyebrow">MUSIC LOOP VIDEO</p><h1>音乐循环视频</h1><p>导入 Cover Maker 的交接文档，按固定曲目顺序制作。成片时长由音乐决定。</p></div></div>
+          <form class="panel" onsubmit="return false">
+            <label>Set 文件夹或 YPP交接.txt 路径（每行一条）<textarea id="loop-paths" rows="3" placeholder="粘贴 Set 路径；也可选择包含多个 Set 的上一级文件夹"></textarea></label>
+            <button type="button" id="loop-pick" class="button">选择 Set 文件夹</button>
+            <div class="form-grid">
+              <label class="span-2">成品保存路径<span class="path-control"><input id="loop-output"><button type="button" id="loop-output-pick" class="button">选择文件夹</button></span></label>
+              <label class="span-2">音乐新根目录（仅路径迁移时填写）<span class="path-control"><input id="loop-music-root"><button type="button" id="loop-music-pick" class="button">选择文件夹</button></span></label>
+              <label>分辨率<select id="loop-resolution"><option value="source">沿用动态封面（优先直接复用画面）</option><option value="1280x720">1280 × 720</option><option value="1920x1080">1920 × 1080</option></select></label>
+              <label>转码帧率<select id="loop-fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></label>
+              <label>并行数量<select id="loop-parallel"><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+              <label>音乐音量<input id="loop-volume" type="number" min="0" max="1" step="0.05" value="1"></label>
+              <label class="switch-label"><input id="loop-nonstop" type="checkbox" checked><span>无缝衔接（去首尾静音＋短过渡）</span></label>
+            </div>
+            <p class="field-help">每个 Set 独立制作，全部歌曲按交接顺序播放一次，合成完成即可播放审核，不抽取缩略图。开启无缝衔接后重新计算实际时间轴。开始制作时采用当前并行数量，有空位自动补入等待任务。两种制作模式共用调度，正在执行的原视频混剪先完成。</p>
+            <button type="button" id="loop-import" class="button primary">导入任务</button>
+          </form>
+          <div id="loop-message" class="notice">审核通过保留作品；审核不通过仅回收生成的作品目录；删除任务只移除记录。原音乐、动态封面和上游文件始终保留。</div>
+          <div class="button-row"><button id="loop-select" class="button">全选 / 取消</button><button id="loop-start" class="button">开始选中任务</button><button id="loop-pause" class="button">暂停选中任务</button><button id="loop-delete" class="button">删除选中任务</button><button id="loop-approve" class="button primary">一键审核</button><button id="loop-refresh" class="button">刷新状态</button></div>
+          <div class="button-row loop-cache"><span id="loop-cache-info">缓存按需统计</span><button id="loop-cache" class="button">统计缓存</button><button id="loop-clear-cache" class="button">清除闲置缓存</button></div>
+          <p id="loop-empty" class="field-help">尚未导入音乐 Set。</p><div id="loop-list"></div>
+        </section>
       </main>
     </div>
   </div>
@@ -93,5 +120,6 @@
   <template id="music-card-template"><article class="asset-card music-card"><div class="audio-icon">♫</div><div class="asset-info"><label class="select-line"><input type="checkbox" class="asset-select"><strong class="asset-name"></strong></label><p class="asset-meta"></p><button type="button" class="button audio-preview">试听</button></div></article></template>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/static/app.js" defer></script>
+  <script src="/static/loopmusic.js" defer></script>
 </body>
 </html>
