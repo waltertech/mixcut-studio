@@ -277,3 +277,47 @@ class IncrementalScanTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+@unittest.skipUnless(shutil.which('ffmpeg'), 'FFmpeg required')
+class RefreshInventoryTests(unittest.TestCase):
+    setUp = IncrementalScanTests.setUp
+    tearDown = IncrementalScanTests.tearDown
+    make_video = IncrementalScanTests.make_video
+    make_music = IncrementalScanTests.make_music
+    def wait_scan(self, body):
+        self.app.start_scan(body)
+        deadline=time.monotonic()+10
+        while time.monotonic()<deadline:
+            job=self.app.scan_status()
+            if job['status'] not in {'discovering','analyzing'}:
+                self.assertEqual('completed',job['status'],job.get('error'))
+                return job['scan']
+            time.sleep(.02)
+        self.fail('scan timeout')
+
+    def test_same_paths_replace_inventory_and_reuse_only_unchanged_metadata(self):
+        deleted=self.make_video();kept=self.make_video('keep.mp4');old=self.make_music()
+        body={'video_dir':str(self.videos),'music_dir':str(self.music)}
+        self.wait_scan(body)
+        deleted.unlink();new=self.make_music('new.mp3')
+        with patch('mixcut.media._run_probe',wraps=media._run_probe) as probe:
+            result=self.wait_scan(body)
+        self.assertEqual([str(kept.resolve())],[a['path'] for a in result['videos']])
+        self.assertEqual({str(old.resolve()),str(new.resolve())},{a['path'] for a in result['music']})
+        self.assertEqual(1,probe.call_count) # Only the new song needs metadata probing.
+        old.unlink()
+        self.assertEqual([str(new.resolve())],[a['path'] for a in self.wait_scan(body)['music']])
+
+    def test_failed_refresh_blocks_planning_across_restart_until_rescan(self):
+        self.make_video();self.make_music()
+        body={'video_dir':str(self.videos),'music_dir':str(self.music)}
+        self.wait_scan(body)
+        with patch('mixcut.media.scan',side_effect=OSError('test scan failure')):
+            self.app.start_scan(body)
+            deadline=time.monotonic()+5
+            while self.app.scan_status()['status']!='failed' and time.monotonic()<deadline:time.sleep(.01)
+        restarted=Application(self.root/'state')
+        with self.assertRaisesRegex(ValueError,'重新扫描'):
+            restarted.create_plan({'config':{}})
+        self.wait_scan(body)
+        self.assertFalse(self.app.store.get('library').get('refresh_required'))

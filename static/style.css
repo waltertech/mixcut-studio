@@ -18,3 +18,13 @@
 #batches .task-item .duration-note{grid-column:3/-1;display:block;margin:0}
 
 #batches .task-item .duration-note,#batches .task-item .recovery-note{grid-column:3/-1;margin:0} .review-buttons{display:flex;gap:10px;flex-wrap:wrap}.button.danger{color:#bd4036;border-color:#e5aaa5}
+.track-title-option{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:500;margin:10px 0}.track-title-option input{width:16px;height:16px;margin:0}#batches .track-title-option{grid-column:3/-1}
+
+/* Music-loop page styles are scoped to preserve the existing editor. */
+#music-loop textarea{width:100%;font:inherit;padding:10px;border:1px solid #ddd6cc;border-radius:6px;resize:vertical}
+#music-loop .loop-task{margin-top:16px}#music-loop .loop-heading{display:flex;align-items:center;gap:12px}
+#music-loop .loop-heading input[type=checkbox]{width:18px;height:18px;flex:0 0 18px;margin:0}#music-loop .loop-heading strong{flex:1;min-width:0;overflow-wrap:anywhere}#music-loop .loop-details{margin-top:18px}
+#music-loop video{display:block;width:min(100%,640px);margin:16px 0}#music-loop .loop-cache{margin-top:14px}
+#music-loop .notice{white-space:pre-line}
+
+.music-repeats-option{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin:8px 0}.music-repeats-option select{width:auto;min-width:140px;margin:0}#batches .music-repeats-option{grid-column:3/-1}

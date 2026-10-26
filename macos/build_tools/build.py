@@ -118,11 +118,17 @@ def verify(release_version):
                 time.sleep(.25)
             else:
                 raise SystemExit('frozen application did not become ready')
+            with urlopen(f'http://127.0.0.1:{VERIFY_PORT}/api/music-loop', timeout=10) as response:
+                if json.load(response).get('tasks') != []:
+                    raise SystemExit('packaged music-loop API missing')
+            with urlopen(f'http://127.0.0.1:{VERIFY_PORT}/static/loopmusic.js', timeout=10) as response:
+                if b'/api/music-loop/import' not in response.read():
+                    raise SystemExit('packaged music-loop page missing')
             if not data.get('ffmpeg_available'):
                 raise SystemExit('bundled FFmpeg was not detected')
             if data.get('version') != release_version:
                 raise SystemExit(f'embedded version mismatch: {data.get("version")}')
-            if data.get('api_protocol') != 10:
+            if data.get('api_protocol') != 17:
                 raise SystemExit('embedded API protocol mismatch')
             request = Request(f'http://127.0.0.1:{VERIFY_PORT}/api/tasks/forget',
                               data=b'{"selections":[]}', method='POST',
